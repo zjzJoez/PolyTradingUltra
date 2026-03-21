@@ -1,0 +1,76 @@
+name: openclaw-polymarket-v0_2
+description: >
+  v0.2 Polymarket event-driven flow: scan active markets, fetch external context,
+  generate proposals, apply hard risk checks, require Telegram approval,
+  then execute approved proposals in mock or real mode with SQLite as the source of truth.
+
+env:
+  POLYMARKET_MVP_STATE_DIR: ./var
+  POLYMARKET_MVP_DB_PATH: ./var/polymarket_mvp.sqlite3
+
+steps:
+  - id: init_db
+    name: Initialize SQLite
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.db_init
+
+  - id: scan_markets
+    name: Scan Polymarket
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.poly_scanner
+      --min-liquidity 10000
+      --max-expiry-days 7
+      --output artifacts/markets.json
+
+  - id: fetch_event_contexts
+    name: Fetch External Context
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.event_fetcher
+      --market-file artifacts/markets.json
+      --output artifacts/contexts.json
+
+  - id: generate_proposals
+    name: Generate Proposals
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.proposer
+      --market-file artifacts/markets.json
+      --context-file artifacts/contexts.json
+      --engine heuristic
+      --size-usdc 10
+      --top 3
+      --max-slippage-bps 500
+      --output artifacts/proposals-v2.json
+
+  - id: apply_risk_gate
+    name: Apply Risk Gate
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.risk_engine
+      --proposal-file artifacts/proposals-v2.json
+      --output artifacts/risk.json
+
+  - id: send_for_telegram_approval
+    name: Send Telegram Approval Request
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.tg_approver
+      send
+      --proposal-file artifacts/proposals-v2.json
+      --output artifacts/approval-request.json
+
+  - id: wait_for_decision
+    name: Wait For Human Decision
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.tg_approver
+      await
+      --proposal-file artifacts/proposals-v2.json
+      --timeout-seconds 1800
+      --poll-interval 5
+      --output artifacts/approval-status.json
+
+  - id: execute_after_approval
+    name: Execute Approved Trades
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.poly_executor
+      --proposal-file artifacts/proposals-v2.json
+      --mode mock
+      --output artifacts/execution.json
+    condition: ${steps.wait_for_decision.output.approved == true}

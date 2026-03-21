@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-mvp"
+version = "0.1.0"
+description = "MVP scaffold for an event-driven Polymarket trading system with Telegram approval gating."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "apify-client>=1.6,<2.0",
+  "Flask>=3.0,<4.0",
+  "requests>=2.31,<3.0",
+]
+
+[project.optional-dependencies]
+real-exec = [
+  "py-clob-client>=0.34.6,<1.0",
+]
+
+[project.scripts]
+db-init = "polymarket_mvp.db_init:main"
+event-fetcher = "polymarket_mvp.event_fetcher:main"
+poly-scanner = "polymarket_mvp.poly_scanner:main"
+poly-proposer = "polymarket_mvp.proposer:main"
+proposal-generator = "polymarket_mvp.proposer:main"
+risk-engine = "polymarket_mvp.risk_engine:main"
+tg-approver = "polymarket_mvp.tg_approver:main"
+poly-mock-executor = "polymarket_mvp.mock_executor:main"
+poly-executor = "polymarket_mvp.poly_executor:main"
+backfill-resolutions = "polymarket_mvp.resolution_backfill:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,10 @@
+.venv/
+.venv-py39-backup/
+.env
+__pycache__/
+*.pyc
+artifacts/
+var/
+dist/
+*.egg-info/
+.tmp-npm-cache/
