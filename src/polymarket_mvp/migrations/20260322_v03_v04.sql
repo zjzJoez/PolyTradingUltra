@@ -1,29 +1,4 @@
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  name TEXT PRIMARY KEY,
-  applied_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS market_snapshots (
-  market_id TEXT PRIMARY KEY,
-  question TEXT,
-  slug TEXT,
-  market_url TEXT,
-  condition_id TEXT,
-  active INTEGER NOT NULL DEFAULT 0,
-  closed INTEGER NOT NULL DEFAULT 0,
-  accepting_orders INTEGER NOT NULL DEFAULT 0,
-  end_date TEXT,
-  seconds_to_expiry INTEGER,
-  days_to_expiry REAL,
-  liquidity_usdc REAL,
-  volume_usdc REAL,
-  volume_24h_usdc REAL,
-  outcomes_json TEXT NOT NULL,
-  market_json TEXT NOT NULL,
-  last_scanned_at TEXT NOT NULL
-);
+PRAGMA foreign_keys = OFF;
 
 CREATE TABLE IF NOT EXISTS event_clusters (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,25 +28,6 @@ CREATE TABLE IF NOT EXISTS market_event_links (
 CREATE INDEX IF NOT EXISTS idx_market_event_links_market ON market_event_links(market_id);
 CREATE INDEX IF NOT EXISTS idx_market_event_links_cluster ON market_event_links(event_cluster_id);
 
-CREATE TABLE IF NOT EXISTS market_contexts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  market_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity')),
-  source_id TEXT,
-  title TEXT,
-  published_at TEXT,
-  url TEXT,
-  raw_text TEXT NOT NULL,
-  display_text TEXT NOT NULL,
-  importance_weight REAL NOT NULL DEFAULT 1.0,
-  normalized_payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_market_contexts_market ON market_contexts(market_id);
-CREATE INDEX IF NOT EXISTS idx_market_contexts_market_type ON market_contexts(market_id, source_type);
-
 CREATE TABLE IF NOT EXISTS research_memos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id TEXT NOT NULL,
@@ -91,94 +47,6 @@ CREATE TABLE IF NOT EXISTS research_memos (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_research_memos_bundle
 ON research_memos(market_id, source_bundle_hash);
-
-CREATE TABLE IF NOT EXISTS proposals (
-  proposal_id TEXT PRIMARY KEY,
-  market_id TEXT NOT NULL,
-  outcome TEXT NOT NULL CHECK(length(trim(outcome)) > 0),
-  confidence_score REAL NOT NULL,
-  recommended_size_usdc REAL NOT NULL,
-  reasoning TEXT NOT NULL,
-  decision_engine TEXT NOT NULL CHECK(decision_engine IN ('heuristic', 'openclaw_llm')),
-  status TEXT NOT NULL CHECK(status IN ('proposed', 'risk_blocked', 'pending_approval', 'approved', 'rejected', 'authorized_for_execution', 'executed', 'failed', 'expired', 'cancelled')),
-  max_slippage_bps INTEGER NOT NULL DEFAULT 500,
-  strategy_name TEXT,
-  topic TEXT,
-  event_cluster_id INTEGER,
-  source_memo_id INTEGER,
-  authorization_status TEXT NOT NULL DEFAULT 'none' CHECK(authorization_status IN ('none', 'matched_manual_only', 'matched_auto_execute')),
-  supervisor_decision TEXT CHECK(supervisor_decision IN ('promote', 'discard', 'merged')),
-  priority_score REAL,
-  proposal_json TEXT NOT NULL,
-  context_payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id),
-  FOREIGN KEY (event_cluster_id) REFERENCES event_clusters(id) ON DELETE SET NULL,
-  FOREIGN KEY (source_memo_id) REFERENCES research_memos(id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_proposals_market ON proposals(market_id);
-CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
-CREATE INDEX IF NOT EXISTS idx_proposals_strategy ON proposals(strategy_name);
-CREATE INDEX IF NOT EXISTS idx_proposals_cluster ON proposals(event_cluster_id);
-
-CREATE TABLE IF NOT EXISTS proposal_contexts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  proposal_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity')),
-  source_id TEXT,
-  title TEXT,
-  published_at TEXT,
-  url TEXT,
-  raw_text TEXT NOT NULL,
-  display_text TEXT NOT NULL,
-  importance_weight REAL NOT NULL DEFAULT 1.0,
-  normalized_payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_proposal_contexts_proposal ON proposal_contexts(proposal_id);
-
-CREATE TABLE IF NOT EXISTS approvals (
-  proposal_id TEXT PRIMARY KEY,
-  decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected')),
-  decided_at TEXT NOT NULL,
-  telegram_user_id TEXT,
-  telegram_username TEXT,
-  callback_query_id TEXT NOT NULL UNIQUE,
-  telegram_message_id TEXT,
-  raw_callback_json TEXT NOT NULL,
-  FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS executions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  proposal_id TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK(mode IN ('mock', 'real')),
-  client_order_id TEXT,
-  order_intent_json TEXT NOT NULL,
-  requested_price REAL,
-  requested_size_usdc REAL NOT NULL,
-  max_slippage_bps INTEGER NOT NULL,
-  observed_worst_price REAL,
-  slippage_check_status TEXT NOT NULL CHECK(slippage_check_status IN ('passed', 'failed', 'skipped')),
-  status TEXT NOT NULL,
-  filled_size_usdc REAL,
-  avg_fill_price REAL,
-  txhash_or_order_id TEXT,
-  slippage_bps REAL,
-  error_message TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_executions_proposal ON executions(proposal_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_real_success
-ON executions(proposal_id)
-WHERE mode = 'real' AND status = 'filled';
 
 CREATE TABLE IF NOT EXISTS strategy_authorizations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -323,10 +191,67 @@ CREATE TABLE IF NOT EXISTS agent_reviews (
 
 CREATE INDEX IF NOT EXISTS idx_agent_reviews_position ON agent_reviews(position_id);
 
-CREATE TABLE IF NOT EXISTS market_resolutions (
-  market_id TEXT PRIMARY KEY,
-  resolved_outcome TEXT NOT NULL,
-  resolved_at TEXT NOT NULL,
-  source_payload_json TEXT NOT NULL,
-  FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id)
+CREATE TABLE IF NOT EXISTS proposals_v_next (
+  proposal_id TEXT PRIMARY KEY,
+  market_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(length(trim(outcome)) > 0),
+  confidence_score REAL NOT NULL,
+  recommended_size_usdc REAL NOT NULL,
+  reasoning TEXT NOT NULL,
+  decision_engine TEXT NOT NULL CHECK(decision_engine IN ('heuristic', 'openclaw_llm')),
+  status TEXT NOT NULL CHECK(status IN ('proposed', 'risk_blocked', 'pending_approval', 'approved', 'rejected', 'authorized_for_execution', 'executed', 'failed', 'expired', 'cancelled')),
+  max_slippage_bps INTEGER NOT NULL DEFAULT 500,
+  strategy_name TEXT,
+  topic TEXT,
+  event_cluster_id INTEGER,
+  source_memo_id INTEGER,
+  authorization_status TEXT NOT NULL DEFAULT 'none' CHECK(authorization_status IN ('none', 'matched_manual_only', 'matched_auto_execute')),
+  supervisor_decision TEXT CHECK(supervisor_decision IN ('promote', 'discard', 'merged')),
+  priority_score REAL,
+  proposal_json TEXT NOT NULL,
+  context_payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id),
+  FOREIGN KEY (event_cluster_id) REFERENCES event_clusters(id) ON DELETE SET NULL,
+  FOREIGN KEY (source_memo_id) REFERENCES research_memos(id) ON DELETE SET NULL
 );
+
+INSERT INTO proposals_v_next (
+  proposal_id, market_id, outcome, confidence_score, recommended_size_usdc, reasoning,
+  decision_engine, status, max_slippage_bps, strategy_name, topic, event_cluster_id,
+  source_memo_id, authorization_status, supervisor_decision, priority_score,
+  proposal_json, context_payload_json, created_at, updated_at
+)
+SELECT
+  proposal_id,
+  market_id,
+  outcome,
+  confidence_score,
+  recommended_size_usdc,
+  reasoning,
+  decision_engine,
+  status,
+  max_slippage_bps,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  'none',
+  NULL,
+  NULL,
+  proposal_json,
+  context_payload_json,
+  created_at,
+  updated_at
+FROM proposals;
+
+DROP TABLE proposals;
+ALTER TABLE proposals_v_next RENAME TO proposals;
+
+CREATE INDEX IF NOT EXISTS idx_proposals_market ON proposals(market_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
+CREATE INDEX IF NOT EXISTS idx_proposals_strategy ON proposals(strategy_name);
+CREATE INDEX IF NOT EXISTS idx_proposals_cluster ON proposals(event_cluster_id);
+
+PRAGMA foreign_keys = ON;

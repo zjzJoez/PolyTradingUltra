@@ -1,5 +1,13 @@
 Polymarket Event-Driven Trading OS - v0.2 PRD
 
+Status note:
+
+- This file is kept as the historical v0.2 product requirement document.
+- The current implementation baseline is now v0.3/v0.4.
+- Use [README.md](/private/tmp/polymarket-mvp/README.md) for the current operating guide.
+- Use [IMPLEMENTATION_PLAN_v0.3_v0.4.md](/private/tmp/polymarket-mvp/IMPLEMENTATION_PLAN_v0.3_v0.4.md) for the current implementation plan.
+- Use [openclaw-polymarket-mvp.yaml](/private/tmp/polymarket-mvp/workflows/openclaw-polymarket-mvp.yaml) for the current authorization-first workflow.
+
 1. 项目背景与核心理念 (Project Vision)
 本项目旨在构建一个基于 Polymarket 的事件驱动型自动化交易系统 MVP。
 系统的核心架构哲学是：“OpenClaw 管脑子，代码管手，风控管命。”

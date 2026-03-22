@@ -7,7 +7,7 @@ from .db import init_db
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Initialize the SQLite schema for Polymarket MVP v0.2.")
+    parser = argparse.ArgumentParser(description="Initialize or migrate the SQLite schema for Polymarket Trading OS.")
     parser.add_argument("--output", help="Optional file path for JSON output.")
     return parser
 

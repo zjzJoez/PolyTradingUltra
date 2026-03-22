@@ -1,67 +1,121 @@
-# Polymarket Trading OS v0.2
+# Polymarket Trading OS v0.4
 
-Local-first event-driven Polymarket trading system with strict human approval and SQLite as the single business source of truth.
+Local-first Polymarket trading system with SQLite as the single business source of truth.
 
-This repository is designed around three responsibilities:
+当前仓库已经不再只是一个 `scan -> approve -> execute` 的 MVP。它现在支持：
 
-- LLM/OpenClaw: proposes structured trades
-- Python pipeline: scans markets, fetches context, applies risk, handles Telegram, executes orders
-- Risk + approval gate: blocks anything unsafe or unapproved
+- 市场扫描与上下文抓取
+- event clustering 与 research memo
+- proposal 元数据增强
+- 单 proposal 风控 + 组合风险 + 策略授权
+- Telegram 人工审批路径
+- `authorized_for_execution` 自动执行队列
+- `mock` / `real` 执行
+- positions / reconciliations / kill-switch / exit-review 基础设施
 
-## System Overview
+## Architecture
 
-End-to-end pipeline:
+系统职责分层：
 
-1. `poly-scanner` scans active near-expiry markets from Gamma and upserts `market_snapshots`.
-2. `event-fetcher` enriches each market with CryptoPanic, Apify Twitter (soft-fail enabled), and Perplexity summary.
-3. `proposal-generator` persists normalized proposals in SQLite.
-4. `risk-engine` updates proposal state to `pending_approval` or `risk_blocked`.
-5. `tg-approver send` pushes inline `Approve/Reject` buttons to Telegram.
-6. `tg-approver serve` receives callback webhooks, records decisions, and auto-executes approved proposals.
-7. `poly-executor` executes in `mock` or `real` mode, with slippage and session safety checks.
-8. Execution and approval events are fully auditable in SQLite (+ JSON artifacts for debugging).
+- OpenClaw / LLM
+  - 作为可选的薄包装 adapter
+  - 可以生成 memo、supervisor 决策、review
+  - deterministic 路径始终可跑
+- Python pipeline
+  - 扫描市场、抓事件、聚类、生成 memo、产出 proposal
+  - 执行风险检查、授权检查、审批、下单、对账、建仓
+- SQLite
+  - proposal、approval、execution、position、review 的唯一状态源
+- Risk + control plane
+  - slippage gate
+  - session spend guard
+  - strategy authorization
+  - kill-switch
 
-## Current v0.2 Behavior
+## Current Operating Modes
 
-- SQLite is the only state authority for proposal, approval, execution, and resolution status.
-- Proposal outcomes support any non-empty outcome label (for example `Yes/No`, `Up/Down`).
-- Risk gate includes configurable slippage limit (`max_slippage_bps`) and executable market check.
-- Telegram approval callback is idempotent on `callback_query_id`.
-- Approved callback can auto-trigger executor (`TG_AUTO_EXECUTE_ON_APPROVE=true`).
-- Real executor prevents duplicate real execution for the same proposal when prior real status is `live/submitted/filled`.
-- Real execution preflight includes:
-  - API key visibility check
-  - collateral balance parse/check
-  - balance sanity limit (`SESSION_MAX_BALANCE_USDC`)
-  - per-run spend limit (`SESSION_MAX_SPEND_USDC`)
+### 1. Authorization-first queue
+
+这是当前 v0.3/v0.4 的主工作流：
+
+1. `poly-scanner`
+2. `event-fetcher`
+3. `cluster-events`
+4. `build-memos`
+5. `proposal-generator`
+6. `risk-engine`
+7. `poly-executor --source authorized_queue`
+8. `update-positions`
+9. `position-report`
+
+当 proposal 命中有效的 `strategy_authorization` 时，`risk-engine` 会把 proposal 状态推进到 `authorized_for_execution`，然后由 executor 扫描队列执行。
+
+### 2. Human approval fallback
+
+当 proposal 没有命中自动授权时，`risk-engine` 会把它推进到 `pending_approval`，然后进入 Telegram 审批路径：
+
+1. `tg-approver send`
+2. `tg-approver serve`
+3. Telegram `Approve / Reject`
+4. `poly-executor --proposal-file ...`
+
+注意：
+
+- 当前仓库的 workflow YAML 重点覆盖 authorization-first 路径
+- Telegram 路径仍然可用，但更适合 operator 手动选择 pending proposals 后执行
 
 ## Repository Layout
 
 ```text
 src/polymarket_mvp/
+  agents/
+    exit_agent.py
+    research_agent.py
+    review_agent.py
+    supervisor_agent.py
+  migrations/
+    20260322_v03_v04.sql
+  services/
+    authorization_service.py
+    event_cluster_service.py
+    kill_switch_service.py
+    memo_service.py
+    openclaw_adapter.py
+    portfolio_risk_service.py
+    position_manager.py
+    reconciler.py
+    shadow_service.py
+  authorize_strategy.py
+  build_memos.py
+  cluster_events.py
   common.py
   db.py
   db_init.py
-  poly_scanner.py
   event_fetcher.py
-  proposer.py
-  risk_engine.py
-  tg_approver.py
-  poly_executor.py
+  kill_switch.py
+  list_authorizations.py
   mock_executor.py
+  poly_executor.py
+  poly_scanner.py
+  position_report.py
+  proposer.py
   resolution_backfill.py
+  risk_engine.py
+  run_exit_agent.py
+  run_review_agent.py
+  shadow_execute.py
+  sync_orders.py
+  tg_approver.py
+  update_positions.py
 
-skills/poly_scanner/run.py
-skills/tg_approver/run.py
-scripts/mock_proposal.py
-scripts/mock_execute.py
 schema.sql
 workflows/openclaw-polymarket-mvp.yaml
+IMPLEMENTATION_PLAN_v0.3_v0.4.md
 ```
 
 ## Installation
 
-Python 3.11+ is recommended (real execution requires Python 3.10+).
+Python 3.11+ is recommended. Real execution requires Python 3.10+ and `py-clob-client`.
 
 ```bash
 python3 -m venv .venv
@@ -76,7 +130,7 @@ For real trading:
 pip install -e .[real-exec]
 ```
 
-## Environment Configuration
+## Environment
 
 Copy `.env.example`:
 
@@ -84,7 +138,7 @@ Copy `.env.example`:
 cp .env.example .env
 ```
 
-Key groups:
+Important variable groups:
 
 - Core
   - `POLYMARKET_MVP_STATE_DIR`
@@ -93,24 +147,27 @@ Key groups:
   - `TG_BOT_TOKEN`
   - `TG_CHAT_ID`
   - `TG_WEBHOOK_SECRET`
-  - `TG_AUTO_EXECUTE_ON_APPROVE` (`true/false`)
-  - `TG_AUTO_EXECUTE_MODE` (`real` or `mock`)
+  - `TG_AUTO_EXECUTE_ON_APPROVE`
+  - `TG_AUTO_EXECUTE_MODE`
 - Context adapters
   - `CRYPTOPANIC_AUTH_TOKEN`
   - `APIFY_TOKEN` or `APIFY_API_KEY`
   - `PERPLEXITY_API_KEY`
-  - `PERPLEXITY_MODEL` (default `sonar`)
-- Risk controls
+  - `PERPLEXITY_MODEL`
+- Risk
   - `POLY_RISK_MAX_ORDER_USDC`
   - `POLY_RISK_MIN_CONFIDENCE`
   - `POLY_RISK_MAX_SLIPPAGE_BPS`
   - `POLY_RISK_REQUIRE_EXECUTABLE_MARKET`
-  - `POLYMARKET_AVAILABLE_BALANCE_U` (used by mock/risk checks)
+  - `POLY_RISK_MAX_TOPIC_EXPOSURE_USDC`
+  - `POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC`
+  - `POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC`
+  - `POLYMARKET_AVAILABLE_BALANCE_U`
 - Real execution / CLOB
   - `POLY_CLOB_HOST`
-  - `CHAIN_ID` (or `POLY_CLOB_CHAIN_ID`)
-  - `SIGNATURE_TYPE` (or `POLY_CLOB_SIGNATURE_TYPE`)
-  - `FUNDER` (or `POLY_CLOB_FUNDER`)
+  - `CHAIN_ID` or `POLY_CLOB_CHAIN_ID`
+  - `SIGNATURE_TYPE` or `POLY_CLOB_SIGNATURE_TYPE`
+  - `FUNDER` or `POLY_CLOB_FUNDER`
   - `POLY_API_KEY`
   - `POLY_API_SECRET`
   - `POLY_API_PASSPHRASE`
@@ -118,19 +175,30 @@ Key groups:
   - `SESSION_MAX_BALANCE_USDC`
   - `SESSION_MAX_SPEND_USDC`
 
-## Command Entry Points
+## CLI Entry Points
 
-Console scripts (after `pip install -e .`):
+Current console scripts:
 
 ```bash
 db-init
 poly-scanner
 event-fetcher
+cluster-events
+build-memos
 proposal-generator
 risk-engine
+authorize-strategy
+list-authorizations
+shadow-execute
 tg-approver
 poly-executor
 poly-mock-executor
+update-positions
+sync-orders
+kill-switch
+run-exit-agent
+run-review-agent
+position-report
 backfill-resolutions
 ```
 
@@ -140,42 +208,58 @@ Equivalent module form:
 PYTHONPATH=src python3 -m polymarket_mvp.<module>
 ```
 
-Skill wrappers:
+## Data Model
 
-```bash
-python skills/poly_scanner/run.py ...
-python skills/tg_approver/run.py ...
-```
+Main tables:
 
-## Proposal Schema
+- `market_snapshots`
+- `market_contexts`
+- `event_clusters`
+- `market_event_links`
+- `research_memos`
+- `proposals`
+- `proposal_contexts`
+- `strategy_authorizations`
+- `approvals`
+- `executions`
+- `shadow_executions`
+- `positions`
+- `position_events`
+- `order_reconciliations`
+- `kill_switches`
+- `exit_recommendations`
+- `agent_reviews`
+- `market_resolutions`
 
-Normalized proposal format:
+Main proposal statuses:
 
-```json
-{
-  "market_id": "1657334",
-  "outcome": "Up",
-  "confidence_score": 0.51,
-  "recommended_size_usdc": 5.0,
-  "reasoning": "Trade thesis",
-  "max_slippage_bps": 700
-}
-```
+- `proposed`
+- `risk_blocked`
+- `pending_approval`
+- `approved`
+- `rejected`
+- `authorized_for_execution`
+- `executed`
+- `failed`
+- `expired`
+- `cancelled`
 
-Notes:
+Important semantics:
 
-- `outcome` is a non-empty string and must match an outcome in market snapshot (`Yes/No`, `Up/Down`, etc.).
-- If a proposal omits `max_slippage_bps`, default normalization can fill `500`.
+- `approved` means explicit human approval
+- `authorized_for_execution` means code-level strategy authorization matched
+- `executed` means an execution record was successfully persisted
+- `real` executor still performs stricter preflight than `risk-engine`
 
-## Quick Start (End-to-End)
+## Quick Start: Authorization-first v0.4 Flow
 
-### 1) Initialize database
+### 1. Initialize or migrate database
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.db_init
 ```
 
-### 2) Scan markets
+### 2. Scan live markets
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.poly_scanner \
@@ -184,7 +268,7 @@ PYTHONPATH=src python3 -m polymarket_mvp.poly_scanner \
   --output artifacts/markets.json
 ```
 
-### 3) Fetch event context
+### 3. Fetch event context
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.event_fetcher \
@@ -192,22 +276,70 @@ PYTHONPATH=src python3 -m polymarket_mvp.event_fetcher \
   --output artifacts/contexts.json
 ```
 
-### 4) Generate proposals
+### 4. Cluster markets
 
-Heuristic path:
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.cluster_events \
+  --market-file artifacts/markets.json \
+  --output artifacts/clusters.json
+```
+
+### 5. Build research memos
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.build_memos \
+  --market-file artifacts/markets.json \
+  --output artifacts/memos.json
+```
+
+### 6. Seed strategy authorizations
+
+Create a JSON file like:
+
+```json
+{
+  "strategy_name": "near_expiry_conviction",
+  "scope_topic": "BTC",
+  "scope_market_type": "binary",
+  "scope_event_cluster_id": null,
+  "max_order_usdc": 5.0,
+  "max_daily_gross_usdc": 25.0,
+  "max_open_positions": 5,
+  "max_daily_loss_usdc": 25.0,
+  "max_slippage_bps": 500,
+  "allow_auto_execute": true,
+  "requires_human_if_above_usdc": 5.0,
+  "valid_from": "2026-03-21T00:00:00Z",
+  "valid_until": "2026-03-23T00:00:00Z",
+  "status": "active",
+  "created_by": "operator"
+}
+```
+
+Then load it:
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.authorize_strategy create \
+  --json-file artifacts/strategy-authorization.json \
+  --output artifacts/authorization.json
+```
+
+### 7. Generate proposals
+
+Heuristic:
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.proposer \
   --market-file artifacts/markets.json \
   --context-file artifacts/contexts.json \
   --engine heuristic \
-  --size-usdc 10 \
+  --size-usdc 5 \
   --top 3 \
   --max-slippage-bps 500 \
   --output artifacts/proposals.json
 ```
 
-LLM/OpenClaw path:
+External OpenClaw / LLM JSON:
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.proposer \
@@ -218,7 +350,7 @@ PYTHONPATH=src python3 -m polymarket_mvp.proposer \
   --output artifacts/proposals.json
 ```
 
-### 5) Apply risk gate
+### 8. Apply risk and authorization
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.risk_engine \
@@ -226,34 +358,66 @@ PYTHONPATH=src python3 -m polymarket_mvp.risk_engine \
   --output artifacts/risk.json
 ```
 
-### 6) Run Telegram approval server
+Expected outcomes:
 
-Keep this process running:
+- `risk_blocked`
+- `pending_approval`
+- `authorized_for_execution`
+
+### 9. Execute authorized queue
+
+Mock:
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.poly_executor \
+  --source authorized_queue \
+  --mode mock \
+  --output artifacts/authorized-execution.json
+```
+
+Real:
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.poly_executor \
+  --source authorized_queue \
+  --mode real \
+  --output artifacts/authorized-execution.json
+```
+
+### 10. Refresh positions and report
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.update_positions \
+  --output artifacts/positions.json
+```
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.position_report \
+  --output artifacts/position-report.json
+```
+
+## Human Approval Path
+
+### 1. Run Telegram webhook server
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.tg_approver serve --port 8787
 ```
 
-### 7) Expose webhook publicly (ngrok)
+### 2. Expose it publicly
 
 ```bash
 ngrok http 8787
 ```
 
-Register webhook:
+### 3. Register webhook
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.tg_approver set-webhook \
   --webhook-url https://<your-ngrok-domain>
 ```
 
-Inspect webhook state:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.tg_approver webhook-info
-```
-
-### 8) Send proposals to Telegram
+### 4. Send pending approvals
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.tg_approver send \
@@ -261,12 +425,7 @@ PYTHONPATH=src python3 -m polymarket_mvp.tg_approver send \
   --output artifacts/approval-request.json
 ```
 
-### 9) Approve/Reject in Telegram
-
-- `Reject`: proposal status becomes `rejected`.
-- `Approve`: proposal status becomes `approved`, and if `TG_AUTO_EXECUTE_ON_APPROVE=true`, executor runs automatically.
-
-### 10) Check status and execution
+### 5. Wait or poll status
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.tg_approver status \
@@ -274,96 +433,70 @@ PYTHONPATH=src python3 -m polymarket_mvp.tg_approver status \
   --output artifacts/approval-status.json
 ```
 
-Manual executor fallback:
+Operator note:
+
+- `tg-approver send` is intended for proposals currently in `pending_approval`
+- If your proposal file mixes `authorized_for_execution` and `pending_approval`, run the auto-exec queue separately first or export a pending-only proposal subset
+
+## Reconciliation, Control, And Review
+
+Sync live orders:
 
 ```bash
-PYTHONPATH=src python3 -m polymarket_mvp.poly_executor \
-  --proposal-file artifacts/proposals.json \
-  --mode real \
-  --output artifacts/execution.json
+PYTHONPATH=src python3 -m polymarket_mvp.sync_orders \
+  --output artifacts/reconciliations.json
 ```
 
-## Mock vs Real Execution
-
-- `mock` mode:
-  - no real order is sent
-  - execution records are still persisted for replay/testing
-- `real` mode:
-  - py-clob-client submits real GTC orders
-  - preflight and session limits are enforced
-  - slippage gate can block before submit
-
-## Data Model and Status Semantics
-
-Main proposal statuses:
-
-- `proposed`
-- `risk_blocked`
-- `pending_approval`
-- `approved`
-- `rejected`
-- `executed`
-- `failed`
-
-Execution statuses (real path observed in DB):
-
-- `live`: order accepted but not fully matched
-- `filled`: matched/filled
-- `failed`: blocked by risk/slippage/preflight/submit error
-
-SQLite tables:
-
-- `market_snapshots`
-- `market_contexts`
-- `proposals`
-- `proposal_contexts`
-- `approvals`
-- `executions`
-- `market_resolutions`
-
-## Known Operational Notes
-
-- `event_fetcher` Twitter adapter soft-fails when Apify plan/access blocks the actor; it inserts a fallback context instead of breaking the pipeline.
-- Heuristic proposer still only generates proposals for explicit `Yes/No` binary markets. For other labels (`Up/Down`), use `openclaw_llm` proposal file path.
-- Telegram callback retries are common; approval and auto-execution paths are idempotent by callback/order checks.
-- Existing long-running `tg_approver serve` processes must be restarted after code updates.
-
-## Troubleshooting
-
-### Approve clicked but no trade execution
-
-Check:
-
-1. `tg_approver serve` process is running.
-2. `webhook-info` URL points to a live tunnel and `/healthz` is reachable.
-3. `TG_AUTO_EXECUTE_ON_APPROVE=true`.
-4. Proposal is actually `approved` in SQLite.
-
-### Order blocked by slippage
-
-- Compare `observed_worst_price` vs `requested_price` and `max_slippage_bps`.
-- For volatile micro-timeframe markets, either:
-  - increase proposal `max_slippage_bps`, or
-  - improve reference-price strategy in executor.
-
-### Real execution fails with SDK/import issues
-
-- Use Python 3.10+.
-- Install optional deps:
+Set kill-switch:
 
 ```bash
-pip install -e .[real-exec]
+PYTHONPATH=src python3 -m polymarket_mvp.kill_switch set \
+  --scope-type strategy \
+  --scope-key near_expiry_conviction \
+  --reason "manual halt"
 ```
 
-### VSCode/Pylance shows false import/type errors
+Generate exit suggestions:
 
-- Ensure interpreter is `.venv/bin/python`.
-- Workspace settings include `src` in analysis path.
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.run_exit_agent \
+  --output artifacts/exit-recommendations.json
+```
 
-## Security and Repo Hygiene
+Backfill resolutions:
 
-- `.env`, `artifacts/`, and `var/` are ignored by git.
-- Never commit real API secrets or signer keys.
-- Use low-balance execution wallets for live tests.
-- Perplexity summaries are prioritized ahead of CryptoPanic and Twitter snippets
-- `mock` execution is intended to stay as the regression-safe path even after `real` trading is enabled
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.resolution_backfill \
+  --input artifacts/resolutions.json \
+  --output artifacts/resolution-backfill.json
+```
+
+Generate reviews:
+
+```bash
+PYTHONPATH=src python3 -m polymarket_mvp.run_review_agent \
+  --output artifacts/reviews.json
+```
+
+## Notes
+
+- `event_fetcher` Twitter adapter soft-fails when Apify blocks the actor; the pipeline continues with a fallback context.
+- `risk-engine` now falls back to snapshot outcome price when CLOB `/price` returns `404 No orderbook exists`, which avoids false negatives for markets still usable in higher-level workflows.
+- `real` execution is still stricter than `risk-engine`; no change was made to preflight signing, balance sanity, session spend, or slippage enforcement.
+- Existing long-running `tg_approver serve` processes should be restarted after code changes.
+- The current workflow YAML is authorization-first. Telegram approval remains a supported operator path, but not the only path.
+
+## Verification
+
+The current repo has a verified smoke-tested path for:
+
+- `risk-engine -> authorized_for_execution`
+- `poly-executor --source authorized_queue`
+- `update-positions`
+- `position-report`
+
+Representative outputs:
+
+- [artifacts/smoke-risk-3.json](/private/tmp/polymarket-mvp/artifacts/smoke-risk-3.json)
+- [artifacts/smoke-authorized-execution-3.json](/private/tmp/polymarket-mvp/artifacts/smoke-authorized-execution-3.json)
+- [artifacts/smoke-position-report-postfix.json](/private/tmp/polymarket-mvp/artifacts/smoke-position-report-postfix.json)

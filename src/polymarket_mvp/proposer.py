@@ -15,12 +15,18 @@ from .common import (
 from .db import (
     connect_db,
     init_db,
+    latest_research_memo,
     market_contexts,
     market_snapshot,
     replace_proposal_contexts,
+    update_proposal_workflow_fields,
     upsert_market_snapshot,
     upsert_proposal,
+    proposal_record,
 )
+from .agents.supervisor_agent import supervise_record
+from .services.event_cluster_service import cluster_market
+from .services.memo_service import build_and_store_memo
 
 
 def _extract_yes_no_prices(market: Mapping[str, Any]) -> Dict[str, float]:
@@ -132,20 +138,50 @@ def main() -> int:
         market_map = {str(item["market_id"]): dict(item) for item in markets}
         for market in market_map.values():
             upsert_market_snapshot(conn, market)
+            cluster_market(conn, market)
         for proposal in proposals:
             market_id = str(proposal["market_id"])
             market = market_map.get(market_id) or market_snapshot(conn, market_id)
             if market is None:
                 raise RuntimeError(f"Unknown market for proposal {market_id}")
+            cluster_result = cluster_market(conn, market)
+            memo = latest_research_memo(conn, market_id)
+            if memo is None and market_contexts(conn, market_id):
+                memo = build_and_store_memo(conn, market_id, cluster=cluster_result["cluster"])
             context_blob = resolve_context_payload(context_payload, market_id)
+            default_topic = (
+                (memo or {}).get("topic")
+                or cluster_result["cluster"].get("topic")
+                or context_blob.get("topic")
+                or market_id
+            )
+            strategy_name = "near_expiry_conviction"
             record = upsert_proposal(
                 conn,
                 proposal,
                 decision_engine=args.engine,
                 status="proposed",
                 context_payload=context_blob,
+                strategy_name=strategy_name,
+                topic=default_topic,
+                event_cluster_id=cluster_result["cluster"]["id"],
+                source_memo_id=(memo or {}).get("id"),
             )
             replace_proposal_contexts(conn, record["proposal_id"], market_contexts(conn, market_id))
+            enriched = proposal_record(conn, record["proposal_id"])
+            if enriched is None:
+                raise RuntimeError(f"Unable to reload proposal record: {record['proposal_id']}")
+            supervisor = supervise_record(enriched)
+            update_proposal_workflow_fields(
+                conn,
+                record["proposal_id"],
+                strategy_name=supervisor.get("strategy_name") or strategy_name,
+                topic=supervisor.get("topic") or default_topic,
+                event_cluster_id=cluster_result["cluster"]["id"],
+                source_memo_id=(memo or {}).get("id"),
+                supervisor_decision=supervisor.get("decision"),
+                priority_score=supervisor.get("priority_score"),
+            )
             persisted.append(
                 {
                     "proposal_id": record["proposal_id"],
@@ -154,6 +190,11 @@ def main() -> int:
                     "decision_engine": args.engine,
                     "status": "proposed",
                     "context_payload": context_blob,
+                    "topic": supervisor.get("topic") or default_topic,
+                    "strategy_name": supervisor.get("strategy_name") or strategy_name,
+                    "event_cluster_id": cluster_result["cluster"]["id"],
+                    "source_memo_id": (memo or {}).get("id"),
+                    "supervisor": supervisor,
                 }
             )
         conn.commit()

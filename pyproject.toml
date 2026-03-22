@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polymarket-mvp"
 version = "0.1.0"
-description = "MVP scaffold for an event-driven Polymarket trading system with Telegram approval gating."
+description = "Local-first Polymarket trading OS with research, authorization, approval, execution, and position tracking."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -30,6 +30,17 @@ tg-approver = "polymarket_mvp.tg_approver:main"
 poly-mock-executor = "polymarket_mvp.mock_executor:main"
 poly-executor = "polymarket_mvp.poly_executor:main"
 backfill-resolutions = "polymarket_mvp.resolution_backfill:main"
+cluster-events = "polymarket_mvp.cluster_events:main"
+build-memos = "polymarket_mvp.build_memos:main"
+authorize-strategy = "polymarket_mvp.authorize_strategy:main"
+list-authorizations = "polymarket_mvp.list_authorizations:main"
+shadow-execute = "polymarket_mvp.shadow_execute:main"
+update-positions = "polymarket_mvp.update_positions:main"
+sync-orders = "polymarket_mvp.sync_orders:main"
+kill-switch = "polymarket_mvp.kill_switch:main"
+run-exit-agent = "polymarket_mvp.run_exit_agent:main"
+run-review-agent = "polymarket_mvp.run_review_agent:main"
+position-report = "polymarket_mvp.position_report:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

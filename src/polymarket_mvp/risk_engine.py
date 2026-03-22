@@ -6,8 +6,10 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import dump_json, get_env_bool, get_env_float, get_env_int, read_proposals, resolve_token_id, utc_now_iso
-from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_status
+from .common import dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, read_proposals, resolve_token_id, utc_now_iso
+from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_workflow_fields
+from .services.authorization_service import evaluate_authorization
+from .services.portfolio_risk_service import evaluate_portfolio_risk
 
 
 def _clob_host() -> str:
@@ -19,23 +21,25 @@ def _selected_outcome_has_live_price(record: Dict[str, Any]) -> bool:
     proposal = record["proposal_json"]
     if market is None:
         return False
+    snapshot_price = market_reference_price(market["market_json"], proposal["outcome"])
+    snapshot_has_price = isinstance(snapshot_price, float) and 0.0 <= snapshot_price <= 1.0
     token_id = resolve_token_id(market["market_json"], proposal["outcome"])
     if not token_id:
-        return False
-    response = requests.get(
-        f"{_clob_host()}/price",
-        params={"token_id": token_id, "side": "BUY"},
-        timeout=10,
-    )
-    if response.status_code == 404:
-        return False
-    response.raise_for_status()
-    payload = response.json()
-    raw_price = payload.get("price") if isinstance(payload, dict) else payload
+        return snapshot_has_price
     try:
+        response = requests.get(
+            f"{_clob_host()}/price",
+            params={"token_id": token_id, "side": "BUY"},
+            timeout=10,
+        )
+        if response.status_code == 404:
+            return snapshot_has_price
+        response.raise_for_status()
+        payload = response.json()
+        raw_price = payload.get("price") if isinstance(payload, dict) else payload
         return float(raw_price) >= 0.0
-    except (TypeError, ValueError):
-        return False
+    except (requests.RequestException, TypeError, ValueError):
+        return snapshot_has_price
 
 
 def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -78,6 +82,39 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def evaluate_full_record(conn, record: Dict[str, Any]) -> Dict[str, Any]:
+    single_risk = evaluate_proposal(record)
+    if not single_risk["approved_for_approval_gate"]:
+        return {
+            "proposal_id": record["proposal_id"],
+            "approved_for_approval_gate": False,
+            "next_status": "risk_blocked",
+            "risk_summary": single_risk["risk_summary"],
+            "portfolio_risk": None,
+            "authorization": None,
+        }
+    portfolio_risk = evaluate_portfolio_risk(conn, record)
+    if not portfolio_risk["approved"]:
+        return {
+            "proposal_id": record["proposal_id"],
+            "approved_for_approval_gate": False,
+            "next_status": "risk_blocked",
+            "risk_summary": single_risk["risk_summary"],
+            "portfolio_risk": portfolio_risk,
+            "authorization": None,
+        }
+    authorization = evaluate_authorization(conn, record)
+    next_status = "authorized_for_execution" if authorization["authorization_status"] == "matched_auto_execute" else "pending_approval"
+    return {
+        "proposal_id": record["proposal_id"],
+        "approved_for_approval_gate": True,
+        "next_status": next_status,
+        "risk_summary": single_risk["risk_summary"],
+        "portfolio_risk": portfolio_risk,
+        "authorization": authorization,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Apply hard risk checks to proposal records.")
     parser.add_argument("--proposal-file", required=True, help="Proposal JSON file.")
@@ -96,8 +133,13 @@ def main() -> int:
             record = proposal_record(conn, proposal_id)
             if record is None:
                 raise RuntimeError(f"Proposal {proposal_id} not found in database. Generate proposals before running risk-engine.")
-            result = evaluate_proposal(record)
-            update_proposal_status(conn, proposal_id, result["next_status"])
+            result = evaluate_full_record(conn, record)
+            update_proposal_workflow_fields(
+                conn,
+                proposal_id,
+                authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                status=result["next_status"],
+            )
             results.append(result)
         conn.commit()
     payload = {

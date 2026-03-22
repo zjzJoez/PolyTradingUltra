@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from .common import (
     get_db_path,
@@ -15,6 +15,7 @@ from .common import (
     schema_path,
     utc_now_iso,
 )
+from .migrations import apply_pending_migrations, ensure_schema_migrations, mark_all_migrations_applied
 
 
 def connect_db(path: Path | None = None) -> sqlite3.Connection:
@@ -26,12 +27,41 @@ def connect_db(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _user_table_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
 def init_db(path: Path | None = None) -> Path:
     db_path = path or get_db_path()
     with connect_db(db_path) as conn:
-        conn.executescript(schema_path().read_text(encoding="utf-8"))
+        fresh = _user_table_count(conn) == 0
+        if fresh:
+            conn.executescript(schema_path().read_text(encoding="utf-8"))
+            ensure_schema_migrations(conn)
+            mark_all_migrations_applied(conn)
+        else:
+            ensure_schema_migrations(conn)
+            apply_pending_migrations(conn)
+            conn.executescript(schema_path().read_text(encoding="utf-8"))
         conn.commit()
     return db_path
+
+
+def _json_loads_if_present(value: Any) -> Any:
+    if value is None or not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def upsert_market_snapshot(conn: sqlite3.Connection, market: Mapping[str, Any]) -> None:
@@ -83,6 +113,16 @@ def upsert_market_snapshot(conn: sqlite3.Connection, market: Mapping[str, Any]) 
     )
 
 
+def market_snapshot(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM market_snapshots WHERE market_id = ?", (market_id,)).fetchone()
+    item = row_to_dict(row)
+    if item is None:
+        return None
+    item["outcomes"] = json.loads(item.pop("outcomes_json"))
+    item["market_json"] = json.loads(item["market_json"])
+    return item
+
+
 def replace_market_contexts(conn: sqlite3.Connection, market_id: str, contexts: Iterable[Mapping[str, Any]]) -> None:
     conn.execute("DELETE FROM market_contexts WHERE market_id = ?", (market_id,))
     now = utc_now_iso()
@@ -110,20 +150,10 @@ def replace_market_contexts(conn: sqlite3.Connection, market_id: str, contexts: 
         )
 
 
-def market_snapshot(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM market_snapshots WHERE market_id = ?", (market_id,)).fetchone()
-    item = row_to_dict(row)
-    if item is None:
-        return None
-    item["outcomes"] = json.loads(item.pop("outcomes_json"))
-    item["market_json"] = json.loads(item["market_json"])
-    return item
-
-
 def market_contexts(conn: sqlite3.Connection, market_id: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT source_type, source_id, title, published_at, url, raw_text, display_text,
+        SELECT id, source_type, source_id, title, published_at, url, raw_text, display_text,
                importance_weight, normalized_payload_json, created_at
         FROM market_contexts
         WHERE market_id = ?
@@ -140,8 +170,138 @@ def market_contexts(conn: sqlite3.Connection, market_id: str) -> List[Dict[str, 
     ).fetchall()
     items = rows_to_dicts(rows)
     for item in items:
-        item["normalized_payload_json"] = json.loads(item["normalized_payload_json"])
+        item["normalized_payload_json"] = _json_loads_if_present(item.get("normalized_payload_json"))
     return items
+
+
+def upsert_event_cluster(conn: sqlite3.Connection, cluster: Mapping[str, Any]) -> Dict[str, Any]:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO event_clusters (
+          cluster_key, topic, title, description, status, canonical_start_time,
+          canonical_end_time, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cluster_key) DO UPDATE SET
+          topic=excluded.topic,
+          title=excluded.title,
+          description=excluded.description,
+          status=excluded.status,
+          canonical_start_time=excluded.canonical_start_time,
+          canonical_end_time=excluded.canonical_end_time,
+          updated_at=excluded.updated_at
+        """,
+        (
+            cluster["cluster_key"],
+            cluster["topic"],
+            cluster["title"],
+            cluster.get("description"),
+            cluster.get("status", "active"),
+            cluster.get("canonical_start_time"),
+            cluster.get("canonical_end_time"),
+            now,
+            now,
+        ),
+    )
+    row = conn.execute("SELECT * FROM event_clusters WHERE cluster_key = ?", (cluster["cluster_key"],)).fetchone()
+    return row_to_dict(row) or {}
+
+
+def replace_market_event_links(conn: sqlite3.Connection, market_id: str, links: Iterable[Mapping[str, Any]]) -> None:
+    conn.execute("DELETE FROM market_event_links WHERE market_id = ?", (market_id,))
+    now = utc_now_iso()
+    for link in links:
+        conn.execute(
+            """
+            INSERT INTO market_event_links (
+              market_id, event_cluster_id, link_confidence, link_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                int(link["event_cluster_id"]),
+                float(link.get("link_confidence", 1.0)),
+                link.get("link_reason"),
+                now,
+            ),
+        )
+
+
+def market_cluster_link(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT mel.*, ec.cluster_key, ec.topic, ec.title, ec.status AS cluster_status
+        FROM market_event_links mel
+        JOIN event_clusters ec ON ec.id = mel.event_cluster_id
+        WHERE mel.market_id = ?
+        ORDER BY mel.link_confidence DESC, mel.id ASC
+        LIMIT 1
+        """,
+        (market_id,),
+    ).fetchone()
+    return row_to_dict(row)
+
+
+def upsert_research_memo(conn: sqlite3.Connection, memo: Mapping[str, Any]) -> Dict[str, Any]:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO research_memos (
+          market_id, event_cluster_id, topic, source_bundle_hash, thesis,
+          supporting_evidence_json, counter_evidence_json, uncertainty_notes,
+          generated_by, memo_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(market_id, source_bundle_hash) DO UPDATE SET
+          event_cluster_id=excluded.event_cluster_id,
+          topic=excluded.topic,
+          thesis=excluded.thesis,
+          supporting_evidence_json=excluded.supporting_evidence_json,
+          counter_evidence_json=excluded.counter_evidence_json,
+          uncertainty_notes=excluded.uncertainty_notes,
+          generated_by=excluded.generated_by,
+          memo_json=excluded.memo_json
+        """,
+        (
+            memo["market_id"],
+            memo.get("event_cluster_id"),
+            memo["topic"],
+            memo["source_bundle_hash"],
+            memo["thesis"],
+            json.dumps(memo.get("supporting_evidence", []), sort_keys=False),
+            json.dumps(memo.get("counter_evidence", []), sort_keys=False),
+            memo.get("uncertainty_notes", ""),
+            memo["generated_by"],
+            json.dumps(dict(memo), sort_keys=False),
+            now,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT *
+        FROM research_memos
+        WHERE market_id = ? AND source_bundle_hash = ?
+        """,
+        (memo["market_id"], memo["source_bundle_hash"]),
+    ).fetchone()
+    item = row_to_dict(row) or {}
+    if item:
+        item["supporting_evidence_json"] = _json_loads_if_present(item.get("supporting_evidence_json"))
+        item["counter_evidence_json"] = _json_loads_if_present(item.get("counter_evidence_json"))
+        item["memo_json"] = _json_loads_if_present(item.get("memo_json"))
+    return item
+
+
+def latest_research_memo(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM research_memos WHERE market_id = ? ORDER BY id DESC LIMIT 1",
+        (market_id,),
+    ).fetchone()
+    item = row_to_dict(row)
+    if item:
+        item["supporting_evidence_json"] = _json_loads_if_present(item.get("supporting_evidence_json"))
+        item["counter_evidence_json"] = _json_loads_if_present(item.get("counter_evidence_json"))
+        item["memo_json"] = _json_loads_if_present(item.get("memo_json"))
+    return item
 
 
 def upsert_proposal(
@@ -151,6 +311,13 @@ def upsert_proposal(
     decision_engine: str,
     status: str,
     context_payload: Mapping[str, Any],
+    strategy_name: str | None = None,
+    topic: str | None = None,
+    event_cluster_id: int | None = None,
+    source_memo_id: int | None = None,
+    authorization_status: str = "none",
+    supervisor_decision: str | None = None,
+    priority_score: float | None = None,
 ) -> Dict[str, Any]:
     normalized = normalize_proposal(proposal)
     proposal_id = proposal_id_for(normalized)
@@ -165,6 +332,13 @@ def upsert_proposal(
         "decision_engine": decision_engine,
         "status": status,
         "max_slippage_bps": normalized["max_slippage_bps"],
+        "strategy_name": strategy_name,
+        "topic": topic,
+        "event_cluster_id": event_cluster_id,
+        "source_memo_id": source_memo_id,
+        "authorization_status": authorization_status,
+        "supervisor_decision": supervisor_decision,
+        "priority_score": priority_score,
         "proposal_json": json.dumps(normalized, sort_keys=False),
         "context_payload_json": json.dumps(context_payload, sort_keys=False),
         "created_at": now,
@@ -174,9 +348,10 @@ def upsert_proposal(
         """
         INSERT INTO proposals (
           proposal_id, market_id, outcome, confidence_score, recommended_size_usdc, reasoning,
-          decision_engine, status, max_slippage_bps, proposal_json, context_payload_json,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          decision_engine, status, max_slippage_bps, strategy_name, topic, event_cluster_id,
+          source_memo_id, authorization_status, supervisor_decision, priority_score,
+          proposal_json, context_payload_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id) DO UPDATE SET
           market_id=excluded.market_id,
           outcome=excluded.outcome,
@@ -186,6 +361,13 @@ def upsert_proposal(
           decision_engine=excluded.decision_engine,
           status=excluded.status,
           max_slippage_bps=excluded.max_slippage_bps,
+          strategy_name=excluded.strategy_name,
+          topic=excluded.topic,
+          event_cluster_id=excluded.event_cluster_id,
+          source_memo_id=excluded.source_memo_id,
+          authorization_status=excluded.authorization_status,
+          supervisor_decision=excluded.supervisor_decision,
+          priority_score=excluded.priority_score,
           proposal_json=excluded.proposal_json,
           context_payload_json=excluded.context_payload_json,
           updated_at=excluded.updated_at
@@ -222,26 +404,10 @@ def replace_proposal_contexts(conn: sqlite3.Connection, proposal_id: str, contex
         )
 
 
-def proposal_record(conn: sqlite3.Connection, proposal_id: str) -> Dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
-    item = row_to_dict(row)
-    if item is None:
-        return None
-    item["proposal_json"] = json.loads(item["proposal_json"])
-    item["context_payload_json"] = json.loads(item["context_payload_json"])
-    item["market"] = market_snapshot(conn, item["market_id"])
-    item["contexts"] = proposal_contexts(conn, proposal_id)
-    approval = conn.execute("SELECT * FROM approvals WHERE proposal_id = ?", (proposal_id,)).fetchone()
-    item["approval"] = row_to_dict(approval)
-    if item["approval"] and item["approval"].get("raw_callback_json"):
-        item["approval"]["raw_callback_json"] = json.loads(item["approval"]["raw_callback_json"])
-    return item
-
-
 def proposal_contexts(conn: sqlite3.Connection, proposal_id: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT source_type, source_id, title, published_at, url, raw_text, display_text,
+        SELECT id, source_type, source_id, title, published_at, url, raw_text, display_text,
                importance_weight, normalized_payload_json, created_at
         FROM proposal_contexts
         WHERE proposal_id = ?
@@ -258,18 +424,107 @@ def proposal_contexts(conn: sqlite3.Connection, proposal_id: str) -> List[Dict[s
     ).fetchall()
     items = rows_to_dicts(rows)
     for item in items:
-        item["normalized_payload_json"] = json.loads(item["normalized_payload_json"])
+        item["normalized_payload_json"] = _json_loads_if_present(item.get("normalized_payload_json"))
     return items
 
 
+def proposal_record(conn: sqlite3.Connection, proposal_id: str) -> Dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    item = row_to_dict(row)
+    if item is None:
+        return None
+    item["proposal_json"] = _json_loads_if_present(item.get("proposal_json"))
+    item["context_payload_json"] = _json_loads_if_present(item.get("context_payload_json"))
+    item["market"] = market_snapshot(conn, item["market_id"])
+    item["contexts"] = proposal_contexts(conn, proposal_id)
+    item["cluster"] = None
+    if item.get("event_cluster_id"):
+        cluster_row = conn.execute("SELECT * FROM event_clusters WHERE id = ?", (item["event_cluster_id"],)).fetchone()
+        item["cluster"] = row_to_dict(cluster_row)
+    memo_row = None
+    if item.get("source_memo_id"):
+        memo_row = conn.execute("SELECT * FROM research_memos WHERE id = ?", (item["source_memo_id"],)).fetchone()
+    item["research_memo"] = row_to_dict(memo_row)
+    if item["research_memo"]:
+        item["research_memo"]["memo_json"] = _json_loads_if_present(item["research_memo"].get("memo_json"))
+    approval = conn.execute("SELECT * FROM approvals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    item["approval"] = row_to_dict(approval)
+    if item["approval"] and item["approval"].get("raw_callback_json"):
+        item["approval"]["raw_callback_json"] = _json_loads_if_present(item["approval"]["raw_callback_json"])
+    return item
+
+
 def list_proposals(conn: sqlite3.Connection, proposal_ids: Iterable[str]) -> List[Dict[str, Any]]:
-    return [proposal_record(conn, proposal_id) for proposal_id in proposal_ids if proposal_record(conn, proposal_id) is not None]
+    items: List[Dict[str, Any]] = []
+    for proposal_id in proposal_ids:
+        record = proposal_record(conn, proposal_id)
+        if record is not None:
+            items.append(record)
+    return items
+
+
+def list_proposals_by_status(conn: sqlite3.Connection, statuses: Sequence[str], *, limit: int | None = None) -> List[Dict[str, Any]]:
+    if not statuses:
+        return []
+    placeholders = ", ".join("?" for _ in statuses)
+    sql = f"SELECT proposal_id FROM proposals WHERE status IN ({placeholders}) ORDER BY updated_at ASC, proposal_id ASC"
+    params: list[Any] = list(statuses)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [proposal_record(conn, str(row["proposal_id"])) for row in rows if proposal_record(conn, str(row["proposal_id"])) is not None]
 
 
 def update_proposal_status(conn: sqlite3.Connection, proposal_id: str, status: str) -> None:
     conn.execute(
         "UPDATE proposals SET status = ?, updated_at = ? WHERE proposal_id = ?",
         (status, utc_now_iso(), proposal_id),
+    )
+
+
+def update_proposal_workflow_fields(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    strategy_name: str | None = None,
+    topic: str | None = None,
+    event_cluster_id: int | None = None,
+    source_memo_id: int | None = None,
+    authorization_status: str | None = None,
+    supervisor_decision: str | None = None,
+    priority_score: float | None = None,
+    status: str | None = None,
+) -> None:
+    current = proposal_record(conn, proposal_id)
+    if current is None:
+        raise KeyError(f"Unknown proposal_id: {proposal_id}")
+    conn.execute(
+        """
+        UPDATE proposals
+        SET strategy_name = ?,
+            topic = ?,
+            event_cluster_id = ?,
+            source_memo_id = ?,
+            authorization_status = ?,
+            supervisor_decision = ?,
+            priority_score = ?,
+            status = ?,
+            updated_at = ?
+        WHERE proposal_id = ?
+        """,
+        (
+            strategy_name if strategy_name is not None else current.get("strategy_name"),
+            topic if topic is not None else current.get("topic"),
+            event_cluster_id if event_cluster_id is not None else current.get("event_cluster_id"),
+            source_memo_id if source_memo_id is not None else current.get("source_memo_id"),
+            authorization_status if authorization_status is not None else current.get("authorization_status"),
+            supervisor_decision if supervisor_decision is not None else current.get("supervisor_decision"),
+            priority_score if priority_score is not None else current.get("priority_score"),
+            status if status is not None else current.get("status"),
+            utc_now_iso(),
+            proposal_id,
+        ),
     )
 
 
@@ -334,9 +589,103 @@ def decision_status_for(conn: sqlite3.Connection, proposal_ids: Iterable[str]) -
                     "status": record["status"],
                     "proposal": record["proposal_json"],
                     "approval": record["approval"],
+                    "authorization_status": record.get("authorization_status"),
                 }
             )
     return results
+
+
+def create_strategy_authorization(conn: sqlite3.Connection, authorization: Mapping[str, Any]) -> Dict[str, Any]:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO strategy_authorizations (
+          strategy_name, scope_topic, scope_market_type, scope_event_cluster_id,
+          max_order_usdc, max_daily_gross_usdc, max_open_positions, max_daily_loss_usdc,
+          max_slippage_bps, allow_auto_execute, requires_human_if_above_usdc,
+          valid_from, valid_until, status, created_by, created_at, revoked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            authorization["strategy_name"],
+            authorization.get("scope_topic"),
+            authorization.get("scope_market_type"),
+            authorization.get("scope_event_cluster_id"),
+            float(authorization["max_order_usdc"]),
+            float(authorization["max_daily_gross_usdc"]),
+            int(authorization["max_open_positions"]),
+            float(authorization["max_daily_loss_usdc"]),
+            int(authorization["max_slippage_bps"]),
+            1 if authorization.get("allow_auto_execute") else 0,
+            authorization.get("requires_human_if_above_usdc"),
+            authorization["valid_from"],
+            authorization["valid_until"],
+            authorization.get("status", "active"),
+            authorization.get("created_by"),
+            now,
+            authorization.get("revoked_at"),
+        ),
+    )
+    row = conn.execute("SELECT * FROM strategy_authorizations WHERE id = last_insert_rowid()").fetchone()
+    return row_to_dict(row) or {}
+
+
+def list_strategy_authorizations(conn: sqlite3.Connection, *, status: str | None = None) -> List[Dict[str, Any]]:
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM strategy_authorizations WHERE status = ? ORDER BY created_at DESC, id DESC",
+            (status,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM strategy_authorizations ORDER BY created_at DESC, id DESC").fetchall()
+    return rows_to_dicts(rows)
+
+
+def record_shadow_execution(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO shadow_executions (
+          proposal_id, simulated_fill_price, simulated_size, simulated_notional,
+          simulated_status, context_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["proposal_id"],
+            payload.get("simulated_fill_price"),
+            payload.get("simulated_size"),
+            payload.get("simulated_notional"),
+            payload["simulated_status"],
+            json.dumps(payload.get("context_json", {}), sort_keys=False),
+            payload.get("created_at", utc_now_iso()),
+        ),
+    )
+    row = conn.execute("SELECT * FROM shadow_executions WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("context_json"):
+        item["context_json"] = _json_loads_if_present(item["context_json"])
+    return item
+
+
+def list_shadow_executions(conn: sqlite3.Connection, proposal_id: str | None = None) -> List[Dict[str, Any]]:
+    if proposal_id:
+        rows = conn.execute(
+            "SELECT * FROM shadow_executions WHERE proposal_id = ? ORDER BY id DESC",
+            (proposal_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM shadow_executions ORDER BY id DESC").fetchall()
+    items = rows_to_dicts(rows)
+    for item in items:
+        item["context_json"] = _json_loads_if_present(item.get("context_json"))
+    return items
+
+
+def _sync_position_for_execution(conn: sqlite3.Connection, execution_id: int) -> None:
+    try:
+        from .services.position_manager import sync_position_for_execution
+    except Exception:
+        return
+    sync_position_for_execution(conn, execution_id)
 
 
 def record_execution(conn: sqlite3.Connection, execution: Mapping[str, Any]) -> Dict[str, Any]:
@@ -372,18 +721,45 @@ def record_execution(conn: sqlite3.Connection, execution: Mapping[str, Any]) -> 
     if payload["status"] in {"filled", "submitted", "live"}:
         update_proposal_status(conn, payload["proposal_id"], "executed")
     elif payload["status"] == "failed":
-        current = conn.execute(
-            "SELECT status FROM proposals WHERE proposal_id = ?",
-            (payload["proposal_id"],),
-        ).fetchone()
+        current = conn.execute("SELECT status FROM proposals WHERE proposal_id = ?", (payload["proposal_id"],)).fetchone()
         current_status = current["status"] if current else None
         if payload.get("error_message") not in {"proposal_not_approved"} and current_status not in {"executed"}:
             update_proposal_status(conn, payload["proposal_id"], "failed")
     row = conn.execute("SELECT * FROM executions WHERE rowid = last_insert_rowid()").fetchone()
     result = row_to_dict(row) or {}
     if result.get("order_intent_json"):
-        result["order_intent_json"] = json.loads(result["order_intent_json"])
+        result["order_intent_json"] = _json_loads_if_present(result["order_intent_json"])
+    if result.get("id") and result.get("status") in {"filled", "submitted", "live"}:
+        _sync_position_for_execution(conn, int(result["id"]))
     return result
+
+
+def update_execution(conn: sqlite3.Connection, execution_id: int, fields: Mapping[str, Any]) -> Dict[str, Any]:
+    if not fields:
+        row = conn.execute("SELECT * FROM executions WHERE id = ?", (execution_id,)).fetchone()
+        item = row_to_dict(row) or {}
+        if item.get("order_intent_json"):
+            item["order_intent_json"] = _json_loads_if_present(item["order_intent_json"])
+        return item
+    assignments: list[str] = []
+    values: list[Any] = []
+    for key, value in fields.items():
+        assignments.append(f"{key} = ?")
+        if key == "order_intent_json" and not isinstance(value, str):
+            values.append(json.dumps(value, sort_keys=False))
+        else:
+            values.append(value)
+    assignments.append("updated_at = ?")
+    values.append(utc_now_iso())
+    values.append(execution_id)
+    conn.execute(f"UPDATE executions SET {', '.join(assignments)} WHERE id = ?", tuple(values))
+    row = conn.execute("SELECT * FROM executions WHERE id = ?", (execution_id,)).fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("order_intent_json"):
+        item["order_intent_json"] = _json_loads_if_present(item["order_intent_json"])
+    if item.get("status") in {"filled", "submitted", "live"}:
+        _sync_position_for_execution(conn, execution_id)
+    return item
 
 
 def latest_execution(conn: sqlite3.Connection, proposal_id: str, mode: str | None = None) -> Dict[str, Any] | None:
@@ -393,14 +769,262 @@ def latest_execution(conn: sqlite3.Connection, proposal_id: str, mode: str | Non
             (proposal_id, mode),
         ).fetchone()
     else:
-        row = conn.execute(
-            "SELECT * FROM executions WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
-            (proposal_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM executions WHERE proposal_id = ? ORDER BY id DESC LIMIT 1", (proposal_id,)).fetchone()
     item = row_to_dict(row)
     if item and item.get("order_intent_json"):
-        item["order_intent_json"] = json.loads(item["order_intent_json"])
+        item["order_intent_json"] = _json_loads_if_present(item["order_intent_json"])
     return item
+
+
+def list_executions(
+    conn: sqlite3.Connection,
+    *,
+    statuses: Sequence[str] | None = None,
+    mode: str | None = None,
+) -> List[Dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+    if mode:
+        clauses.append("mode = ?")
+        params.append(mode)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(f"SELECT * FROM executions {where} ORDER BY id DESC", tuple(params)).fetchall()
+    items = rows_to_dicts(rows)
+    for item in items:
+        item["order_intent_json"] = _json_loads_if_present(item.get("order_intent_json"))
+    return items
+
+
+def record_position(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO positions (
+          proposal_id, execution_id, market_id, event_cluster_id, outcome, entry_price,
+          size_usdc, filled_qty, status, entry_time, last_mark_price, unrealized_pnl,
+          realized_pnl, strategy_name, is_shadow, mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(execution_id, is_shadow) DO UPDATE SET
+          market_id=excluded.market_id,
+          event_cluster_id=excluded.event_cluster_id,
+          outcome=excluded.outcome,
+          entry_price=excluded.entry_price,
+          size_usdc=excluded.size_usdc,
+          filled_qty=excluded.filled_qty,
+          status=excluded.status,
+          entry_time=excluded.entry_time,
+          last_mark_price=excluded.last_mark_price,
+          unrealized_pnl=excluded.unrealized_pnl,
+          realized_pnl=excluded.realized_pnl,
+          strategy_name=excluded.strategy_name,
+          mode=excluded.mode,
+          updated_at=excluded.updated_at
+        """,
+        (
+            payload["proposal_id"],
+            payload["execution_id"],
+            payload["market_id"],
+            payload.get("event_cluster_id"),
+            payload["outcome"],
+            payload.get("entry_price"),
+            payload["size_usdc"],
+            payload.get("filled_qty"),
+            payload["status"],
+            payload["entry_time"],
+            payload.get("last_mark_price"),
+            payload.get("unrealized_pnl"),
+            payload.get("realized_pnl"),
+            payload.get("strategy_name"),
+            1 if payload.get("is_shadow") else 0,
+            payload.get("mode", "real"),
+            payload["created_at"],
+            payload["updated_at"],
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM positions WHERE execution_id = ? AND is_shadow = ?",
+        (payload["execution_id"], 1 if payload.get("is_shadow") else 0),
+    ).fetchone()
+    return row_to_dict(row) or {}
+
+
+def record_position_event(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO position_events (position_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            payload["position_id"],
+            payload["event_type"],
+            json.dumps(payload.get("payload_json", {}), sort_keys=False),
+            payload.get("created_at", utc_now_iso()),
+        ),
+    )
+    row = conn.execute("SELECT * FROM position_events WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
+    return item
+
+
+def list_positions(conn: sqlite3.Connection, *, statuses: Sequence[str] | None = None, is_shadow: bool | None = None) -> List[Dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+    if is_shadow is not None:
+        clauses.append("is_shadow = ?")
+        params.append(1 if is_shadow else 0)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(f"SELECT * FROM positions {where} ORDER BY id DESC", tuple(params)).fetchall()
+    return rows_to_dicts(rows)
+
+
+def position_for_execution(conn: sqlite3.Connection, execution_id: int, *, is_shadow: bool = False) -> Dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM positions WHERE execution_id = ? AND is_shadow = ?",
+        (execution_id, 1 if is_shadow else 0),
+    ).fetchone()
+    return row_to_dict(row)
+
+
+def record_order_reconciliation(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO order_reconciliations (
+          execution_id, external_order_id, observed_status, observed_fill_qty,
+          observed_fill_price, reconciliation_result, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["execution_id"],
+            payload.get("external_order_id"),
+            payload.get("observed_status"),
+            payload.get("observed_fill_qty"),
+            payload.get("observed_fill_price"),
+            payload["reconciliation_result"],
+            json.dumps(payload.get("payload_json", {}), sort_keys=False),
+            payload.get("created_at", utc_now_iso()),
+        ),
+    )
+    row = conn.execute("SELECT * FROM order_reconciliations WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
+    return item
+
+
+def set_kill_switch(
+    conn: sqlite3.Connection,
+    *,
+    scope_type: str,
+    scope_key: str,
+    reason: str,
+    created_by: str | None = None,
+) -> Dict[str, Any]:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO kill_switches (
+          scope_type, scope_key, status, reason, created_by, created_at, released_at
+        ) VALUES (?, ?, 'active', ?, ?, ?, NULL)
+        """,
+        (scope_type, scope_key, reason, created_by, now),
+    )
+    row = conn.execute("SELECT * FROM kill_switches WHERE id = last_insert_rowid()").fetchone()
+    return row_to_dict(row) or {}
+
+
+def release_kill_switch(conn: sqlite3.Connection, kill_id: int) -> Dict[str, Any] | None:
+    conn.execute(
+        "UPDATE kill_switches SET status = 'released', released_at = ? WHERE id = ?",
+        (utc_now_iso(), kill_id),
+    )
+    row = conn.execute("SELECT * FROM kill_switches WHERE id = ?", (kill_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_kill_switches(conn: sqlite3.Connection, *, active_only: bool = False) -> List[Dict[str, Any]]:
+    if active_only:
+        rows = conn.execute("SELECT * FROM kill_switches WHERE status = 'active' ORDER BY id DESC").fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM kill_switches ORDER BY id DESC").fetchall()
+    return rows_to_dicts(rows)
+
+
+def record_exit_recommendation(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO exit_recommendations (
+          position_id, recommendation, target_reduce_pct, reasoning,
+          confidence_score, created_at, action_status, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["position_id"],
+            payload["recommendation"],
+            payload.get("target_reduce_pct"),
+            payload["reasoning"],
+            payload["confidence_score"],
+            payload.get("created_at", utc_now_iso()),
+            payload.get("action_status", "generated"),
+            json.dumps(payload.get("payload_json", {}), sort_keys=False),
+        ),
+    )
+    row = conn.execute("SELECT * FROM exit_recommendations WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
+    return item
+
+
+def record_agent_review(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO agent_reviews (
+          position_id, proposal_id, event_cluster_id, review_type, summary,
+          what_worked, what_failed, failure_bucket, next_action, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.get("position_id"),
+            payload.get("proposal_id"),
+            payload.get("event_cluster_id"),
+            payload["review_type"],
+            payload["summary"],
+            json.dumps(payload.get("what_worked", []), sort_keys=False),
+            json.dumps(payload.get("what_failed", []), sort_keys=False),
+            payload["failure_bucket"],
+            payload["next_action"],
+            json.dumps(payload.get("payload_json", {}), sort_keys=False),
+            payload.get("created_at", utc_now_iso()),
+        ),
+    )
+    row = conn.execute("SELECT * FROM agent_reviews WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
+    if item.get("what_worked"):
+        item["what_worked"] = _json_loads_if_present(item["what_worked"])
+    if item.get("what_failed"):
+        item["what_failed"] = _json_loads_if_present(item["what_failed"])
+    return item
+
+
+def list_reviews(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute("SELECT * FROM agent_reviews ORDER BY id DESC").fetchall()
+    items = rows_to_dicts(rows)
+    for item in items:
+        item["payload_json"] = _json_loads_if_present(item.get("payload_json"))
+        item["what_worked"] = _json_loads_if_present(item.get("what_worked"))
+        item["what_failed"] = _json_loads_if_present(item.get("what_failed"))
+    return items
 
 
 def upsert_market_resolution(conn: sqlite3.Connection, market_id: str, resolved_outcome: str, payload: Mapping[str, Any]) -> None:
@@ -420,3 +1044,11 @@ def upsert_market_resolution(conn: sqlite3.Connection, market_id: str, resolved_
             json.dumps(payload, sort_keys=False),
         ),
     )
+
+
+def market_resolution(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM market_resolutions WHERE market_id = ?", (market_id,)).fetchone()
+    item = row_to_dict(row)
+    if item and item.get("source_payload_json"):
+        item["source_payload_json"] = _json_loads_if_present(item["source_payload_json"])
+    return item

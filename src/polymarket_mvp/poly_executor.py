@@ -6,8 +6,12 @@ import os
 import sys
 from typing import Any, Dict, List
 
+import requests
+
 from .common import dump_json, get_env_float, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
-from .db import connect_db, init_db, latest_execution, proposal_record, record_execution
+from .db import connect_db, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
+from .services.kill_switch_service import check_kill_switch
+from .services.shadow_service import create_shadow_execution
 
 load_repo_env()
 BALANCE_SANITY_REASON = "Balance sanity check failed"
@@ -17,6 +21,37 @@ ACCOUNT_MODE_NAMES = {
     1: "poly_proxy",
     2: "poly_gnosis_safe",
 }
+
+
+def _maybe_notify_auto_execution(record: Dict[str, Any], execution: Dict[str, Any]) -> None:
+    token = os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TG_CHAT_ID")
+    if not token or not chat_id:
+        return
+    if str(record.get("status")) != "authorized_for_execution":
+        return
+    base = (os.getenv("TG_BASE_URL") or "https://api.telegram.org").rstrip("/")
+    text = "\n".join(
+        [
+            "Polymarket auto-execution update",
+            f"Proposal ID: {record['proposal_id']}",
+            f"Market: {(record.get('market') or {}).get('question') or record['market_id']}",
+            f"Outcome: {record['proposal_json']['outcome']}",
+            f"Mode: {execution['mode']}",
+            f"Status: {execution['status']}",
+            f"Order ID: {execution.get('txhash_or_order_id') or 'n/a'}",
+            f"Error: {execution.get('error_message') or 'none'}",
+        ]
+    )
+    try:
+        response = requests.post(
+            f"{base}/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=20,
+        )
+        response.raise_for_status()
+    except Exception:
+        return
 
 
 def _env_any(*names: str, required: bool = False, default: str | None = None) -> str | None:
@@ -298,9 +333,13 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     proposal = record["proposal_json"]
     session_state = session_state or {"cumulative_spend_usdc": 0.0}
     approval = record.get("approval") or {}
-    is_approved = approval.get("decision") == "approved"
+    is_approved = approval.get("decision") == "approved" or record.get("status") in {"approved", "authorized_for_execution"}
     if not is_approved:
-        return _failed_execution(record, mode, "proposal_not_approved")
+        return _failed_execution(record, mode, "proposal_not_authorized")
+
+    kill_check = check_kill_switch(conn, record)
+    if kill_check["blocked"]:
+        return _failed_execution(record, mode, f"blocked_by_kill_switch: {kill_check['reason']}")
 
     prior = latest_execution(conn, record["proposal_id"], mode="real") if mode == "real" else None
     if mode == "real" and prior and prior.get("status") in {"filled", "submitted", "live"}:
@@ -397,6 +436,10 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
         "updated_at": utc_now_iso(),
     }
     if mode == "real":
+        try:
+            create_shadow_execution(conn, record, simulated_fill_price=requested_price, simulated_status="pretrade_shadow")
+        except Exception:
+            pass
         if client is None:
             return _failed_execution(record, mode, "real_client_missing", preflight=preflight)
         real_client = client
@@ -422,8 +465,10 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Execute approved Polymarket proposals in mock or real mode.")
-    parser.add_argument("--proposal-file", required=True, help="Proposal JSON file.")
+    parser.add_argument("--proposal-file", help="Proposal JSON file.")
     parser.add_argument("--mode", choices=["mock", "real"], default="mock")
+    parser.add_argument("--source", choices=["file", "authorized_queue"], default="file")
+    parser.add_argument("--limit", type=int, default=20, help="Queue execution limit when --source=authorized_queue.")
     parser.add_argument("--output", help="Optional file path for JSON output.")
     return parser
 
@@ -431,21 +476,31 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     init_db()
-    proposals = read_proposals(args.proposal_file)
-    proposal_ids = [proposal_id_for(item) for item in proposals]
     executions: List[Dict[str, Any]] = []
     session_state: Dict[str, float] = {"cumulative_spend_usdc": 0.0}
     fatal_abort = False
     with connect_db() as conn:
-        for proposal_id in proposal_ids:
-            record = proposal_record(conn, proposal_id)
-            if record is None:
-                raise RuntimeError(f"Proposal {proposal_id} not found in database.")
+        records: List[Dict[str, Any]]
+        if args.source == "authorized_queue":
+            records = list_proposals_by_status(conn, ["authorized_for_execution"], limit=args.limit)
+        else:
+            if not args.proposal_file:
+                raise RuntimeError("--proposal-file is required when --source=file")
+            proposals = read_proposals(args.proposal_file)
+            proposal_ids = [proposal_id_for(item) for item in proposals]
+            records = []
+            for proposal_id in proposal_ids:
+                record = proposal_record(conn, proposal_id)
+                if record is None:
+                    raise RuntimeError(f"Proposal {proposal_id} not found in database.")
+                records.append(record)
+        for record in records:
             try:
                 execution = execute_record(conn, record, mode=args.mode, session_state=session_state)
             except Exception as exc:
                 execution = _failed_execution(record, args.mode, f"executor_unhandled: {exc}")
             stored = record_execution(conn, execution)
+            _maybe_notify_auto_execution(record, stored)
             executions.append(stored)
             if args.mode == "real" and isinstance(stored.get("error_message"), str) and BALANCE_SANITY_REASON in stored["error_message"]:
                 fatal_abort = True
@@ -454,6 +509,7 @@ def main() -> int:
     summary = {
         "generated_at": utc_now_iso(),
         "mode": args.mode,
+        "source": args.source,
         "session_cumulative_spend_usdc": session_state["cumulative_spend_usdc"],
         "session_max_spend_usdc": get_env_float("SESSION_MAX_SPEND_USDC", 50.0),
         "aborted_on_balance_sanity_check": fatal_abort,

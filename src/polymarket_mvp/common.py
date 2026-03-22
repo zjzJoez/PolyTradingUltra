@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Union
@@ -24,8 +25,16 @@ VALID_PROPOSAL_STATUSES = {
     "pending_approval",
     "approved",
     "rejected",
+    "authorized_for_execution",
     "executed",
     "failed",
+    "expired",
+    "cancelled",
+}
+VALID_AUTHORIZATION_STATUSES = {
+    "none",
+    "matched_manual_only",
+    "matched_auto_execute",
 }
 _ENV_LOADED = False
 
@@ -157,6 +166,10 @@ def json_dumps_compact(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def stable_hash(value: Any) -> str:
+    return hashlib.sha256(json_dumps_compact(value).encode("utf-8")).hexdigest()
+
+
 def normalize_proposal(proposal: Mapping[str, Any], *, default_max_slippage_bps: int = 500) -> Dict[str, Any]:
     keys = set(proposal.keys())
     if keys == set(LEGACY_PROPOSAL_KEYS):
@@ -235,6 +248,14 @@ def sanitize_text(value: str) -> str:
 
 def strip_urls(value: str) -> str:
     return sanitize_text(re.sub(r"https?://\S+|www\.\S+", "", value or ""))
+
+
+def slugify_text(value: str, *, fallback: str = "item", max_length: int = 80) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-").lower()
+    if not normalized:
+        normalized = fallback
+    return normalized[:max_length].strip("-") or fallback
 
 
 def outcome_map(market: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:

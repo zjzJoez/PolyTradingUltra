@@ -1,8 +1,10 @@
-name: openclaw-polymarket-v0_2
+name: openclaw-polymarket-v0_4
 description: >
-  v0.2 Polymarket event-driven flow: scan active markets, fetch external context,
-  generate proposals, apply hard risk checks, require Telegram approval,
-  then execute approved proposals in mock or real mode with SQLite as the source of truth.
+  v0.4 authorization-first Polymarket workflow: scan markets, fetch contexts,
+  cluster events, build memos, generate proposals, apply risk plus authorization,
+  execute the authorized queue, then refresh positions and generate a position report.
+  Human Telegram approval remains available as a separate operator path for proposals
+  that stay in pending_approval.
 
 env:
   POLYMARKET_MVP_STATE_DIR: ./var
@@ -10,7 +12,7 @@ env:
 
 steps:
   - id: init_db
-    name: Initialize SQLite
+    name: Initialize Or Migrate SQLite
     command: >
       PYTHONPATH=src python3 -m polymarket_mvp.db_init
 
@@ -29,6 +31,20 @@ steps:
       --market-file artifacts/markets.json
       --output artifacts/contexts.json
 
+  - id: cluster_events
+    name: Cluster Events
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.cluster_events
+      --market-file artifacts/markets.json
+      --output artifacts/clusters.json
+
+  - id: build_memos
+    name: Build Research Memos
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.build_memos
+      --market-file artifacts/markets.json
+      --output artifacts/memos.json
+
   - id: generate_proposals
     name: Generate Proposals
     command: >
@@ -36,41 +52,34 @@ steps:
       --market-file artifacts/markets.json
       --context-file artifacts/contexts.json
       --engine heuristic
-      --size-usdc 10
+      --size-usdc 5
       --top 3
       --max-slippage-bps 500
-      --output artifacts/proposals-v2.json
+      --output artifacts/proposals.json
 
-  - id: apply_risk_gate
-    name: Apply Risk Gate
+  - id: apply_risk_and_authorization
+    name: Apply Risk And Authorization
     command: >
       PYTHONPATH=src python3 -m polymarket_mvp.risk_engine
-      --proposal-file artifacts/proposals-v2.json
+      --proposal-file artifacts/proposals.json
       --output artifacts/risk.json
 
-  - id: send_for_telegram_approval
-    name: Send Telegram Approval Request
-    command: >
-      PYTHONPATH=src python3 -m polymarket_mvp.tg_approver
-      send
-      --proposal-file artifacts/proposals-v2.json
-      --output artifacts/approval-request.json
-
-  - id: wait_for_decision
-    name: Wait For Human Decision
-    command: >
-      PYTHONPATH=src python3 -m polymarket_mvp.tg_approver
-      await
-      --proposal-file artifacts/proposals-v2.json
-      --timeout-seconds 1800
-      --poll-interval 5
-      --output artifacts/approval-status.json
-
-  - id: execute_after_approval
-    name: Execute Approved Trades
+  - id: execute_authorized_queue
+    name: Execute Authorized Queue
     command: >
       PYTHONPATH=src python3 -m polymarket_mvp.poly_executor
-      --proposal-file artifacts/proposals-v2.json
+      --source authorized_queue
       --mode mock
-      --output artifacts/execution.json
-    condition: ${steps.wait_for_decision.output.approved == true}
+      --output artifacts/authorized-execution.json
+
+  - id: refresh_positions
+    name: Refresh Positions
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.update_positions
+      --output artifacts/positions.json
+
+  - id: position_report
+    name: Position Report
+    command: >
+      PYTHONPATH=src python3 -m polymarket_mvp.position_report
+      --output artifacts/position-report.json
