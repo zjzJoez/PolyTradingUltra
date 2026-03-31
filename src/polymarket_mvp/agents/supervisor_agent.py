@@ -16,14 +16,17 @@ def supervise_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         "merge_group": None,
         "notes": "deterministic supervisor pass-through",
     }
-    generated = maybe_generate_supervisor_decision(
-        {
-            "proposal": proposal,
-            "topic": deterministic["topic"],
-            "event_cluster_id": deterministic["event_cluster_id"],
-            "reasoning": proposal["reasoning"],
-        }
-    )
+    try:
+        generated = maybe_generate_supervisor_decision(
+            {
+                "proposal": proposal,
+                "topic": deterministic["topic"],
+                "event_cluster_id": deterministic["event_cluster_id"],
+                "reasoning": proposal["reasoning"],
+            }
+        )
+    except Exception:
+        generated = None
     if isinstance(generated, dict):
         deterministic.update(
             {

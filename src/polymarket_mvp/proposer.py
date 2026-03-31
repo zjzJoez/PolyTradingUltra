@@ -27,6 +27,7 @@ from .db import (
 from .agents.supervisor_agent import supervise_record
 from .services.event_cluster_service import cluster_market
 from .services.memo_service import build_and_store_memo
+from .services.openclaw_adapter import maybe_generate_trade_proposals
 
 
 def _extract_yes_no_prices(market: Mapping[str, Any]) -> Dict[str, float]:
@@ -37,6 +38,15 @@ def _extract_yes_no_prices(market: Mapping[str, Any]) -> Dict[str, float]:
         if name in {"Yes", "No"} and isinstance(price, (int, float)):
             prices[name] = float(price)
     return prices
+
+
+def _market_outcome_names(market: Mapping[str, Any]) -> List[str]:
+    names: List[str] = []
+    for outcome in market.get("outcomes", []):
+        name = outcome.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
 
 
 def build_heuristic_proposals(
@@ -95,13 +105,125 @@ def resolve_context_payload(context_file: Dict[str, Any] | None, market_id: str)
     return {"market_id": market_id, "context_budget_chars": 0, "assembled_text": "", "sources": []}
 
 
+def build_openclaw_proposals(
+    markets: List[Mapping[str, Any]],
+    *,
+    context_file: Dict[str, Any] | None,
+    size_usdc: float,
+    top: int,
+    max_slippage_bps: int,
+) -> List[Dict[str, Any]]:
+    market_outcomes = {str(market["market_id"]): _market_outcome_names(market) for market in markets[:25]}
+    prompt_payload = {
+        "constraints": {
+            "top": top,
+            "default_recommended_size_usdc": size_usdc,
+            "max_slippage_bps": max_slippage_bps,
+            "outcome_rule": "Each proposal outcome must exactly match one of the provided outcomes for that market.",
+            "duplicate_rule": "Do not return duplicate proposals or multiple outcomes for the same market unless explicitly requested.",
+            "empty_result_rule": "If there is not enough evidence for a valid proposal, return an empty proposals list.",
+        },
+        "output_contract": {
+            "json_only": True,
+            "preferred_top_level_shape": {"proposals": []},
+            "top_level_array_also_accepted": True,
+            "proposal_required_keys": [
+                "market_id",
+                "outcome",
+                "confidence_score",
+                "recommended_size_usdc",
+                "reasoning",
+                "max_slippage_bps",
+            ],
+            "proposal_field_rules": {
+                "market_id": "must exactly match a provided market_id",
+                "outcome": "must exactly match one provided allowed_outcomes entry for that market",
+                "confidence_score": "number in [0, 1]",
+                "recommended_size_usdc": "positive number",
+                "reasoning": "concise factual plain text grounded only in the provided payload",
+                "max_slippage_bps": f"positive integer <= {max_slippage_bps}",
+            },
+            "drop_invalid_instead_of_guessing": True,
+            "extra_fields_forbidden": True,
+        },
+        "markets": [],
+    }
+    for market in markets[:25]:
+        context_blob = resolve_context_payload(context_file, str(market["market_id"]))
+        prompt_payload["markets"].append(
+            {
+                "market_id": market["market_id"],
+                "question": market.get("question"),
+                "liquidity_usdc": market.get("liquidity_usdc"),
+                "volume_24h_usdc": market.get("volume_24h_usdc"),
+                "days_to_expiry": market.get("days_to_expiry"),
+                "end_date": market.get("end_date"),
+                "allowed_outcomes": market_outcomes[str(market["market_id"])],
+                "outcomes": [
+                    {
+                        "name": item.get("name"),
+                        "price": item.get("price"),
+                        "token_id": item.get("token_id"),
+                    }
+                    for item in market.get("outcomes", [])
+                ],
+                "context": {
+                    "topic": context_blob.get("topic"),
+                    "assembled_text": context_blob.get("assembled_text"),
+                    "sources": context_blob.get("sources", [])[:5],
+                },
+            }
+        )
+    generated = maybe_generate_trade_proposals(prompt_payload)
+    if not generated:
+        raise RuntimeError(
+            "OpenClaw proposal generation returned no JSON proposals. "
+            "Configure OpenClaw transport or pass --proposal-file."
+        )
+    proposals: List[Dict[str, Any]] = []
+    invalid_items: List[str] = []
+    seen_ids = set()
+    for item in generated:
+        market_id = str(item["market_id"])
+        allowed_outcomes = market_outcomes.get(market_id, [])
+        outcome = str(item["outcome"]).strip()
+        if outcome not in allowed_outcomes:
+            invalid_items.append(
+                f"market_id={market_id} outcome={outcome!r} allowed={allowed_outcomes}"
+            )
+            continue
+        normalized = normalize_proposal(
+            {
+                "market_id": market_id,
+                "outcome": outcome,
+                "confidence_score": item["confidence_score"],
+                "recommended_size_usdc": item.get("recommended_size_usdc", size_usdc),
+                "reasoning": item["reasoning"],
+                "max_slippage_bps": item.get("max_slippage_bps", max_slippage_bps),
+            }
+        )
+        proposal_id = proposal_id_for(normalized)
+        if proposal_id in seen_ids:
+            continue
+        seen_ids.add(proposal_id)
+        proposals.append(normalized)
+        if len(proposals) >= top:
+            break
+    if not proposals and invalid_items:
+        raise RuntimeError(
+            "OpenClaw proposal generation returned only invalid outcomes: "
+            + "; ".join(invalid_items[:5])
+        )
+    return proposals
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate normalized proposal records and persist them to SQLite.")
     parser.add_argument("--market-file", help="Scanner JSON file.")
     parser.add_argument("--input", dest="legacy_market_file", help="Legacy alias for --market-file.")
     parser.add_argument("--context-file", help="event_fetcher output JSON file.")
     parser.add_argument("--engine", choices=["heuristic", "openclaw_llm"], default="heuristic")
-    parser.add_argument("--proposal-file", help="External OpenClaw/LLM proposal JSON file when engine=openclaw_llm.")
+    parser.add_argument("--proposal-file", help="Optional external OpenClaw/LLM proposal JSON file when engine=openclaw_llm.")
     parser.add_argument("--min-confidence", type=float, default=0.6)
     parser.add_argument("--size-usdc", type=float, default=10.0)
     parser.add_argument("--size-u", dest="legacy_size_usdc", type=float, help="Legacy alias for --size-usdc.")
@@ -122,9 +244,16 @@ def main() -> int:
     markets = list(markets_payload.get("markets", []))
     context_payload = load_json(args.context_file) if args.context_file else None
     if args.engine == "openclaw_llm":
-        if not args.proposal_file:
-            raise RuntimeError("--proposal-file is required when --engine=openclaw_llm")
-        proposals = read_proposals(args.proposal_file)
+        if args.proposal_file:
+            proposals = read_proposals(args.proposal_file)
+        else:
+            proposals = build_openclaw_proposals(
+                markets,
+                context_file=context_payload,
+                size_usdc=size_usdc,
+                top=args.top,
+                max_slippage_bps=args.max_slippage_bps,
+            )
     else:
         proposals = build_heuristic_proposals(
             markets,

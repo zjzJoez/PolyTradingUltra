@@ -51,7 +51,7 @@ steps:
       PYTHONPATH=src python3 -m polymarket_mvp.proposer
       --market-file artifacts/markets.json
       --context-file artifacts/contexts.json
-      --engine heuristic
+      --engine openclaw_llm
       --size-usdc 5
       --top 3
       --max-slippage-bps 500

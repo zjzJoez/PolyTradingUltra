@@ -154,6 +154,15 @@ Important variable groups:
   - `APIFY_TOKEN` or `APIFY_API_KEY`
   - `PERPLEXITY_API_KEY`
   - `PERPLEXITY_MODEL`
+- OpenClaw
+  - `OPENCLAW_TRANSPORT`
+  - `OPENCLAW_CLI_PATH`
+  - `OPENCLAW_AGENT_ID`
+  - `OPENCLAW_THINKING`
+  - `OPENCLAW_TIMEOUT_SECONDS`
+  - `OPENCLAW_API_URL`
+  - `OPENCLAW_API_KEY`
+  - `OPENCLAW_MODEL`
 - Risk
   - `POLY_RISK_MAX_ORDER_USDC`
   - `POLY_RISK_MIN_CONFIDENCE`
@@ -309,8 +318,8 @@ Create a JSON file like:
   "max_slippage_bps": 500,
   "allow_auto_execute": true,
   "requires_human_if_above_usdc": 5.0,
-  "valid_from": "2026-03-21T00:00:00Z",
-  "valid_until": "2026-03-23T00:00:00Z",
+  "valid_from": "2026-03-31T00:00:00Z",
+  "valid_until": "2026-12-31T00:00:00Z",
   "status": "active",
   "created_by": "operator"
 }
@@ -349,6 +358,26 @@ PYTHONPATH=src python3 -m polymarket_mvp.proposer \
   --proposal-file artifacts/openclaw-proposals.json \
   --output artifacts/proposals.json
 ```
+
+Direct OpenClaw generation:
+
+```bash
+OPENCLAW_TRANSPORT=cli \
+PYTHONPATH=src python3 -m polymarket_mvp.proposer \
+  --market-file artifacts/markets.json \
+  --context-file artifacts/contexts.json \
+  --engine openclaw_llm \
+  --size-usdc 5 \
+  --top 3 \
+  --max-slippage-bps 500 \
+  --output artifacts/proposals.json
+```
+
+Notes:
+
+- `OPENCLAW_TRANSPORT=cli` uses your local `openclaw agent --local --json`.
+- If `OPENCLAW_TRANSPORT` is omitted, the adapter tries `OPENCLAW_API_URL` first, then local CLI, then OpenAI chat completion fallback.
+- `--proposal-file` remains supported when you want OpenClaw to run outside the repo and only import the final JSON.
 
 ### 8. Apply risk and authorization
 

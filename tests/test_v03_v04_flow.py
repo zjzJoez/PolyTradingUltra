@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from polymarket_mvp.common import parse_iso8601, proposal_id_for, utc_now_iso
 from polymarket_mvp.db import (
     connect_db,
     create_strategy_authorization,
@@ -13,13 +15,18 @@ from polymarket_mvp.db import (
     list_positions,
     market_snapshot,
     proposal_record,
+    record_execution,
     set_kill_switch,
     upsert_market_snapshot,
     upsert_proposal,
+    upsert_market_resolution,
 )
 from polymarket_mvp.poly_executor import execute_record
+from polymarket_mvp.proposer import build_openclaw_proposals
 from polymarket_mvp.risk_engine import evaluate_full_record
-from polymarket_mvp.common import proposal_id_for
+from polymarket_mvp.agents.supervisor_agent import supervise_record
+from polymarket_mvp.services.position_manager import sync_all_positions, update_position_marks
+from polymarket_mvp.services.openclaw_adapter import chat_json
 
 
 OLD_SCHEMA = """
@@ -95,6 +102,28 @@ def sample_proposal() -> dict:
     }
 
 
+def sample_updown_market() -> dict:
+    market = sample_market()
+    market["market_id"] = "m2"
+    market["question"] = "Will SOL be up in the next hour?"
+    market["slug"] = "sol-next-hour"
+    market["market_url"] = "https://polymarket.com/event/sol-next-hour"
+    market["condition_id"] = "cond-2"
+    market["outcomes"] = [
+        {"name": "Up", "price": 0.44, "token_id": "tok_up"},
+        {"name": "Down", "price": 0.56, "token_id": "tok_down"},
+    ]
+    return market
+
+
+def active_authorization_window() -> tuple[str, str]:
+    now = parse_iso8601(utc_now_iso())
+    return (
+        (now - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        (now + timedelta(days=30)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    )
+
+
 class TradingOSUpgradeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -144,6 +173,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
 
     def test_risk_engine_can_authorize_for_execution(self) -> None:
         init_db(self.db_path)
+        valid_from, valid_until = active_authorization_window()
         with connect_db(self.db_path) as conn:
             upsert_market_snapshot(conn, sample_market())
             proposal = sample_proposal()
@@ -171,8 +201,8 @@ class TradingOSUpgradeTests(unittest.TestCase):
                     "max_slippage_bps": 600,
                     "allow_auto_execute": True,
                     "requires_human_if_above_usdc": 10,
-                    "valid_from": "2026-03-21T00:00:00Z",
-                    "valid_until": "2026-03-23T00:00:00Z",
+                    "valid_from": valid_from,
+                    "valid_until": valid_until,
                     "status": "active",
                     "created_by": "test",
                 },
@@ -246,6 +276,291 @@ class TradingOSUpgradeTests(unittest.TestCase):
             with patch("polymarket_mvp.risk_engine.requests.get", return_value=mocked):
                 result = evaluate_full_record(conn, record)
         self.assertNotIn("selected_outcome_has_no_live_price", result["risk_summary"]["reasons"])
+
+    def test_update_position_marks_skips_open_requested_positions(self) -> None:
+        init_db(self.db_path)
+        market = sample_market()
+        market["outcomes"] = [
+            {"name": "Yes", "price": 0.7, "token_id": "tok_yes"},
+            {"name": "No", "price": 0.3, "token_id": "tok_no"},
+        ]
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, market)
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(
+                conn,
+                {
+                    "proposal_id": stored["proposal_id"],
+                    "mode": "mock",
+                    "client_order_id": f"{stored['proposal_id']}-submitted",
+                    "order_intent_json": {"request": {}},
+                    "requested_price": 0.4,
+                    "requested_size_usdc": 10.0,
+                    "max_slippage_bps": 500,
+                    "observed_worst_price": 0.4,
+                    "slippage_check_status": "passed",
+                    "status": "submitted",
+                    "filled_size_usdc": None,
+                    "avg_fill_price": None,
+                    "txhash_or_order_id": "order-1",
+                    "slippage_bps": None,
+                    "error_message": None,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            conn.commit()
+
+            updated = update_position_marks(conn)
+            position = list_positions(conn)[0]
+
+        self.assertEqual(updated, [])
+        self.assertEqual(position["status"], "open_requested")
+        self.assertEqual(position["last_mark_price"], 0.4)
+        self.assertEqual(position["unrealized_pnl"], 0.0)
+
+    def test_update_position_marks_keeps_resolution_idempotent(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            execution = execute_record(conn, proposal_record(conn, stored["proposal_id"]), mode="mock", session_state={"cumulative_spend_usdc": 0.0})
+            record_execution(conn, execution)
+            upsert_market_resolution(conn, "m1", "Yes", {"market_id": "m1", "resolved_outcome": "Yes"})
+            conn.commit()
+
+            first = update_position_marks(conn)
+            sync_all_positions(conn)
+            second = update_position_marks(conn)
+            events = conn.execute(
+                "SELECT event_type FROM position_events WHERE position_id = 1 ORDER BY id ASC"
+            ).fetchall()
+            position = list_positions(conn)[0]
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertEqual([row["event_type"] for row in events], ["open", "resolve"])
+        self.assertEqual(position["status"], "resolved")
+        self.assertEqual(position["last_mark_price"], 1.0)
+        self.assertGreater(position["realized_pnl"], 0.0)
+
+    def test_sync_all_positions_cancels_existing_open_requested_when_execution_fails(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            execution = {
+                "proposal_id": stored["proposal_id"],
+                "mode": "real",
+                "client_order_id": f"{stored['proposal_id']}-submitted",
+                "order_intent_json": {"request": {}},
+                "requested_price": 0.4,
+                "requested_size_usdc": 10.0,
+                "max_slippage_bps": 500,
+                "observed_worst_price": 0.4,
+                "slippage_check_status": "passed",
+                "status": "submitted",
+                "filled_size_usdc": None,
+                "avg_fill_price": None,
+                "txhash_or_order_id": "order-cancel-test",
+                "slippage_bps": None,
+                "error_message": None,
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            }
+            record_execution(conn, execution)
+            conn.commit()
+
+            sync_all_positions(conn)
+            conn.execute(
+                "UPDATE executions SET status = ?, error_message = ?, updated_at = ? WHERE txhash_or_order_id = ?",
+                ("failed", "order_not_live", utc_now_iso(), "order-cancel-test"),
+            )
+            conn.commit()
+
+            sync_all_positions(conn)
+            position = list_positions(conn)[0]
+            events = conn.execute(
+                "SELECT event_type FROM position_events WHERE position_id = 1 ORDER BY id ASC"
+            ).fetchall()
+
+        self.assertEqual(position["status"], "cancelled")
+        self.assertEqual(events[0]["event_type"], "open")
+        self.assertEqual(events[-1]["event_type"], "reconcile")
+
+    def test_build_openclaw_proposals_generates_from_adapter(self) -> None:
+        markets = [sample_market()]
+        context_file = {
+            "markets": [
+                {
+                    "market_id": "m1",
+                    "context_payload": {
+                        "topic": "BTC",
+                        "assembled_text": "ETF chatter and near-term momentum.",
+                        "sources": [{"source_type": "news", "display_text": "ETF chatter"}],
+                    },
+                }
+            ]
+        }
+        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+            mocked.return_value = [
+                {
+                    "market_id": "m1",
+                    "outcome": "Yes",
+                    "confidence_score": 0.71,
+                    "recommended_size_usdc": 7.5,
+                    "reasoning": "Context points toward Yes in the near term.",
+                    "max_slippage_bps": 400,
+                }
+            ]
+            proposals = build_openclaw_proposals(
+                markets,
+                context_file=context_file,
+                size_usdc=5.0,
+                top=3,
+                max_slippage_bps=500,
+            )
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["market_id"], "m1")
+        self.assertEqual(proposals[0]["outcome"], "Yes")
+        self.assertEqual(proposals[0]["recommended_size_usdc"], 7.5)
+
+    def test_build_openclaw_proposals_rejects_invalid_market_outcome(self) -> None:
+        markets = [sample_updown_market()]
+        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+            mocked.return_value = [
+                {
+                    "market_id": "m2",
+                    "outcome": "No",
+                    "confidence_score": 0.66,
+                    "recommended_size_usdc": 1.0,
+                    "reasoning": "Bearish setup.",
+                    "max_slippage_bps": 500,
+                }
+            ]
+            with self.assertRaises(RuntimeError) as exc:
+                build_openclaw_proposals(
+                    markets,
+                    context_file=None,
+                    size_usdc=1.0,
+                    top=1,
+                    max_slippage_bps=500,
+                )
+
+        self.assertIn("invalid outcomes", str(exc.exception))
+        self.assertIn("allowed=['Up', 'Down']", str(exc.exception))
+
+    def test_openclaw_cli_json_is_parsed_from_wrapped_response(self) -> None:
+        completed = Mock()
+        completed.returncode = 0
+        completed.stdout = (
+            '{"result":{"messages":[{"role":"assistant","content":"'
+            '{\\"thesis\\":\\"Alpha\\",\\"supporting_evidence\\":[\\"One\\"],'
+            '\\"counter_evidence\\":[],\\"uncertainty_notes\\":\\"Low\\"}"}]}}'
+        )
+        completed.stderr = ""
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_TRANSPORT": "cli",
+                "OPENCLAW_CLI_PATH": "/usr/local/bin/openclaw",
+            },
+            clear=False,
+        ):
+            with patch("polymarket_mvp.services.openclaw_adapter._cli_path", return_value="/usr/local/bin/openclaw"):
+                with patch("polymarket_mvp.services.openclaw_adapter.subprocess.run", return_value=completed):
+                    payload = chat_json("Return JSON only.", '{"market_id":"m1"}')
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["thesis"], "Alpha")
+
+    def test_openclaw_cli_json_is_parsed_from_payloads_response(self) -> None:
+        completed = Mock()
+        completed.returncode = 0
+        completed.stdout = (
+            '{"payloads":[{"text":"{\\"thesis\\":\\"Bravo\\",\\"supporting_evidence\\":[\\"Two\\"],'
+            '\\"counter_evidence\\":[],\\"uncertainty_notes\\":\\"Medium\\"}","mediaUrl":null}],"meta":{"aborted":false}}'
+        )
+        completed.stderr = ""
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_TRANSPORT": "cli",
+                "OPENCLAW_CLI_PATH": "/usr/local/bin/openclaw",
+            },
+            clear=False,
+        ):
+            with patch("polymarket_mvp.services.openclaw_adapter._cli_path", return_value="/usr/local/bin/openclaw"):
+                with patch("polymarket_mvp.services.openclaw_adapter.subprocess.run", return_value=completed):
+                    payload = chat_json("Return JSON only.", '{"market_id":"m1"}')
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["thesis"], "Bravo")
+
+    def test_openclaw_cli_json_can_be_read_from_stderr_logs(self) -> None:
+        completed = Mock()
+        completed.returncode = 0
+        completed.stdout = ""
+        completed.stderr = (
+            '[agents/model-providers] bootstrap config fallback\\n'
+            '{"payloads":[{"text":"{\\"thesis\\":\\"Charlie\\",\\"supporting_evidence\\":[\\"Three\\"],'
+            '\\"counter_evidence\\":[],\\"uncertainty_notes\\":\\"High\\"}","mediaUrl":null}],"meta":{"aborted":false}}'
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_TRANSPORT": "cli",
+                "OPENCLAW_CLI_PATH": "/usr/local/bin/openclaw",
+            },
+            clear=False,
+        ):
+            with patch("polymarket_mvp.services.openclaw_adapter._cli_path", return_value="/usr/local/bin/openclaw"):
+                with patch("polymarket_mvp.services.openclaw_adapter.subprocess.run", return_value=completed):
+                    payload = chat_json("Return JSON only.", '{"market_id":"m1"}')
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["thesis"], "Charlie")
+
+    def test_supervisor_falls_back_when_openclaw_raises(self) -> None:
+        record = {
+            "proposal_json": sample_proposal(),
+            "strategy_name": "near_expiry_conviction",
+            "topic": "BTC",
+            "event_cluster_id": 7,
+            "context_payload_json": {"topic": "BTC"},
+        }
+        with patch("polymarket_mvp.agents.supervisor_agent.maybe_generate_supervisor_decision", side_effect=RuntimeError("boom")):
+            supervisor = supervise_record(record)
+
+        self.assertEqual(supervisor["strategy_name"], "near_expiry_conviction")
+        self.assertEqual(supervisor["topic"], "BTC")
+        self.assertEqual(supervisor["decision"], "promote")
+        self.assertEqual(supervisor["priority_score"], 0.62)
 
 
 if __name__ == "__main__":

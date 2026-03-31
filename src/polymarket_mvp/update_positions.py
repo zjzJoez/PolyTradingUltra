@@ -4,7 +4,7 @@ import argparse
 
 from .common import dump_json, utc_now_iso
 from .db import connect_db, init_db
-from .services.position_manager import sync_all_positions
+from .services.position_manager import sync_all_positions, update_position_marks
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,8 +18,14 @@ def main() -> int:
     init_db()
     with connect_db() as conn:
         positions = sync_all_positions(conn)
+        marks = update_position_marks(conn)
         conn.commit()
-    print(dump_json({"generated_at": utc_now_iso(), "positions": positions}, path=args.output))
+    print(dump_json({
+        "generated_at": utc_now_iso(),
+        "positions": positions,
+        "marks_updated": len(marks),
+        "marks": marks,
+    }, path=args.output))
     return 0
 
 
