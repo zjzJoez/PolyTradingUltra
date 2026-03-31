@@ -21,6 +21,11 @@ ACCOUNT_MODE_NAMES = {
     1: "poly_proxy",
     2: "poly_gnosis_safe",
 }
+KNOWN_NEG_RISK_SPENDERS = [
+    "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+    "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+    "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+]
 
 
 def _maybe_notify_auto_execution(record: Dict[str, Any], execution: Dict[str, Any]) -> None:
@@ -263,7 +268,7 @@ def _extract_balance_value(payload: Any) -> float | None:
     return None
 
 
-def _real_preflight_check(client: Any, proposal: Dict[str, Any]) -> Dict[str, Any]:
+def _real_preflight_check(client: Any, proposal: Dict[str, Any], *, token_id: str | None = None) -> Dict[str, Any]:
     from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
 
     signature_type = _require_signature_type()
@@ -295,10 +300,37 @@ def _real_preflight_check(client: Any, proposal: Dict[str, Any]) -> Dict[str, An
             f"Insufficient collateral balance for order size: needed={proposal['recommended_size_usdc']:.6f}, "
             f"available={available_balance:.6f}"
         )
+    conditional_allowance_info = None
+    if token_id:
+        try:
+            conditional = client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                    signature_type=signature_type,
+                )
+            )
+            conditional_allowance = None
+            if isinstance(conditional, dict):
+                conditional_allowance = _coerce_float(conditional.get("allowance"))
+            conditional_allowance_info = {"token_id": token_id, "raw": conditional, "allowance": conditional_allowance}
+            if conditional_allowance is not None and conditional_allowance == 0.0:
+                from .common import polygon_rpc_url
+                raise RuntimeError(
+                    f"Conditional token allowance is zero for token_id={token_id}. "
+                    f"You may need to approve spender contracts for neg-risk markets. "
+                    f"Known spenders: {', '.join(KNOWN_NEG_RISK_SPENDERS)}. "
+                    f"Use RPC: {polygon_rpc_url()}"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
     return {
         "api_keys_count": _api_key_count(api_keys),
         "collateral_balance_available": available_balance,
         "collateral_raw": collateral,
+        "conditional_allowance": conditional_allowance_info,
         "account_identity": _client_identity_summary(client, signature_type=signature_type, funder=funder),
     }
 
@@ -361,7 +393,8 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     if mode == "real":
         try:
             client = _build_clob_client()
-            preflight = _real_preflight_check(client, proposal)
+            token_id_for_preflight = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
+            preflight = _real_preflight_check(client, proposal, token_id=token_id_for_preflight)
             print(
                 f"[poly-executor] real preflight proposal_id={record['proposal_id']} "
                 f"{json.dumps({'account_identity': preflight['account_identity'], 'api_keys_count': preflight['api_keys_count'], 'collateral_balance_available': preflight['collateral_balance_available']}, sort_keys=True)}",
@@ -458,7 +491,17 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
             execution["updated_at"] = utc_now_iso()
             execution = _reconcile_execution_with_order_snapshot(real_client, execution)
         except Exception as exc:
-            return _failed_execution(record, mode, f"order_submit_failed: {exc}", preflight=preflight)
+            error_msg = str(exc)
+            if "allowance" in error_msg.lower() or "spender" in error_msg.lower():
+                from .common import polygon_rpc_url
+                error_msg = (
+                    f"order_submit_failed (likely missing spender approval): {exc}. "
+                    f"Known neg-risk spenders: {', '.join(KNOWN_NEG_RISK_SPENDERS)}. "
+                    f"RPC: {polygon_rpc_url()}"
+                )
+            else:
+                error_msg = f"order_submit_failed: {exc}"
+            return _failed_execution(record, mode, error_msg, preflight=preflight)
         session_state["cumulative_spend_usdc"] = float(session_state.get("cumulative_spend_usdc", 0.0)) + requested_size_usdc
     return execution
 

@@ -183,6 +183,7 @@ Important variable groups:
   - `POLY_CLOB_SIGNER_KEY`
   - `SESSION_MAX_BALANCE_USDC`
   - `SESSION_MAX_SPEND_USDC`
+  - `POLYGON_RPC_URL` — Polygon RPC endpoint for on-chain approve txns (default: `https://polygon-bor-rpc.publicnode.com`)
 
 ## CLI Entry Points
 

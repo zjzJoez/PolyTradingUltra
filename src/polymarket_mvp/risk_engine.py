@@ -16,16 +16,15 @@ def _clob_host() -> str:
     return (os.getenv("POLY_CLOB_HOST") or "https://clob.polymarket.com").rstrip("/")
 
 
-def _selected_outcome_has_live_price(record: Dict[str, Any]) -> bool:
+def _clob_buy_price(record: Dict[str, Any]) -> float | None:
+    """Fetch real CLOB BUY price for the selected outcome. Returns None if unavailable."""
     market = record.get("market")
     proposal = record["proposal_json"]
     if market is None:
-        return False
-    snapshot_price = market_reference_price(market["market_json"], proposal["outcome"])
-    snapshot_has_price = isinstance(snapshot_price, float) and 0.0 <= snapshot_price <= 1.0
+        return None
     token_id = resolve_token_id(market["market_json"], proposal["outcome"])
     if not token_id:
-        return snapshot_has_price
+        return None
     try:
         response = requests.get(
             f"{_clob_host()}/price",
@@ -33,13 +32,26 @@ def _selected_outcome_has_live_price(record: Dict[str, Any]) -> bool:
             timeout=10,
         )
         if response.status_code == 404:
-            return snapshot_has_price
+            return None
         response.raise_for_status()
         payload = response.json()
         raw_price = payload.get("price") if isinstance(payload, dict) else payload
-        return float(raw_price) >= 0.0
+        return float(raw_price)
     except (requests.RequestException, TypeError, ValueError):
-        return snapshot_has_price
+        return None
+
+
+def _selected_outcome_has_live_price(record: Dict[str, Any]) -> bool:
+    market = record.get("market")
+    proposal = record["proposal_json"]
+    if market is None:
+        return False
+    snapshot_price = market_reference_price(market["market_json"], proposal["outcome"])
+    snapshot_has_price = isinstance(snapshot_price, float) and 0.0 <= snapshot_price <= 1.0
+    clob_price = _clob_buy_price(record)
+    if clob_price is not None and clob_price >= 0.0:
+        return True
+    return snapshot_has_price
 
 
 def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,6 +78,14 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("insufficient_balance")
     if require_executable_market and market is not None and not _selected_outcome_has_live_price(record):
         reasons.append("selected_outcome_has_no_live_price")
+    if require_executable_market and market is not None and not reasons:
+        max_divergence_bps = get_env_int("POLY_RISK_MAX_GAMMA_CLOB_DIVERGENCE_BPS", 500)
+        clob_price = _clob_buy_price(record)
+        gamma_price = market_reference_price(market["market_json"], proposal["outcome"])
+        if clob_price is not None and gamma_price is not None and gamma_price > 0:
+            divergence_bps = abs(clob_price - gamma_price) / gamma_price * 10000
+            if divergence_bps > max_divergence_bps:
+                reasons.append("gamma_clob_price_divergence_exceeded")
     approved = not reasons
     return {
         "proposal_id": record["proposal_id"],

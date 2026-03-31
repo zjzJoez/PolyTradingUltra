@@ -281,6 +281,10 @@ def market_reference_price(market: Mapping[str, Any], outcome: str) -> float | N
     return float(value)
 
 
+def polygon_rpc_url() -> str:
+    return os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"
+
+
 KNOWN_SYMBOLS = {
     "BTC": ("BTC", "BITCOIN"),
     "ETH": ("ETH", "ETHEREUM"),

@@ -27,6 +27,7 @@ from polymarket_mvp.risk_engine import evaluate_full_record
 from polymarket_mvp.agents.supervisor_agent import supervise_record
 from polymarket_mvp.services.position_manager import sync_all_positions, update_position_marks
 from polymarket_mvp.services.openclaw_adapter import chat_json
+from polymarket_mvp.services.reconciler import reconcile_live_orders
 
 
 OLD_SCHEMA = """
@@ -561,6 +562,207 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(supervisor["topic"], "BTC")
         self.assertEqual(supervisor["decision"], "promote")
         self.assertEqual(supervisor["priority_score"], 0.62)
+
+    def test_reconciler_fills_live_order_and_position_updates(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(
+                conn,
+                {
+                    "proposal_id": stored["proposal_id"],
+                    "mode": "real",
+                    "client_order_id": f"{stored['proposal_id']}-submitted",
+                    "order_intent_json": {"request": {}},
+                    "requested_price": 0.62,
+                    "requested_size_usdc": 5.0,
+                    "max_slippage_bps": 500,
+                    "observed_worst_price": 0.62,
+                    "slippage_check_status": "passed",
+                    "status": "submitted",
+                    "filled_size_usdc": None,
+                    "avg_fill_price": None,
+                    "txhash_or_order_id": "order-fill-lifecycle",
+                    "slippage_bps": None,
+                    "error_message": None,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            conn.commit()
+
+            sync_all_positions(conn)
+            position_before = list_positions(conn)[0]
+            self.assertEqual(position_before["status"], "open_requested")
+
+            mock_client = Mock()
+            mock_client.get_order.return_value = {
+                "status": "MATCHED",
+                "size_matched": "8.064516",
+                "price": "0.62",
+            }
+            with patch("polymarket_mvp.services.reconciler._build_clob_client", return_value=mock_client):
+                reconciliations = reconcile_live_orders(conn)
+            conn.commit()
+
+            self.assertEqual(len(reconciliations), 1)
+            self.assertEqual(reconciliations[0]["observed_status"], "filled")
+
+            sync_all_positions(conn)
+            position_after = list_positions(conn)[0]
+            self.assertEqual(position_after["status"], "open")
+            self.assertIsNotNone(position_after["entry_price"])
+
+    def test_reconciler_cancels_live_order_and_position_updates(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(
+                conn,
+                {
+                    "proposal_id": stored["proposal_id"],
+                    "mode": "real",
+                    "client_order_id": f"{stored['proposal_id']}-submitted",
+                    "order_intent_json": {"request": {}},
+                    "requested_price": 0.62,
+                    "requested_size_usdc": 5.0,
+                    "max_slippage_bps": 500,
+                    "observed_worst_price": 0.62,
+                    "slippage_check_status": "passed",
+                    "status": "submitted",
+                    "filled_size_usdc": None,
+                    "avg_fill_price": None,
+                    "txhash_or_order_id": "order-cancel-lifecycle",
+                    "slippage_bps": None,
+                    "error_message": None,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            conn.commit()
+
+            sync_all_positions(conn)
+            position_before = list_positions(conn)[0]
+            self.assertEqual(position_before["status"], "open_requested")
+
+            mock_client = Mock()
+            mock_client.get_order.return_value = {
+                "status": "CANCELED",
+                "size_matched": "0",
+                "price": "0.62",
+            }
+            with patch("polymarket_mvp.services.reconciler._build_clob_client", return_value=mock_client):
+                reconciliations = reconcile_live_orders(conn)
+            conn.commit()
+
+            self.assertEqual(len(reconciliations), 1)
+            self.assertEqual(reconciliations[0]["observed_status"], "failed")
+
+            sync_all_positions(conn)
+            position_after = list_positions(conn)[0]
+            self.assertEqual(position_after["status"], "cancelled")
+
+            events = conn.execute(
+                "SELECT event_type FROM position_events WHERE position_id = ? ORDER BY id ASC",
+                (position_after["id"],),
+            ).fetchall()
+            event_types = [e["event_type"] for e in events]
+            self.assertIn("open", event_types)
+            self.assertIn("reconcile", event_types)
+
+    def test_risk_engine_blocks_on_gamma_clob_divergence(self) -> None:
+        os.environ["POLY_RISK_REQUIRE_EXECUTABLE_MARKET"] = "true"
+        os.environ["POLY_RISK_MAX_GAMMA_CLOB_DIVERGENCE_BPS"] = "500"
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            proposal = sample_proposal()
+            upsert_proposal(
+                conn,
+                proposal,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(proposal))
+            mocked = Mock()
+            mocked.status_code = 200
+            mocked.json.return_value = {"price": "0.999"}
+            mocked.raise_for_status = Mock()
+            with patch("polymarket_mvp.risk_engine.requests.get", return_value=mocked):
+                result = evaluate_full_record(conn, record)
+        self.assertIn("gamma_clob_price_divergence_exceeded", result["risk_summary"]["reasons"])
+        self.assertEqual(result["next_status"], "risk_blocked")
+
+    def test_risk_engine_passes_when_gamma_clob_divergence_within_bounds(self) -> None:
+        os.environ["POLY_RISK_REQUIRE_EXECUTABLE_MARKET"] = "true"
+        os.environ["POLY_RISK_MAX_GAMMA_CLOB_DIVERGENCE_BPS"] = "500"
+        init_db(self.db_path)
+        valid_from, valid_until = active_authorization_window()
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            proposal = sample_proposal()
+            upsert_proposal(
+                conn,
+                proposal,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+                authorization_status="none",
+            )
+            create_strategy_authorization(
+                conn,
+                {
+                    "strategy_name": "near_expiry_conviction",
+                    "scope_topic": "BTC",
+                    "scope_market_type": "binary",
+                    "scope_event_cluster_id": None,
+                    "max_order_usdc": 10,
+                    "max_daily_gross_usdc": 50,
+                    "max_open_positions": 10,
+                    "max_daily_loss_usdc": 50,
+                    "max_slippage_bps": 600,
+                    "allow_auto_execute": True,
+                    "requires_human_if_above_usdc": 10,
+                    "valid_from": valid_from,
+                    "valid_until": valid_until,
+                    "status": "active",
+                    "created_by": "test",
+                },
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(proposal))
+            mocked = Mock()
+            mocked.status_code = 200
+            mocked.json.return_value = {"price": "0.63"}
+            mocked.raise_for_status = Mock()
+            with patch("polymarket_mvp.risk_engine.requests.get", return_value=mocked):
+                result = evaluate_full_record(conn, record)
+        self.assertNotIn("gamma_clob_price_divergence_exceeded", result["risk_summary"]["reasons"])
+        self.assertEqual(result["next_status"], "authorized_for_execution")
 
 
 if __name__ == "__main__":
