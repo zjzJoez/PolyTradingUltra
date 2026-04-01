@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import dump_json, get_env_float, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
+from .common import clamp_order_live_ttl, dump_json, get_env_float, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
 from .db import connect_db, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
@@ -440,6 +440,7 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     requested_size_usdc = proposal["recommended_size_usdc"]
     share_size = requested_size_usdc / requested_price if requested_price else 0.0
     token_id = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
+    order_live_ttl = clamp_order_live_ttl(record.get("order_live_ttl_seconds"))
     order_intent = {
         "proposal_id": record["proposal_id"],
         "market_id": proposal["market_id"],
@@ -448,6 +449,8 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
         "price": requested_price,
         "size_shares": share_size,
         "size_usdc": requested_size_usdc,
+        "order_live_ttl_seconds": order_live_ttl,
+        "order_posted_at": utc_now_iso(),
     }
     execution = {
         "proposal_id": record["proposal_id"],
@@ -478,11 +481,12 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
         real_client = client
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType  # pyright: ignore[reportMissingImports]
-            from py_clob_client.order_builder.constants import BUY  # pyright: ignore[reportMissingImports]
+            from py_clob_client.order_builder.constants import BUY, SELL  # pyright: ignore[reportMissingImports]
         except Exception as exc:
             return _failed_execution(record, mode, f"order_sdk_unavailable: {exc}", preflight=preflight)
         try:
-            order = OrderArgs(token_id=token_id, price=requested_price, size=share_size, side=BUY)
+            side = SELL if record.get("proposal_kind") == "exit" else BUY
+            order = OrderArgs(token_id=token_id, price=requested_price, size=share_size, side=side)
             signed = real_client.create_order(order)
             response = real_client.post_order(signed, OrderType.GTC)
             execution["txhash_or_order_id"] = str(response.get("orderID") or response.get("id") or "")

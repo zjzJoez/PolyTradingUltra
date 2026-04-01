@@ -318,6 +318,10 @@ def upsert_proposal(
     authorization_status: str = "none",
     supervisor_decision: str | None = None,
     priority_score: float | None = None,
+    proposal_kind: str = "entry",
+    target_position_id: int | None = None,
+    approval_ttl_seconds: int | None = None,
+    order_live_ttl_seconds: int | None = None,
 ) -> Dict[str, Any]:
     normalized = normalize_proposal(proposal)
     proposal_id = proposal_id_for(normalized)
@@ -339,6 +343,10 @@ def upsert_proposal(
         "authorization_status": authorization_status,
         "supervisor_decision": supervisor_decision,
         "priority_score": priority_score,
+        "proposal_kind": proposal_kind,
+        "target_position_id": target_position_id,
+        "approval_ttl_seconds": approval_ttl_seconds,
+        "order_live_ttl_seconds": order_live_ttl_seconds,
         "proposal_json": json.dumps(normalized, sort_keys=False),
         "context_payload_json": json.dumps(context_payload, sort_keys=False),
         "created_at": now,
@@ -350,8 +358,9 @@ def upsert_proposal(
           proposal_id, market_id, outcome, confidence_score, recommended_size_usdc, reasoning,
           decision_engine, status, max_slippage_bps, strategy_name, topic, event_cluster_id,
           source_memo_id, authorization_status, supervisor_decision, priority_score,
+          proposal_kind, target_position_id, approval_ttl_seconds, order_live_ttl_seconds,
           proposal_json, context_payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id) DO UPDATE SET
           market_id=excluded.market_id,
           outcome=excluded.outcome,
@@ -368,6 +377,10 @@ def upsert_proposal(
           authorization_status=excluded.authorization_status,
           supervisor_decision=excluded.supervisor_decision,
           priority_score=excluded.priority_score,
+          proposal_kind=excluded.proposal_kind,
+          target_position_id=excluded.target_position_id,
+          approval_ttl_seconds=excluded.approval_ttl_seconds,
+          order_live_ttl_seconds=excluded.order_live_ttl_seconds,
           proposal_json=excluded.proposal_json,
           context_payload_json=excluded.context_payload_json,
           updated_at=excluded.updated_at
@@ -495,6 +508,10 @@ def update_proposal_workflow_fields(
     supervisor_decision: str | None = None,
     priority_score: float | None = None,
     status: str | None = None,
+    approval_requested_at: str | None = None,
+    approval_expires_at: str | None = None,
+    telegram_message_id: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> None:
     current = proposal_record(conn, proposal_id)
     if current is None:
@@ -510,6 +527,10 @@ def update_proposal_workflow_fields(
             supervisor_decision = ?,
             priority_score = ?,
             status = ?,
+            approval_requested_at = ?,
+            approval_expires_at = ?,
+            telegram_message_id = ?,
+            telegram_chat_id = ?,
             updated_at = ?
         WHERE proposal_id = ?
         """,
@@ -522,6 +543,10 @@ def update_proposal_workflow_fields(
             supervisor_decision if supervisor_decision is not None else current.get("supervisor_decision"),
             priority_score if priority_score is not None else current.get("priority_score"),
             status if status is not None else current.get("status"),
+            approval_requested_at if approval_requested_at is not None else current.get("approval_requested_at"),
+            approval_expires_at if approval_expires_at is not None else current.get("approval_expires_at"),
+            telegram_message_id if telegram_message_id is not None else current.get("telegram_message_id"),
+            telegram_chat_id if telegram_chat_id is not None else current.get("telegram_chat_id"),
             utc_now_iso(),
             proposal_id,
         ),
@@ -1014,6 +1039,53 @@ def record_agent_review(conn: sqlite3.Connection, payload: Mapping[str, Any]) ->
         item["what_worked"] = _json_loads_if_present(item["what_worked"])
     if item.get("what_failed"):
         item["what_failed"] = _json_loads_if_present(item["what_failed"])
+    return item
+
+
+def list_expired_pending_proposals(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Return pending_approval proposals whose approval deadline has passed."""
+    now = utc_now_iso()
+    rows = conn.execute(
+        """
+        SELECT proposal_id FROM proposals
+        WHERE status = 'pending_approval'
+          AND approval_expires_at IS NOT NULL
+          AND approval_expires_at < ?
+        ORDER BY approval_expires_at ASC
+        """,
+        (now,),
+    ).fetchall()
+    return [proposal_record(conn, str(row["proposal_id"])) for row in rows if proposal_record(conn, str(row["proposal_id"])) is not None]
+
+
+def record_heartbeat(
+    conn: sqlite3.Connection,
+    loop_name: str,
+    started_at: str,
+    finished_at: str | None,
+    items_processed: int,
+    error_message: str | None,
+    payload: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO autopilot_heartbeats (
+          loop_name, started_at, finished_at, items_processed, error_message, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            loop_name,
+            started_at,
+            finished_at,
+            items_processed,
+            error_message,
+            json.dumps(payload or {}, sort_keys=False),
+        ),
+    )
+    row = conn.execute("SELECT * FROM autopilot_heartbeats WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
     return item
 
 

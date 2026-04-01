@@ -285,6 +285,28 @@ def polygon_rpc_url() -> str:
     return os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"
 
 
+def clamp_approval_ttl(agent_ttl: int | None, seconds_to_expiry: float | None) -> int:
+    """Clamp agent-suggested approval TTL to system bounds."""
+    max_ttl = get_env_int("POLY_APPROVAL_MAX_TTL_SECONDS", 300)
+    buffer = get_env_int("POLY_APPROVAL_EXPIRY_BUFFER_SECONDS", 120)
+    floor = 30
+    candidates = [max_ttl]
+    if seconds_to_expiry is not None and seconds_to_expiry > 0:
+        candidates.append(max(floor, int(0.25 * seconds_to_expiry)))
+        candidates.append(max(floor, int(seconds_to_expiry) - buffer))
+    system_max = min(candidates)
+    effective = min(agent_ttl or system_max, system_max)
+    return max(floor, effective)
+
+
+def clamp_order_live_ttl(agent_ttl: int | None) -> int:
+    """Clamp agent-suggested order live TTL to system bounds."""
+    max_ttl = get_env_int("POLY_ORDER_MAX_LIVE_TTL_SECONDS", 300)
+    floor = 15
+    effective = min(agent_ttl or max_ttl, max_ttl)
+    return max(floor, effective)
+
+
 KNOWN_SYMBOLS = {
     "BTC": ("BTC", "BITCOIN"),
     "ETH": ("ETH", "ETHEREUM"),

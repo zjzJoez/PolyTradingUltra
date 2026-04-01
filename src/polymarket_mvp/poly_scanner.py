@@ -147,6 +147,20 @@ def build_payload(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def scan_and_persist(conn, *, min_liquidity: float = 10000, max_expiry_days: float = 7,
+                     page_size: int = 100, max_pages: int = 5) -> List[Dict[str, Any]]:
+    """Scan markets and persist to DB. Returns market dicts."""
+    markets, _ = fetch_markets(
+        min_liquidity=min_liquidity,
+        max_expiry_days=max_expiry_days,
+        page_size=page_size,
+        max_pages=max_pages,
+    )
+    for market in markets:
+        upsert_market_snapshot(conn, market)
+    return markets
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scan Polymarket markets and emit normalized JSON.")
     parser.add_argument("--min-liquidity", type=float, default=10000, help="Minimum market liquidity in USDC.")

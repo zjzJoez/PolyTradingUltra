@@ -252,3 +252,21 @@ def maybe_generate_trade_proposals(prompt_payload: Mapping[str, Any]) -> list[Di
         ),
         json.dumps(prompt_payload, ensure_ascii=True, sort_keys=False),
     )
+
+
+def maybe_generate_exit_proposals(prompt_payload: Mapping[str, Any]) -> list[Dict[str, Any]] | None:
+    return chat_list(
+        (
+            "You are a position exit advisor for a Polymarket trading system."
+            " Given open positions with their entry data and current market state,"
+            " decide whether to hold, reduce, or close each position."
+            " Return valid JSON only. No markdown, no commentary."
+            " Preferred format: an object with a recommendations array; a top-level JSON array is also accepted."
+            " Each item must contain: position_id (integer), recommendation (hold/reduce/close/cancel),"
+            " confidence_score (0-1), reasoning (concise factual text)."
+            " Optional: target_reduce_pct (0-1, for reduce recommendations only)."
+            " If there is not enough evidence to recommend action, recommend hold."
+            " Do not invent data. Base decisions only on the provided payload."
+        ),
+        json.dumps(prompt_payload, ensure_ascii=True, sort_keys=False, default=str),
+    )

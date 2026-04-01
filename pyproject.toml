@@ -41,6 +41,8 @@ kill-switch = "polymarket_mvp.kill_switch:main"
 run-exit-agent = "polymarket_mvp.run_exit_agent:main"
 run-review-agent = "polymarket_mvp.run_review_agent:main"
 position-report = "polymarket_mvp.position_report:main"
+polymarket-autopilot = "polymarket_mvp.autopilot:main"
+autopilot-status = "polymarket_mvp.autopilot_status:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,4 +1,4 @@
-# Polymarket Trading OS v0.4
+# Polymarket Trading OS v0.5
 
 Local-first Polymarket trading system with SQLite as the single business source of truth.
 
@@ -85,6 +85,8 @@ src/polymarket_mvp/
     position_manager.py
     reconciler.py
     shadow_service.py
+  autopilot.py
+  autopilot_status.py
   authorize_strategy.py
   build_memos.py
   cluster_events.py
@@ -110,7 +112,9 @@ src/polymarket_mvp/
 
 schema.sql
 workflows/openclaw-polymarket-mvp.yaml
-IMPLEMENTATION_PLAN_v0.3_v0.4.md
+deploy/
+  com.polymarket.autopilot.plist
+  com.polymarket.tg-webhook.plist
 ```
 
 ## Installation
@@ -210,6 +214,8 @@ run-exit-agent
 run-review-agent
 position-report
 backfill-resolutions
+polymarket-autopilot
+autopilot-status
 ```
 
 Equivalent module form:
@@ -507,6 +513,58 @@ Generate reviews:
 PYTHONPATH=src python3 -m polymarket_mvp.run_review_agent \
   --output artifacts/reviews.json
 ```
+
+## 24/7 Autopilot Mode (v0.5)
+
+The autopilot replaces the manual CLI chain with a single long-running supervisor:
+
+```bash
+polymarket-autopilot
+```
+
+It continuously runs: scan -> context -> propose -> risk -> approve(TG) -> execute -> reconcile -> exit -> review.
+
+Key features:
+- Approval deadlines: each Telegram approval has a TTL; proposals auto-expire if not acted on
+- Stale order cancellation: live orders exceeding their TTL are auto-cancelled
+- OpenClaw exit proposals: LLM-powered exit decisions for open positions
+- Heartbeat logging to `autopilot_heartbeats` table for observability
+
+Check status:
+
+```bash
+autopilot-status
+```
+
+### launchd Deployment (macOS)
+
+```bash
+# Copy plist templates
+cp deploy/com.polymarket.autopilot.plist ~/Library/LaunchAgents/
+cp deploy/com.polymarket.tg-webhook.plist ~/Library/LaunchAgents/
+
+# Edit paths in plists to match your setup, then load
+launchctl load ~/Library/LaunchAgents/com.polymarket.autopilot.plist
+launchctl load ~/Library/LaunchAgents/com.polymarket.tg-webhook.plist
+
+# Set Telegram webhook (one-time)
+tg-approver set-webhook --webhook-url https://your-ngrok-domain
+
+# Verify
+autopilot-status
+```
+
+Autopilot environment variables:
+- `POLY_SCAN_INTERVAL_SECONDS` (default 30)
+- `POLY_CONTEXT_INTERVAL_SECONDS` (default 60)
+- `POLY_DECISION_INTERVAL_SECONDS` (default 30)
+- `POLY_RECONCILE_INTERVAL_SECONDS` (default 10)
+- `POLY_EXIT_INTERVAL_SECONDS` (default 30)
+- `POLY_APPROVAL_MAX_TTL_SECONDS` (default 300)
+- `POLY_APPROVAL_EXPIRY_BUFFER_SECONDS` (default 120)
+- `POLY_ORDER_MAX_LIVE_TTL_SECONDS` (default 300)
+- `POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP` (default 25)
+- `POLY_AUTOPILOT_MAX_EXIT_PROPOSALS_PER_LOOP` (default 5)
 
 ## Notes
 

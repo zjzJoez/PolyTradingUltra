@@ -109,13 +109,22 @@ CREATE TABLE IF NOT EXISTS proposals (
   authorization_status TEXT NOT NULL DEFAULT 'none' CHECK(authorization_status IN ('none', 'matched_manual_only', 'matched_auto_execute')),
   supervisor_decision TEXT CHECK(supervisor_decision IN ('promote', 'discard', 'merged')),
   priority_score REAL,
+  proposal_kind TEXT NOT NULL DEFAULT 'entry' CHECK(proposal_kind IN ('entry', 'exit')),
+  target_position_id INTEGER,
+  approval_ttl_seconds INTEGER,
+  order_live_ttl_seconds INTEGER,
+  approval_requested_at TEXT,
+  approval_expires_at TEXT,
+  telegram_message_id TEXT,
+  telegram_chat_id TEXT,
   proposal_json TEXT NOT NULL,
   context_payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id),
   FOREIGN KEY (event_cluster_id) REFERENCES event_clusters(id) ON DELETE SET NULL,
-  FOREIGN KEY (source_memo_id) REFERENCES research_memos(id) ON DELETE SET NULL
+  FOREIGN KEY (source_memo_id) REFERENCES research_memos(id) ON DELETE SET NULL,
+  FOREIGN KEY (target_position_id) REFERENCES positions(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_proposals_market ON proposals(market_id);
@@ -322,6 +331,18 @@ CREATE TABLE IF NOT EXISTS agent_reviews (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_reviews_position ON agent_reviews(position_id);
+
+CREATE TABLE IF NOT EXISTS autopilot_heartbeats (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loop_name TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  items_processed INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_heartbeats_loop ON autopilot_heartbeats(loop_name, started_at);
 
 CREATE TABLE IF NOT EXISTS market_resolutions (
   market_id TEXT PRIMARY KEY,

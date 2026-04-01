@@ -288,6 +288,26 @@ def fetch_contexts_for_market(
     }
 
 
+def fetch_and_persist_contexts(conn, markets: List[Dict[str, Any]], *,
+                               providers: List[str] | None = None,
+                               limit: int = 5, min_favorite_count: int = 5,
+                               budget_chars: int = 2400) -> List[Dict[str, Any]]:
+    """Fetch contexts for a list of markets and persist to DB. Returns result dicts."""
+    providers = providers or provider_names(None)
+    results = []
+    for market in markets:
+        result = fetch_contexts_for_market(
+            market,
+            providers=providers,
+            limit=limit,
+            min_favorite_count=min_favorite_count,
+            budget_chars=budget_chars,
+        )
+        replace_market_contexts(conn, str(market["market_id"]), result["contexts"])
+        results.append(result)
+    return results
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fetch external event contexts for scanned Polymarket markets.")
     parser.add_argument("--market-file", required=True, help="Scanner JSON file.")

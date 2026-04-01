@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.polymarket.autopilot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- UPDATE: absolute path to your venv Python -->
+    <string>/Users/joez/Desktop/polymarket-mvp/.venv311/bin/polymarket-autopilot</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <!-- UPDATE: absolute path to your repo -->
+  <string>/Users/joez/Desktop/polymarket-mvp</string>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/joez/Desktop/polymarket-mvp/var/log/autopilot.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/joez/Desktop/polymarket-mvp/var/log/autopilot.err</string>
+</dict>
+</plist>

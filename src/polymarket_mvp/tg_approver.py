@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import time
+from datetime import timedelta
 from typing import Any, Dict, List
 
 import requests
@@ -11,12 +12,14 @@ from flask import Flask, jsonify, request
 
 from .common import (
     append_jsonl,
+    clamp_approval_ttl,
     debug_events_path,
     dump_json,
     get_env_bool,
     get_env_float,
     get_env_int,
     load_repo_env,
+    parse_iso8601,
     proposal_id_for,
     read_proposals,
     utc_now_iso,
@@ -27,9 +30,12 @@ from .db import (
     decision_status_for,
     init_db,
     latest_execution,
+    list_expired_pending_proposals,
     proposal_record,
     record_approval,
     record_execution,
+    update_proposal_status,
+    update_proposal_workflow_fields,
 )
 from .poly_executor import execute_record
 
@@ -110,7 +116,14 @@ def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False)
                 raise RuntimeError(f"Proposal {proposal_id} not found.")
             if record["status"] not in {"pending_approval", "approved", "rejected"}:
                 raise RuntimeError(f"Proposal {proposal_id} is in status '{record['status']}', expected pending_approval.")
-            message_text = format_message(record)
+            # Compute approval deadline
+            market = record.get("market") or {}
+            seconds_to_expiry = market.get("seconds_to_expiry")
+            approval_ttl = clamp_approval_ttl(record.get("approval_ttl_seconds"), seconds_to_expiry)
+            now = utc_now_iso()
+            now_dt = parse_iso8601(now)
+            expires_at = (now_dt + timedelta(seconds=approval_ttl)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            message_text = format_message(record) + f"\n\nExpires in {approval_ttl}s — approve before {expires_at} UTC"
             if dry_run:
                 telegram_result = {"message_id": None, "dry_run": True}
             else:
@@ -127,12 +140,24 @@ def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False)
                     },
                 }
                 telegram_result = tg_post("sendMessage", payload)["result"]
+            msg_id = str(telegram_result.get("message_id") or "") if not dry_run else None
+            update_proposal_workflow_fields(
+                conn,
+                proposal_id,
+                approval_requested_at=now,
+                approval_expires_at=expires_at,
+                telegram_message_id=msg_id,
+                telegram_chat_id=str(chat_id),
+            )
+            conn.commit()
             event = {
-                "timestamp": utc_now_iso(),
+                "timestamp": now,
                 "type": "proposal_sent",
                 "proposal_id": proposal_id,
                 "status": record["status"],
                 "chat_id": str(chat_id),
+                "approval_ttl_seconds": approval_ttl,
+                "approval_expires_at": expires_at,
                 "telegram": telegram_result,
             }
             append_jsonl(debug_events_path("approvals"), event)
@@ -215,6 +240,41 @@ def auto_execute_approved_proposal(proposal_id: str) -> Dict[str, Any]:
         }
 
 
+def expire_stale_proposals(conn=None) -> List[Dict[str, Any]]:
+    """Sweep pending_approval proposals past their deadline. Returns list of expired entries."""
+    own_conn = conn is None
+    if own_conn:
+        conn = connect_db()
+    try:
+        expired = list_expired_pending_proposals(conn)
+        results = []
+        for record in expired:
+            update_proposal_status(conn, record["proposal_id"], "expired")
+            if record.get("telegram_message_id") and record.get("telegram_chat_id"):
+                try:
+                    tg_post("editMessageText", {
+                        "chat_id": record["telegram_chat_id"],
+                        "message_id": record["telegram_message_id"],
+                        "text": format_message(record) + "\n\n--- EXPIRED ---",
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+                except Exception:
+                    pass
+            append_jsonl(debug_events_path("approvals"), {
+                "timestamp": utc_now_iso(),
+                "type": "proposal_expired",
+                "proposal_id": record["proposal_id"],
+                "approval_expires_at": record.get("approval_expires_at"),
+            })
+            results.append({"proposal_id": record["proposal_id"], "action": "expired"})
+        if own_conn:
+            conn.commit()
+        return results
+    finally:
+        if own_conn:
+            conn.close()
+
+
 def create_app() -> Flask:
     init_db()
     app = Flask(__name__)
@@ -250,6 +310,26 @@ def create_app() -> Flask:
         action, proposal_id = data.split(":", 1)
         if action not in {"approve", "reject"}:
             return jsonify({"ok": False, "error": "invalid action"}), 400
+
+        # Reject late callbacks for expired proposals
+        with connect_db() as conn:
+            pre_record = proposal_record(conn, proposal_id)
+        if pre_record and pre_record.get("approval_expires_at"):
+            if utc_now_iso() > pre_record["approval_expires_at"]:
+                try:
+                    tg_post("answerCallbackQuery", {
+                        "callback_query_id": callback_query["id"],
+                        "text": "This proposal has expired.",
+                    })
+                except Exception:
+                    pass
+                append_jsonl(debug_events_path("approvals"), {
+                    "timestamp": utc_now_iso(),
+                    "type": "late_callback_rejected",
+                    "proposal_id": proposal_id,
+                    "approval_expires_at": pre_record["approval_expires_at"],
+                })
+                return jsonify({"ok": False, "reason": "expired", "proposal_id": proposal_id})
 
         result = update_decision(action, proposal_id, callback_query)
         auto_exec = None

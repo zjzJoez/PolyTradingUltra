@@ -217,6 +217,94 @@ def build_openclaw_proposals(
     return proposals
 
 
+def run_proposal_pipeline(
+    conn,
+    markets: List[Dict[str, Any]],
+    *,
+    engine: str = "heuristic",
+    context_payload: Dict[str, Any] | None = None,
+    size_usdc: float = 10.0,
+    top: int = 3,
+    max_slippage_bps: int = 500,
+    min_confidence: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """Generate proposals, enrich with memos/supervision, and persist. Returns enriched records."""
+    if engine == "openclaw_llm":
+        proposals = build_openclaw_proposals(
+            markets,
+            context_file=context_payload,
+            size_usdc=size_usdc,
+            top=top,
+            max_slippage_bps=max_slippage_bps,
+        )
+    else:
+        proposals = build_heuristic_proposals(
+            markets,
+            min_confidence=min_confidence,
+            size_usdc=size_usdc,
+            top=top,
+            max_slippage_bps=max_slippage_bps,
+        )
+    market_map = {str(item["market_id"]): dict(item) for item in markets}
+    for m in market_map.values():
+        upsert_market_snapshot(conn, m)
+        cluster_market(conn, m)
+    persisted = []
+    for proposal in proposals:
+        market_id = str(proposal["market_id"])
+        market = market_map.get(market_id) or market_snapshot(conn, market_id)
+        if market is None:
+            continue
+        cluster_result = cluster_market(conn, market)
+        memo = latest_research_memo(conn, market_id)
+        if memo is None and market_contexts(conn, market_id):
+            memo = build_and_store_memo(conn, market_id, cluster=cluster_result["cluster"])
+        context_blob = resolve_context_payload(context_payload, market_id)
+        default_topic = (
+            (memo or {}).get("topic")
+            or cluster_result["cluster"].get("topic")
+            or context_blob.get("topic")
+            or market_id
+        )
+        strategy_name = "near_expiry_conviction"
+        record = upsert_proposal(
+            conn,
+            proposal,
+            decision_engine=engine,
+            status="proposed",
+            context_payload=context_blob,
+            strategy_name=strategy_name,
+            topic=default_topic,
+            event_cluster_id=cluster_result["cluster"]["id"],
+            source_memo_id=(memo or {}).get("id"),
+        )
+        replace_proposal_contexts(conn, record["proposal_id"], market_contexts(conn, market_id))
+        enriched = proposal_record(conn, record["proposal_id"])
+        if enriched is None:
+            continue
+        supervisor = supervise_record(enriched)
+        update_proposal_workflow_fields(
+            conn,
+            record["proposal_id"],
+            strategy_name=supervisor.get("strategy_name") or strategy_name,
+            topic=supervisor.get("topic") or default_topic,
+            event_cluster_id=cluster_result["cluster"]["id"],
+            source_memo_id=(memo or {}).get("id"),
+            supervisor_decision=supervisor.get("decision"),
+            priority_score=supervisor.get("priority_score"),
+        )
+        persisted.append({
+            "proposal_id": record["proposal_id"],
+            "proposal": normalize_proposal(proposal),
+            "market_reference_price": market_reference_price(market, proposal["outcome"]),
+            "decision_engine": engine,
+            "status": "proposed",
+            "topic": supervisor.get("topic") or default_topic,
+            "strategy_name": supervisor.get("strategy_name") or strategy_name,
+        })
+    return persisted
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate normalized proposal records and persist them to SQLite.")
     parser.add_argument("--market-file", help="Scanner JSON file.")
