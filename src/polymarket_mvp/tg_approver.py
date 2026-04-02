@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any, Dict, List
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request
 
 from .common import (
     append_jsonl,
@@ -37,9 +37,307 @@ from .db import (
     update_proposal_status,
     update_proposal_workflow_fields,
 )
+from .ops_snapshot import build_ops_snapshot
 from .poly_executor import execute_record
 
 load_repo_env()
+
+
+OPS_DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket Ops</title>
+  <style>
+    :root {
+      --bg: #0c1118;
+      --panel: #121925;
+      --panel-2: #182131;
+      --border: #273247;
+      --text: #e7edf7;
+      --muted: #92a1b8;
+      --accent: #8dd3ff;
+      --good: #1fb877;
+      --warn: #f4b942;
+      --bad: #ef6b73;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #152033 0%, var(--bg) 55%);
+      color: var(--text);
+      font: 14px/1.45 Menlo, Monaco, Consolas, monospace;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    .page { max-width: 1500px; margin: 0 auto; padding: 24px; }
+    .header {
+      display: flex; justify-content: space-between; gap: 16px; align-items: flex-start;
+      margin-bottom: 20px;
+    }
+    .title h1 { margin: 0 0 6px; font-size: 26px; }
+    .title p, .meta { margin: 0; color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.00)), var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      min-height: 120px;
+      box-shadow: 0 12px 24px rgba(0,0,0,0.22);
+    }
+    .panel h2 { margin: 0 0 12px; font-size: 15px; }
+    .span-12 { grid-column: span 12; }
+    .span-8 { grid-column: span 8; }
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .span-3 { grid-column: span 3; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; }
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+    }
+    .card .name { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .badge {
+      display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px;
+      border: 1px solid currentColor;
+    }
+    .green { color: var(--good); }
+    .yellow { color: var(--warn); }
+    .red { color: var(--bad); }
+    .metric { font-size: 20px; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; font-size: 12px; }
+    .empty { color: var(--muted); padding: 10px 0; }
+    .attention-item {
+      padding: 10px 0;
+      border-top: 1px solid var(--border);
+    }
+    .attention-item:first-child { border-top: 0; padding-top: 0; }
+    .attention-title { font-weight: 700; margin-bottom: 4px; }
+    .small { font-size: 12px; color: var(--muted); }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .pill {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.02);
+    }
+    @media (max-width: 1100px) {
+      .span-8, .span-6, .span-4, .span-3 { grid-column: span 12; }
+      .header { display: block; }
+      .meta { margin-top: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="title">
+        <h1>Polymarket Ops</h1>
+        <p>Internal dashboard for autopilot, Telegram approvals, live orders, positions, and recent failures.</p>
+      </div>
+      <div class="meta" id="header-meta">Loading...</div>
+    </div>
+
+    <div class="grid">
+      <section class="panel span-12">
+        <h2>System Health</h2>
+        <div id="system-health" class="cards"></div>
+      </section>
+
+      <section class="panel span-4">
+        <h2>Needs Attention</h2>
+        <div id="needs-attention"></div>
+      </section>
+
+      <section class="panel span-8">
+        <h2>Control State</h2>
+        <div id="control-state"></div>
+      </section>
+
+      <section class="panel span-6">
+        <h2>Pending Approvals</h2>
+        <div id="pending-approvals"></div>
+      </section>
+
+      <section class="panel span-6">
+        <h2>Live Orders</h2>
+        <div id="live-orders"></div>
+      </section>
+
+      <section class="panel span-12">
+        <h2>Open Positions</h2>
+        <div id="open-positions"></div>
+      </section>
+
+      <section class="panel span-6">
+        <h2>Recent Decisions</h2>
+        <div id="recent-decisions"></div>
+      </section>
+
+      <section class="panel span-6">
+        <h2>Recent Failures</h2>
+        <div id="recent-failures"></div>
+      </section>
+    </div>
+  </div>
+
+  <script id="initial-ops-data" type="application/json">{{ initial_json|safe }}</script>
+  <script>
+    const initial = JSON.parse(document.getElementById("initial-ops-data").textContent);
+
+    function fmtRelative(seconds) {
+      if (seconds === null || seconds === undefined) return "n/a";
+      const abs = Math.abs(seconds);
+      if (abs < 60) return `${seconds}s`;
+      if (abs < 3600) return `${Math.round(seconds / 60)}m`;
+      if (abs < 86400) return `${Math.round(seconds / 3600)}h`;
+      return `${Math.round(seconds / 86400)}d`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    }
+
+    function emptyState(message) {
+      return `<div class="empty">${escapeHtml(message)}</div>`;
+    }
+
+    function renderTable(columns, rows) {
+      if (!rows.length) return emptyState("No rows.");
+      const head = `<tr>${columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
+      const body = rows.map(row => `<tr>${columns.map(c => `<td>${c.render(row)}</td>`).join("")}</tr>`).join("");
+      return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+    }
+
+    function renderHealth(items) {
+      if (!items.length) return emptyState("No heartbeats yet.");
+      return items.map(item => `
+        <div class="card">
+          <div class="name">${escapeHtml(item.loop)}</div>
+          <div><span class="badge ${item.health}">${escapeHtml(item.health)}</span></div>
+          <div class="metric">${fmtRelative(item.age_seconds)}</div>
+          <div class="small">cadence ${fmtRelative(item.cadence_seconds)} | processed ${item.items_processed ?? 0}</div>
+          <div class="small">duration ${item.duration_seconds != null ? item.duration_seconds.toFixed(1) + "s" : "n/a"}</div>
+          ${item.last_error_text ? `<div class="small red">${escapeHtml(item.last_error_text.slice(0, 220))}</div>` : ""}
+        </div>
+      `).join("");
+    }
+
+    function renderAttention(items) {
+      if (!items.length) return emptyState("Nothing urgent.");
+      return items.slice(0, 10).map(item => `
+        <div class="attention-item">
+          <div class="attention-title ${item.severity === "high" ? "red" : "yellow"}">${escapeHtml(item.title || item.kind || "attention")}</div>
+          <div class="small">${escapeHtml(item.detail || item.message || "")}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderControlState(control) {
+      const kill = (control.kill_switches || []).length
+        ? renderTable(
+            [
+              { label: "Scope", render: row => escapeHtml(`${row.scope_type}:${row.scope_key}`) },
+              { label: "Reason", render: row => escapeHtml(row.reason) },
+              { label: "Created", render: row => escapeHtml(row.created_at) },
+            ],
+            control.kill_switches
+          )
+        : emptyState("No active kill switches.");
+      const intervals = Object.entries(control.loop_intervals_seconds || {})
+        .map(([key, value]) => `<span class="pill">${escapeHtml(key)} ${fmtRelative(value)}</span>`)
+        .join("");
+      return `
+        <div class="small">OpenClaw agent: ${escapeHtml(control.openclaw_agent_id || "n/a")} | auto execute mode: ${escapeHtml(control.tg_auto_execute_mode || "n/a")}</div>
+        <div class="pill-row">${intervals}</div>
+        <div style="margin-top: 12px">${kill}</div>
+      `;
+    }
+
+    function renderSnapshot(data) {
+      document.getElementById("header-meta").textContent =
+        `updated ${data.timestamp} | pending ${data.pending_count} | live orders ${data.live_order_count} | open positions ${data.open_position_count}`;
+
+      document.getElementById("system-health").innerHTML = renderHealth(data.system_health || []);
+      document.getElementById("needs-attention").innerHTML = renderAttention(data.needs_attention || []);
+      document.getElementById("control-state").innerHTML = renderControlState(data.control_state || {});
+
+      document.getElementById("pending-approvals").innerHTML = renderTable(
+        [
+          { label: "Proposal", render: row => `<div>${escapeHtml(row.proposal_id)}</div><div class="small">${escapeHtml(row.proposal_kind || "entry")}</div>` },
+          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
+          { label: "Trade", render: row => `${escapeHtml(row.outcome)} · $${Number(row.size_usdc || 0).toFixed(2)} · ${(Number(row.confidence_score || 0)).toFixed(2)}` },
+          { label: "Expires", render: row => `<div>${escapeHtml(row.approval_expires_at || "n/a")}</div><div class="small ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${fmtRelative(row.seconds_remaining)}</div>` },
+        ],
+        data.pending_approvals || []
+      );
+
+      document.getElementById("live-orders").innerHTML = renderTable(
+        [
+          { label: "Order", render: row => `<div>${escapeHtml(row.order_id || row.proposal_id)}</div><div class="small">${escapeHtml(row.status)}</div>` },
+          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
+          { label: "Request", render: row => `${escapeHtml(row.outcome || "")} · $${Number(row.requested_size_usdc || 0).toFixed(2)} @ ${row.requested_price ?? "n/a"}` },
+          { label: "Age / TTL", render: row => `<div>${fmtRelative(row.age_seconds)}</div><div class="small ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${row.seconds_remaining != null ? fmtRelative(row.seconds_remaining) + " left" : "n/a"}</div>` },
+        ],
+        data.live_orders || []
+      );
+
+      document.getElementById("open-positions").innerHTML = renderTable(
+        [
+          { label: "Position", render: row => `<div>${escapeHtml(row.market)}</div><div class="small">${escapeHtml(row.outcome)}</div>` },
+          { label: "Status", render: row => escapeHtml(row.status) },
+          { label: "Entry / Mark", render: row => `${row.entry_price ?? "n/a"} / ${row.last_mark_price ?? "n/a"}` },
+          { label: "Size", render: row => `$${Number(row.size_usdc || 0).toFixed(2)}` },
+          { label: "PnL", render: row => `<div>U ${Number(row.unrealized_pnl || 0).toFixed(2)}</div><div class="small">R ${Number(row.realized_pnl || 0).toFixed(2)}</div>` },
+        ],
+        data.open_positions || []
+      );
+
+      document.getElementById("recent-decisions").innerHTML = renderTable(
+        [
+          { label: "Proposal", render: row => `<div>${escapeHtml(row.proposal_id)}</div><div class="small">${escapeHtml(row.status)}</div>` },
+          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
+          { label: "Trade", render: row => `${escapeHtml(row.outcome)} · $${Number(row.size_usdc || 0).toFixed(2)} · ${(Number(row.confidence_score || 0)).toFixed(2)}` },
+          { label: "Reason", render: row => `<span class="small">${escapeHtml(row.reason || "")}</span>` },
+        ],
+        data.recent_decisions || []
+      );
+
+      document.getElementById("recent-failures").innerHTML = renderTable(
+        [
+          { label: "Kind", render: row => `<div>${escapeHtml(row.kind)}</div><div class="small">${escapeHtml(row.category)}</div>` },
+          { label: "Target", render: row => escapeHtml(row.market || row.loop || row.proposal_id || "") },
+          { label: "When", render: row => `<div>${escapeHtml(row.timestamp || "")}</div><div class="small">${escapeHtml(row.status || "")}</div>` },
+          { label: "Message", render: row => `<span class="small">${escapeHtml((row.message || "").slice(0, 220))}</span>` },
+        ],
+        data.recent_failures || []
+      );
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/ops/status", { headers: { "Accept": "application/json" } });
+        if (!response.ok) throw new Error(`status ${response.status}`);
+        const data = await response.json();
+        renderSnapshot(data);
+      } catch (error) {
+        document.getElementById("header-meta").textContent = `dashboard refresh failed: ${error}`;
+      }
+    }
+
+    renderSnapshot(initial);
+    window.setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
+"""
 
 
 def tg_base_url() -> str:
@@ -290,6 +588,45 @@ def create_app() -> Flask:
         if record is None:
             return jsonify({"proposal_id": proposal_id, "status": "missing"}), 404
         return jsonify({"proposal_id": proposal_id, "status": record["status"], "approval": record["approval"]})
+
+    @app.get("/api/ops/status")
+    def ops_status():
+        with connect_db() as conn:
+            return jsonify(build_ops_snapshot(conn))
+
+    @app.get("/api/ops/proposals")
+    def ops_proposals():
+        with connect_db() as conn:
+            snapshot = build_ops_snapshot(conn)
+        return jsonify(
+            {
+                "timestamp": snapshot["timestamp"],
+                "pending_count": snapshot["pending_count"],
+                "pending_approvals": snapshot["pending_approvals"],
+                "recent_decisions": snapshot["recent_decisions"],
+            }
+        )
+
+    @app.get("/api/ops/failures")
+    def ops_failures():
+        with connect_db() as conn:
+            snapshot = build_ops_snapshot(conn)
+        return jsonify({"timestamp": snapshot["timestamp"], "recent_failures": snapshot["recent_failures"]})
+
+    @app.get("/api/ops/events")
+    def ops_events():
+        with connect_db() as conn:
+            snapshot = build_ops_snapshot(conn)
+        return jsonify({"timestamp": snapshot["timestamp"], "recent_events": snapshot["recent_events"]})
+
+    @app.get("/ops")
+    def ops_dashboard():
+        with connect_db() as conn:
+            snapshot = build_ops_snapshot(conn)
+        return render_template_string(
+            OPS_DASHBOARD_TEMPLATE,
+            initial_json=json.dumps(snapshot, sort_keys=False),
+        )
 
     @app.post("/telegram/webhook")
     def telegram_webhook():

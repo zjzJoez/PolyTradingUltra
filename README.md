@@ -536,6 +536,19 @@ Check status:
 autopilot-status
 ```
 
+Local dashboard:
+
+```text
+http://127.0.0.1:8787/ops
+```
+
+JSON observability endpoints:
+
+- `/api/ops/status`
+- `/api/ops/proposals`
+- `/api/ops/failures`
+- `/api/ops/events`
+
 ### launchd Deployment (macOS)
 
 ```bash

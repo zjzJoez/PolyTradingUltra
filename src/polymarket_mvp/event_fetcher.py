@@ -152,6 +152,26 @@ def twitter_soft_fail_context(error: str) -> Dict[str, Any]:
     }
 
 
+def cryptopanic_soft_fail_context(error: str) -> Dict[str, Any]:
+    message = "CryptoPanic news temporarily unavailable. Agent should rely on remaining context providers."
+    detail = sanitize_text(error) or "unknown_cryptopanic_error"
+    return {
+        "source_type": "cryptopanic",
+        "source_id": "soft_fail",
+        "title": "CryptoPanic context unavailable",
+        "published_at": utc_now_iso(),
+        "url": None,
+        "raw_text": detail,
+        "display_text": short_context_line("NEWS: ", message, limit=280),
+        "importance_weight": 0.2,
+        "normalized_payload_json": {
+            "soft_fail": True,
+            "message": message,
+            "error": detail,
+        },
+    }
+
+
 class PerplexityAdapter:
     endpoint = "https://api.perplexity.ai/chat/completions"
 
@@ -272,7 +292,10 @@ def fetch_contexts_for_market(
     if "perplexity" in enabled:
         contexts.extend(PerplexityAdapter().fetch(market))
     if "cryptopanic" in enabled:
-        contexts.extend(CryptoPanicAdapter().fetch(market, limit=limit))
+        try:
+            contexts.extend(CryptoPanicAdapter().fetch(market, limit=limit))
+        except Exception as exc:
+            contexts.append(cryptopanic_soft_fail_context(str(exc)))
     if "apify_twitter" in enabled:
         try:
             contexts.extend(ApifyTwitterAdapter().fetch(market, limit=limit, min_favorite_count=min_favorite_count))
