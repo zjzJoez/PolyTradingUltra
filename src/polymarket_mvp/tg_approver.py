@@ -405,9 +405,12 @@ def format_message(record: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False) -> Dict[str, Any]:
+def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False, conn=None) -> Dict[str, Any]:
     results = []
-    with connect_db() as conn:
+    _own_conn = conn is None
+    if _own_conn:
+        conn = connect_db().__enter__()
+    try:
         for proposal_id in proposal_ids:
             record = proposal_record(conn, proposal_id)
             if record is None:
@@ -460,6 +463,9 @@ def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False)
             }
             append_jsonl(debug_events_path("approvals"), event)
             results.append(event)
+    finally:
+        if _own_conn:
+            conn.close()
     return {"timestamp": utc_now_iso(), "sent_count": len(results), "events": results}
 
 

@@ -21,8 +21,9 @@ from .migrations import apply_pending_migrations, ensure_schema_migrations, mark
 def connect_db(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

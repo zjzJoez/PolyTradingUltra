@@ -76,10 +76,14 @@ class Autopilot:
                         iteration += 1
                         continue
 
-                    for name in ["scan", "context", "propose", "expiry", "execute", "reconcile", "exit", "review"]:
-                        if self.should_run(name):
-                            self._tick(conn, name)
-                    conn.commit()
+                for name in ["scan", "context", "propose", "expiry", "execute", "reconcile", "exit", "review"]:
+                    if self.should_run(name):
+                        try:
+                            with connect_db() as conn:
+                                self._tick(conn, name)
+                                conn.commit()
+                        except Exception:
+                            _log(f"{name} top-level error: {traceback.format_exc()}")
             except Exception:
                 _log(f"top-level error: {traceback.format_exc()}")
             iteration += 1
@@ -199,7 +203,7 @@ class Autopilot:
             return
         try:
             from .tg_approver import send_proposals
-            send_proposals([p["proposal_id"] for p in unsent], chat_id=chat_id)
+            send_proposals([p["proposal_id"] for p in unsent], chat_id=chat_id, conn=conn)
         except Exception:
             _log(f"telegram send failed: {traceback.format_exc()}")
 
