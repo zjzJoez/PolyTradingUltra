@@ -2,7 +2,22 @@
 
 Local-first Polymarket trading system with SQLite as the single business source of truth.
 
-当前仓库已经不再只是一个 `scan -> approve -> execute` 的 MVP。它现在支持：
+这个仓库现在已经不是一个单次脚本串起来的 MVP，而是一个本地常驻运行的 Polymarket 交易操作系统。它把市场扫描、上下文抓取、候选单生成、风险检查、人工审批、自动执行、订单对账、持仓管理、退出建议、复盘和运维控制，放进了一套统一的 Python + SQLite 控制面里。
+
+当前系统主要由 4 层组成：
+
+- 决策层
+  - OpenClaw / LLM 负责 proposal、memo、supervisor、exit、review 这类“需要判断”的节点
+  - 没有 LLM 时，deterministic / heuristic 路径依然能跑
+- 执行层
+  - Python pipeline 负责扫描、抓 context、跑风控、发 Telegram、执行订单、同步订单和持仓
+- 状态层
+  - SQLite 是唯一业务状态源，proposal / approval / execution / position / review 都落库
+- 运维层
+  - `8787` 是主业务 dashboard
+  - `8788` 是独立 control plane，用来在主系统停掉后仍能做 `start / stop / restart`
+
+当前仓库支持：
 
 - 市场扫描与上下文抓取
 - event clustering 与 research memo
@@ -12,6 +27,25 @@ Local-first Polymarket trading system with SQLite as the single business source 
 - `authorized_for_execution` 自动执行队列
 - `mock` / `real` 执行
 - positions / reconciliations / kill-switch / exit-review 基础设施
+
+## What It Is
+
+一句话概括：
+
+`scan -> context -> propose -> risk -> approve/authorize -> execute -> reconcile -> manage positions -> review`
+
+如果你把它当成产品来理解，现在它更像一个：
+
+- 本地运行的 Polymarket research + execution engine
+- 有人审路径和自动授权路径并存
+- 带运维控制面的单机交易系统
+
+它不是“一个一直在自由思考的大脑”，而是一个 24/7 调度器：
+
+- 固定 cadence 轮询各个 loop
+- 在关键节点调用 LLM
+- 风控和授权决定 proposal 能不能继续往下走
+- Telegram/控制面负责人工干预
 
 ## Architecture
 
@@ -31,6 +65,70 @@ Local-first Polymarket trading system with SQLite as the single business source 
   - session spend guard
   - strategy authorization
   - kill-switch
+
+## Recommended Operating Model
+
+目前推荐的使用方式是：
+
+1. `autopilot` 常驻运行，负责 24/7 链路
+2. `tg-webhook` 常驻运行，负责 Telegram 审批和主 dashboard
+3. `control-plane` 常驻运行，负责独立的系统启停和状态查看
+4. `SQLite` 作为唯一状态源，不绕库做旁路状态管理
+
+推荐你平时只记住这两个页面：
+
+- 主业务 dashboard: `http://127.0.0.1:8787/ops`
+- 独立控制页: `http://127.0.0.1:8788/`
+
+它们的职责不同：
+
+- `8787`
+  - 看 proposals、failures、positions、heartbeats、recent events
+  - 这是业务侧观察页
+  - 如果你停掉主系统，这个页面自己也会消失
+- `8788`
+  - 做 `Start System / Stop System / Restart System`
+  - 查看主系统是否真的活着
+  - 这是系统外部的 control plane
+  - 就算 `8787` 已经挂了，`8788` 仍然可以把它重新拉起
+
+## System Flow
+
+主链路是：
+
+1. `scan`
+   - 扫描可交易市场，落库 `market_snapshots`
+2. `context`
+   - 为候选市场抓取新闻、事件和外部 context
+3. `propose`
+   - heuristic 或 OpenClaw/LLM 生成 proposal
+   - proposal 会补充 topic / cluster / memo / supervisor metadata
+4. `risk`
+   - 检查价格可交易性、slippage、topic/cluster exposure、session spend、strategy authorization
+5. `approve / authorize`
+   - 命中策略授权: `authorized_for_execution`
+   - 未命中自动授权: `pending_approval`，进入 Telegram
+6. `execute`
+   - 对 `authorized_for_execution` 或人工批准后的 proposal 下单
+7. `reconcile`
+   - 同步 live order、取消 stale order、刷新 position / mark / fill
+8. `exit / review`
+   - 为 open positions 生成 exit 建议
+   - 为 resolved positions 生成 review
+
+## Current Runtime Pieces
+
+你可以把系统运行时分成 3 个长驻组件：
+
+- `polymarket-autopilot`
+  - 主监督循环
+  - 负责 scan / context / propose / expiry / execute / reconcile / exit / review
+- `tg-approver serve --port 8787`
+  - Telegram webhook server
+  - 同时承载 `/ops` dashboard 和 `/api/ops/*`
+- `python -m polymarket_mvp.control_plane --port 8788`
+  - 独立系统控制页
+  - 承载 `/api/system/status` 和 `/api/system/control`
 
 ## Current Operating Modes
 
@@ -63,6 +161,47 @@ Local-first Polymarket trading system with SQLite as the single business source 
 
 - 当前仓库的 workflow YAML 重点覆盖 authorization-first 路径
 - Telegram 路径仍然可用，但更适合 operator 手动选择 pending proposals 后执行
+
+## Day-To-Day Usage
+
+如果你平时只是开系统、看状态、停系统，推荐最短路径如下。
+
+启动系统：
+
+```bash
+./.venv311/bin/python scripts/system_control.py start
+```
+
+或者直接打开：
+
+- `scripts/start_system.command`
+
+看系统：
+
+- `http://127.0.0.1:8788/` 看控制面
+- `http://127.0.0.1:8787/ops` 看主业务状态
+
+停止系统：
+
+```bash
+./.venv311/bin/python scripts/system_control.py stop
+```
+
+重启系统：
+
+```bash
+./.venv311/bin/python scripts/system_control.py restart
+```
+
+启动独立 control plane：
+
+```bash
+./.venv311/bin/python -m polymarket_mvp.control_plane --port 8788
+```
+
+或者直接打开：
+
+- `scripts/start_control_plane.command`
 
 ## Repository Layout
 
@@ -103,6 +242,7 @@ src/polymarket_mvp/
   proposer.py
   resolution_backfill.py
   risk_engine.py
+  control_plane.py
   run_exit_agent.py
   run_review_agent.py
   shadow_execute.py
@@ -114,6 +254,7 @@ schema.sql
 workflows/openclaw-polymarket-mvp.yaml
 deploy/
   com.polymarket.autopilot.plist
+  com.polymarket.control-plane.plist
   com.polymarket.tg-webhook.plist
 ```
 
@@ -218,12 +359,21 @@ position-report
 backfill-resolutions
 polymarket-autopilot
 autopilot-status
+system-control-plane
 ```
 
 Equivalent module form:
 
 ```bash
 PYTHONPATH=src python3 -m polymarket_mvp.<module>
+```
+
+Control plane helper script:
+
+```bash
+./.venv311/bin/python scripts/system_control.py start
+./.venv311/bin/python scripts/system_control.py stop
+./.venv311/bin/python scripts/system_control.py restart
 ```
 
 ## Data Model
@@ -544,12 +694,20 @@ Local dashboard:
 http://127.0.0.1:8787/ops
 ```
 
+Standalone control plane:
+
+```text
+http://127.0.0.1:8788/
+```
+
 JSON observability endpoints:
 
 - `/api/ops/status`
 - `/api/ops/proposals`
 - `/api/ops/failures`
 - `/api/ops/events`
+- `http://127.0.0.1:8788/api/system/status`
+- `http://127.0.0.1:8788/api/system/control`
 
 ### launchd Deployment (macOS)
 
@@ -575,6 +733,12 @@ Control plane:
 
 - `http://127.0.0.1:8788/`
 - Stays outside the main trading system so it can start `autopilot` and `tg-webhook` even when port `8787` is down
+
+Current recommendation on macOS:
+
+- Let `control-plane` auto-start on login via `launchd`
+- Keep `autopilot` and `tg-webhook` under the control plane unless you fully migrate them to `launchd`
+- Use `8788` for lifecycle control, not `8787`
 
 Autopilot environment variables:
 - `POLY_SCAN_INTERVAL_SECONDS` (default 30)
