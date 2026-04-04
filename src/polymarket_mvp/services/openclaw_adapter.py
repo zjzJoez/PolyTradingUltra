@@ -236,6 +236,9 @@ def maybe_generate_trade_proposals(prompt_payload: Mapping[str, Any]) -> list[Di
     return chat_list(
         (
             "You are the dedicated Polymarket proposal generator."
+            " Optimize for tradable opportunities, not merely the highest apparent certainty."
+            " Avoid near-certain, near-expiry, low-upside markets where the selected outcome is already priced close to 0 or 1."
+            " Prefer proposals with realistic fill probability, non-trivial upside, and prices in a healthy tradable range."
             " Return valid JSON only. No markdown, no commentary, no prose outside JSON."
             " Preferred format: an object with a proposals array; a top-level JSON array is also accepted."
             " If there are no valid proposals, return {\"proposals\": []}."

@@ -281,6 +281,19 @@ def market_reference_price(market: Mapping[str, Any], outcome: str) -> float | N
     return float(value)
 
 
+def tradable_price_bounds() -> tuple[float, float]:
+    minimum = get_env_float("POLY_MIN_TRADABLE_PRICE", 0.10)
+    maximum = get_env_float("POLY_MAX_TRADABLE_PRICE", 0.90)
+    return minimum, maximum
+
+
+def price_is_tradable(price: float | None) -> bool:
+    if price is None:
+        return False
+    minimum, maximum = tradable_price_bounds()
+    return minimum <= float(price) <= maximum
+
+
 def polygon_rpc_url() -> str:
     return os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"
 

@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import subprocess
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, List
 
 import requests
@@ -52,66 +56,154 @@ OPS_DASHBOARD_TEMPLATE = """
   <title>Polymarket Ops</title>
   <style>
     :root {
-      --bg: #0c1118;
-      --panel: #121925;
-      --panel-2: #182131;
-      --border: #273247;
-      --text: #e7edf7;
-      --muted: #92a1b8;
-      --accent: #8dd3ff;
-      --good: #1fb877;
-      --warn: #f4b942;
-      --bad: #ef6b73;
+      --bg: #f3efe6;
+      --bg-accent: #e6dfd2;
+      --panel: rgba(255, 252, 247, 0.92);
+      --panel-2: #f7f1e8;
+      --border: #d7cbb8;
+      --border-strong: #bfae95;
+      --text: #1f1b16;
+      --muted: #6b6256;
+      --accent: #0b5fff;
+      --good: #0f8a5f;
+      --warn: #b57617;
+      --bad: #c53c4c;
+      --shadow: 0 18px 40px rgba(81, 57, 24, 0.08);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: radial-gradient(circle at top, #152033 0%, var(--bg) 55%);
+      background:
+        radial-gradient(circle at top left, rgba(255,255,255,0.8), transparent 28%),
+        radial-gradient(circle at top right, rgba(214,194,160,0.35), transparent 32%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-accent) 100%);
       color: var(--text);
-      font: 14px/1.45 Menlo, Monaco, Consolas, monospace;
+      font: 14px/1.5 "SF Mono", "IBM Plex Mono", Menlo, Monaco, Consolas, monospace;
     }
     a { color: var(--accent); text-decoration: none; }
-    .page { max-width: 1500px; margin: 0 auto; padding: 24px; }
+    a:hover { text-decoration: underline; }
+    .page { max-width: 1580px; margin: 0 auto; padding: 24px; }
     .header {
-      display: flex; justify-content: space-between; gap: 16px; align-items: flex-start;
-      margin-bottom: 20px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.8fr);
+      gap: 16px;
+      margin-bottom: 18px;
     }
-    .title h1 { margin: 0 0 6px; font-size: 26px; }
+    .hero, .meta-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+    }
+    .hero {
+      padding: 22px;
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.88), rgba(246,239,228,0.92)),
+        var(--panel);
+    }
+    .meta-card {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .title h1 { margin: 0 0 8px; font-size: 34px; line-height: 1.1; }
     .title p, .meta { margin: 0; color: var(--muted); }
+    .hero-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
     .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
     .panel {
-      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.00)), var(--panel);
+      background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.52)), var(--panel);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 14px;
+      border-radius: 18px;
+      padding: 16px;
       min-height: 120px;
-      box-shadow: 0 12px 24px rgba(0,0,0,0.22);
+      box-shadow: var(--shadow);
     }
-    .panel h2 { margin: 0 0 12px; font-size: 15px; }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .panel h2 { margin: 0; font-size: 15px; }
+    .panel-copy { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
     .span-12 { grid-column: span 12; }
     .span-8 { grid-column: span 8; }
     .span-6 { grid-column: span 6; }
     .span-4 { grid-column: span 4; }
     .span-3 { grid-column: span 3; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
     .card {
       background: var(--panel-2);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px;
+      border-radius: 14px;
+      padding: 12px;
+      min-width: 0;
     }
-    .card .name { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .card .name {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
     .badge {
-      display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
       border: 1px solid currentColor;
+      background: rgba(255,255,255,0.55);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     .green { color: var(--good); }
     .yellow { color: var(--warn); }
     .red { color: var(--bad); }
-    .metric { font-size: 20px; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--border); vertical-align: top; }
-    th { color: var(--muted); font-weight: 600; font-size: 12px; }
+    .metric { font-size: 24px; font-weight: 700; line-height: 1.1; }
+    .metric.small-metric { font-size: 18px; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .table-shell {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.42);
+    }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td {
+      text-align: left;
+      padding: 10px 10px;
+      border-top: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: rgba(247,241,232,0.7);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tbody tr:hover { background: rgba(255,255,255,0.38); }
     .empty { color: var(--muted); padding: 10px 0; }
     .attention-item {
       padding: 10px 0;
@@ -120,70 +212,226 @@ OPS_DASHBOARD_TEMPLATE = """
     .attention-item:first-child { border-top: 0; padding-top: 0; }
     .attention-title { font-weight: 700; margin-bottom: 4px; }
     .small { font-size: 12px; color: var(--muted); }
+    .tiny { font-size: 11px; color: var(--muted); }
+    .mono { font-variant-ligatures: none; }
+    .mono-wrap {
+      font-variant-ligatures: none;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .truncate-2 {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .cell-stack { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .cell-main { font-weight: 600; overflow-wrap: anywhere; }
+    .cell-sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .table-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
     .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
     .pill {
       border: 1px solid var(--border);
       border-radius: 999px;
       padding: 4px 8px;
       color: var(--muted);
-      background: rgba(255,255,255,0.02);
+      background: rgba(255,255,255,0.6);
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 11px;
+      background: rgba(255,255,255,0.58);
+      color: var(--text);
+    }
+    .muted-block {
+      border: 1px dashed var(--border-strong);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.45);
+    }
+    .control-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .control-button {
+      appearance: none;
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      padding: 10px 14px;
+      background: rgba(255,255,255,0.72);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    .control-button:hover { background: rgba(255,255,255,0.92); }
+    .control-button.red {
+      border-color: rgba(197, 60, 76, 0.45);
+      color: var(--bad);
+    }
+    .control-button.yellow {
+      border-color: rgba(181, 118, 23, 0.45);
+      color: var(--warn);
+    }
+    .control-log {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.48);
+      min-height: 42px;
+    }
+    .section-kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
     }
     @media (max-width: 1100px) {
       .span-8, .span-6, .span-4, .span-3 { grid-column: span 12; }
-      .header { display: block; }
+      .header { grid-template-columns: 1fr; }
+      .hero-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .meta { margin-top: 10px; }
+    }
+    @media (max-width: 720px) {
+      .page { padding: 16px; }
+      .hero { padding: 18px; }
+      .hero-metrics { grid-template-columns: 1fr; }
+      table { min-width: 640px; }
     }
   </style>
 </head>
 <body>
   <div class="page">
     <div class="header">
-      <div class="title">
+      <div class="hero">
+        <div class="eyebrow">Ops Console</div>
+        <div class="title">
         <h1>Polymarket Ops</h1>
-        <p>Internal dashboard for autopilot, Telegram approvals, live orders, positions, and recent failures.</p>
+          <p>Readable at a glance: approvals, live execution, open positions, and the few things that actually need intervention.</p>
+        </div>
+        <div id="hero-metrics" class="hero-metrics"></div>
       </div>
-      <div class="meta" id="header-meta">Loading...</div>
+      <div class="meta-card">
+        <div>
+          <div class="eyebrow">Snapshot</div>
+          <div class="metric small-metric" id="snapshot-status">Loading...</div>
+          <p class="meta" id="header-meta"></p>
+        </div>
+        <div class="muted-block">
+          <div class="tiny">Dashboard</div>
+          <div class="small">Auto-refreshes every 5 seconds. Long text is clamped and IDs wrap instead of blowing out the layout.</div>
+        </div>
+      </div>
     </div>
 
     <div class="grid">
-      <section class="panel span-12">
-        <h2>System Health</h2>
-        <div id="system-health" class="cards"></div>
-      </section>
-
       <section class="panel span-4">
-        <h2>Needs Attention</h2>
+        <div class="panel-head">
+          <div>
+            <h2>Needs Attention</h2>
+            <p class="panel-copy">Most urgent operational items.</p>
+          </div>
+        </div>
         <div id="needs-attention"></div>
       </section>
 
       <section class="panel span-8">
-        <h2>Control State</h2>
+        <div class="panel-head">
+          <div>
+            <h2>Control State</h2>
+            <p class="panel-copy">Current agent binding, loop cadence, and kill switches.</p>
+          </div>
+        </div>
         <div id="control-state"></div>
+        <div class="control-actions">
+          <button class="control-button" data-action="start_system">Start System</button>
+          <button class="control-button yellow" data-action="restart_system">Restart System</button>
+          <button class="control-button red" data-action="stop_system">Stop System</button>
+        </div>
+        <div id="control-log" class="control-log small">Launchd control for `autopilot` and `tg-webhook`.</div>
       </section>
 
-      <section class="panel span-6">
-        <h2>Pending Approvals</h2>
+      <section class="panel span-12">
+        <div class="panel-head">
+          <div>
+            <h2>System Health</h2>
+            <p class="panel-copy">Heartbeat age, loop duration, and latest top-level errors.</p>
+          </div>
+        </div>
+        <div id="system-health" class="cards"></div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-head">
+          <div>
+            <h2>Pending Approvals</h2>
+            <p class="panel-copy">Human decisions waiting in Telegram, sorted by urgency.</p>
+          </div>
+        </div>
         <div id="pending-approvals"></div>
       </section>
 
       <section class="panel span-6">
-        <h2>Live Orders</h2>
+        <div class="panel-head">
+          <div>
+            <h2>Live Orders</h2>
+            <p class="panel-copy">Submitted or working orders with age and remaining TTL.</p>
+          </div>
+        </div>
         <div id="live-orders"></div>
       </section>
 
+      <section class="panel span-6">
+        <div class="panel-head">
+          <div>
+            <h2>Recent Decisions</h2>
+            <p class="panel-copy">Latest proposal outcomes and why they landed there.</p>
+          </div>
+        </div>
+        <div id="recent-decisions"></div>
+      </section>
+
       <section class="panel span-12">
-        <h2>Open Positions</h2>
+        <div class="panel-head">
+          <div>
+            <h2>Open Positions</h2>
+            <p class="panel-copy">Current inventory with entry, mark, and PnL.</p>
+          </div>
+        </div>
         <div id="open-positions"></div>
       </section>
 
       <section class="panel span-6">
-        <h2>Recent Decisions</h2>
-        <div id="recent-decisions"></div>
+        <div class="panel-head">
+          <div>
+            <h2>Recent Failures</h2>
+            <p class="panel-copy">Recent execution, reconcile, risk, heartbeat, or Telegram failures.</p>
+          </div>
+        </div>
+        <div id="recent-failures"></div>
       </section>
 
       <section class="panel span-6">
-        <h2>Recent Failures</h2>
-        <div id="recent-failures"></div>
+        <div class="panel-head">
+          <div>
+            <h2>Recent Events</h2>
+            <p class="panel-copy">Raw operational events for quick spot checks.</p>
+          </div>
+        </div>
+        <div id="recent-events"></div>
       </section>
     </div>
   </div>
@@ -201,19 +449,99 @@ OPS_DASHBOARD_TEMPLATE = """
       return `${Math.round(seconds / 86400)}d`;
     }
 
+    function fmtTimestamp(value) {
+      if (!value) return "n/a";
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return escapeHtml(String(value));
+      return escapeHtml(parsed.toLocaleString());
+    }
+
     function escapeHtml(value) {
-      return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value);
+    }
+
+    function toNumberOrNull(value) {
+      if (value === null || value === undefined || value === "") return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function fmtMoney(value) {
+      const parsed = toNumberOrNull(value);
+      return parsed === null ? "n/a" : `$${parsed.toFixed(2)}`;
+    }
+
+    function fmtSignedMoney(value) {
+      const parsed = toNumberOrNull(value);
+      if (parsed === null) return "n/a";
+      const sign = parsed > 0 ? "+" : "";
+      return `${sign}${parsed.toFixed(2)}`;
+    }
+
+    function fmtDecimal(value, digits = 2) {
+      const parsed = toNumberOrNull(value);
+      return parsed === null ? "n/a" : parsed.toFixed(digits);
+    }
+
+    function fmtPrice(value) {
+      const parsed = toNumberOrNull(value);
+      return parsed === null ? "n/a" : parsed.toFixed(3);
+    }
+
+    function toneClass(value, positiveGood = false) {
+      const parsed = toNumberOrNull(value);
+      if (parsed === null || parsed === 0) return "";
+      if (positiveGood) return parsed > 0 ? "green" : "red";
+      return parsed < 0 ? "red" : "yellow";
+    }
+
+    function statusTone(value) {
+      const normalized = String(value || "").toLowerCase();
+      if (!normalized) return "";
+      if (["approved", "filled", "open", "live", "submitted", "healthy", "green"].includes(normalized)) return "green";
+      if (["pending_approval", "partial_fill", "yellow"].includes(normalized)) return "yellow";
+      if (["failed", "error", "rejected", "expired", "risk_blocked", "red"].includes(normalized)) return "red";
+      return "";
+    }
+
+    function safeLink(url, label) {
+      if (!url) return escapeHtml(label);
+      return `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
     }
 
     function emptyState(message) {
       return `<div class="empty">${escapeHtml(message)}</div>`;
     }
 
-    function renderTable(columns, rows) {
-      if (!rows.length) return emptyState("No rows.");
+    function renderTable(columns, rows, emptyMessage = "No rows.") {
+      if (!rows.length) return emptyState(emptyMessage);
       const head = `<tr>${columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
       const body = rows.map(row => `<tr>${columns.map(c => `<td>${c.render(row)}</td>`).join("")}</tr>`).join("");
-      return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+      return `<div class="table-shell"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+    }
+
+    function renderHeroMetrics(data) {
+      const metrics = [
+        { label: "Pending", value: data.pending_count || 0, tone: data.pending_count ? "yellow" : "green" },
+        { label: "Live Orders", value: data.live_order_count || 0, tone: data.live_order_count ? "yellow" : "green" },
+        { label: "Open Positions", value: data.open_position_count || 0, tone: data.open_position_count ? "yellow" : "green" },
+        { label: "Failures", value: (data.recent_failures || []).length, tone: (data.recent_failures || []).length ? "red" : "green" },
+      ];
+      return metrics.map(item => `
+        <div class="card">
+          <div class="name">${escapeHtml(item.label)}</div>
+          <div class="metric ${item.tone === "red" ? "red" : item.tone === "yellow" ? "yellow" : item.tone === "green" ? "green" : ""}">${escapeHtml(item.value)}</div>
+        </div>
+      `).join("");
     }
 
     function renderHealth(items) {
@@ -225,7 +553,7 @@ OPS_DASHBOARD_TEMPLATE = """
           <div class="metric">${fmtRelative(item.age_seconds)}</div>
           <div class="small">cadence ${fmtRelative(item.cadence_seconds)} | processed ${item.items_processed ?? 0}</div>
           <div class="small">duration ${item.duration_seconds != null ? item.duration_seconds.toFixed(1) + "s" : "n/a"}</div>
-          ${item.last_error_text ? `<div class="small red">${escapeHtml(item.last_error_text.slice(0, 220))}</div>` : ""}
+          ${item.last_error_text ? `<div class="small red truncate-2 mono-wrap">${escapeHtml(item.last_error_text.slice(0, 220))}</div>` : ""}
         </div>
       `).join("");
     }
@@ -236,6 +564,7 @@ OPS_DASHBOARD_TEMPLATE = """
         <div class="attention-item">
           <div class="attention-title ${item.severity === "high" ? "red" : "yellow"}">${escapeHtml(item.title || item.kind || "attention")}</div>
           <div class="small">${escapeHtml(item.detail || item.message || "")}</div>
+          ${item.timestamp ? `<div class="small">${fmtTimestamp(item.timestamp)}</div>` : ""}
         </div>
       `).join("");
     }
@@ -244,26 +573,60 @@ OPS_DASHBOARD_TEMPLATE = """
       const kill = (control.kill_switches || []).length
         ? renderTable(
             [
-              { label: "Scope", render: row => escapeHtml(`${row.scope_type}:${row.scope_key}`) },
-              { label: "Reason", render: row => escapeHtml(row.reason) },
-              { label: "Created", render: row => escapeHtml(row.created_at) },
+              { label: "Scope", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(`${row.scope_type}:${row.scope_key}`)}</div></div>` },
+              { label: "Reason", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2">${escapeHtml(row.reason)}</div></div>` },
+              { label: "Created", render: row => `<div class="cell-stack"><div class="cell-sub">${fmtTimestamp(row.created_at)}</div></div>` },
             ],
-            control.kill_switches
+            control.kill_switches,
+            "No active kill switches."
           )
         : emptyState("No active kill switches.");
       const intervals = Object.entries(control.loop_intervals_seconds || {})
         .map(([key, value]) => `<span class="pill">${escapeHtml(key)} ${fmtRelative(value)}</span>`)
         .join("");
       return `
-        <div class="small">OpenClaw agent: ${escapeHtml(control.openclaw_agent_id || "n/a")} | auto execute mode: ${escapeHtml(control.tg_auto_execute_mode || "n/a")}</div>
+        <div class="table-meta">
+          <span class="status-chip">OpenClaw agent ${escapeHtml(control.openclaw_agent_id || "n/a")}</span>
+          <span class="status-chip">auto execute ${escapeHtml(control.tg_auto_execute_mode || "n/a")}</span>
+        </div>
         <div class="pill-row">${intervals}</div>
         <div style="margin-top: 12px">${kill}</div>
       `;
     }
 
+    function summarizeEvent(row) {
+      const parts = [];
+      if (row.status) parts.push(`status ${row.status}`);
+      if (row.market) parts.push(String(row.market));
+      if (row.outcome) parts.push(`outcome ${row.outcome}`);
+      if (row.error) parts.push(`error ${row.error}`);
+      if (row.approval_expires_at) parts.push(`expires ${row.approval_expires_at}`);
+      if (row.callback_query_id) parts.push(`callback ${row.callback_query_id}`);
+      if (row.chat_id) parts.push(`chat ${row.chat_id}`);
+      if (!parts.length && row.telegram && row.telegram.text) {
+        parts.push(String(row.telegram.text).replace(/\s+/g, " ").slice(0, 180));
+      }
+      if (!parts.length) parts.push(JSON.stringify(row).slice(0, 180));
+      return escapeHtml(parts.join(" | "));
+    }
+
+    function renderRecentEvents(items) {
+      return renderTable(
+        [
+          { label: "Type", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.type || "event")}</div><div class="cell-sub">${escapeHtml(row.proposal_id || row.chat_id || "")}</div></div>` },
+          { label: "When", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.timestamp)}</div><div class="cell-sub">${row.approval_expires_at ? `expires ${escapeHtml(row.approval_expires_at)}` : ""}</div></div>` },
+          { label: "Summary", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2 mono-wrap">${summarizeEvent(row)}</div></div>` },
+        ],
+        items || [],
+        "No recent events."
+      );
+    }
+
     function renderSnapshot(data) {
+      document.getElementById("snapshot-status").textContent = "Live snapshot";
       document.getElementById("header-meta").textContent =
-        `updated ${data.timestamp} | pending ${data.pending_count} | live orders ${data.live_order_count} | open positions ${data.open_position_count}`;
+        `updated ${new Date(data.timestamp).toLocaleString()} | pending ${data.pending_count || 0} | live orders ${data.live_order_count || 0} | open positions ${data.open_position_count || 0}`;
+      document.getElementById("hero-metrics").innerHTML = renderHeroMetrics(data);
 
       document.getElementById("system-health").innerHTML = renderHealth(data.system_health || []);
       document.getElementById("needs-attention").innerHTML = renderAttention(data.needs_attention || []);
@@ -271,54 +634,60 @@ OPS_DASHBOARD_TEMPLATE = """
 
       document.getElementById("pending-approvals").innerHTML = renderTable(
         [
-          { label: "Proposal", render: row => `<div>${escapeHtml(row.proposal_id)}</div><div class="small">${escapeHtml(row.proposal_kind || "entry")}</div>` },
-          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
-          { label: "Trade", render: row => `${escapeHtml(row.outcome)} · $${Number(row.size_usdc || 0).toFixed(2)} · ${(Number(row.confidence_score || 0)).toFixed(2)}` },
-          { label: "Expires", render: row => `<div>${escapeHtml(row.approval_expires_at || "n/a")}</div><div class="small ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${fmtRelative(row.seconds_remaining)}</div>` },
+          { label: "Proposal", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.proposal_id)}</div><div class="cell-sub">${escapeHtml(row.proposal_kind || "entry")}</div></div>` },
+          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.topic || "")}</div></div>` },
+          { label: "Trade", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.outcome || "n/a")}</div><div class="cell-sub">${fmtMoney(row.size_usdc)} size | conf ${fmtDecimal(row.confidence_score)}</div></div>` },
+          { label: "Expires", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.approval_expires_at)}</div><div class="cell-sub ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${fmtRelative(row.seconds_remaining)}</div></div>` },
         ],
-        data.pending_approvals || []
+        data.pending_approvals || [],
+        "No proposals waiting for approval."
       );
 
       document.getElementById("live-orders").innerHTML = renderTable(
         [
-          { label: "Order", render: row => `<div>${escapeHtml(row.order_id || row.proposal_id)}</div><div class="small">${escapeHtml(row.status)}</div>` },
-          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
-          { label: "Request", render: row => `${escapeHtml(row.outcome || "")} · $${Number(row.requested_size_usdc || 0).toFixed(2)} @ ${row.requested_price ?? "n/a"}` },
-          { label: "Age / TTL", render: row => `<div>${fmtRelative(row.age_seconds)}</div><div class="small ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${row.seconds_remaining != null ? fmtRelative(row.seconds_remaining) + " left" : "n/a"}</div>` },
+          { label: "Order", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.order_id || row.proposal_id || "n/a")}</div><div class="cell-sub">${escapeHtml(row.status || "n/a")}</div></div>` },
+          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
+          { label: "Request", render: row => `<div class="cell-stack"><div class="cell-main">${fmtMoney(row.requested_size_usdc)}</div><div class="cell-sub">@ ${fmtPrice(row.requested_price)}</div></div>` },
+          { label: "Age / TTL", render: row => `<div class="cell-stack"><div class="cell-main">${fmtRelative(row.age_seconds)}</div><div class="cell-sub ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${row.seconds_remaining != null ? fmtRelative(row.seconds_remaining) + " left" : "n/a"}</div></div>` },
         ],
-        data.live_orders || []
+        data.live_orders || [],
+        "No live orders."
       );
 
       document.getElementById("open-positions").innerHTML = renderTable(
         [
-          { label: "Position", render: row => `<div>${escapeHtml(row.market)}</div><div class="small">${escapeHtml(row.outcome)}</div>` },
-          { label: "Status", render: row => escapeHtml(row.status) },
-          { label: "Entry / Mark", render: row => `${row.entry_price ?? "n/a"} / ${row.last_mark_price ?? "n/a"}` },
-          { label: "Size", render: row => `$${Number(row.size_usdc || 0).toFixed(2)}` },
-          { label: "PnL", render: row => `<div>U ${Number(row.unrealized_pnl || 0).toFixed(2)}</div><div class="small">R ${Number(row.realized_pnl || 0).toFixed(2)}</div>` },
+          { label: "Position", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
+          { label: "Status", render: row => `<span class="status-chip ${statusTone(row.status)}">${escapeHtml(row.status || "n/a")}</span>` },
+          { label: "Entry / Mark", render: row => `<div class="cell-stack"><div class="cell-main">${fmtPrice(row.entry_price)} / ${fmtPrice(row.last_mark_price)}</div><div class="cell-sub">mark age ${fmtRelative(row.mark_age_seconds)}</div></div>` },
+          { label: "Size", render: row => `<div class="cell-stack"><div class="cell-main">${fmtMoney(row.size_usdc)}</div></div>` },
+          { label: "PnL", render: row => `<div class="cell-stack"><div class="cell-main ${toneClass(row.unrealized_pnl, true)}">U ${fmtSignedMoney(row.unrealized_pnl)}</div><div class="cell-sub ${toneClass(row.realized_pnl, true)}">R ${fmtSignedMoney(row.realized_pnl)}</div></div>` },
         ],
-        data.open_positions || []
+        data.open_positions || [],
+        "No open positions."
       );
 
       document.getElementById("recent-decisions").innerHTML = renderTable(
         [
-          { label: "Proposal", render: row => `<div>${escapeHtml(row.proposal_id)}</div><div class="small">${escapeHtml(row.status)}</div>` },
-          { label: "Market", render: row => row.market_url ? `<a href="${escapeHtml(row.market_url)}" target="_blank">${escapeHtml(row.market)}</a>` : escapeHtml(row.market) },
-          { label: "Trade", render: row => `${escapeHtml(row.outcome)} · $${Number(row.size_usdc || 0).toFixed(2)} · ${(Number(row.confidence_score || 0)).toFixed(2)}` },
-          { label: "Reason", render: row => `<span class="small">${escapeHtml(row.reason || "")}</span>` },
+          { label: "Proposal", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.proposal_id)}</div><div class="cell-sub ${statusTone(row.status)}">${escapeHtml(row.status || "n/a")}</div></div>` },
+          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")} | ${fmtMoney(row.size_usdc)} | conf ${fmtDecimal(row.confidence_score)}</div></div>` },
+          { label: "Reason", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2">${escapeHtml(row.reason || "")}</div><div class="cell-sub">${fmtTimestamp(row.updated_at)}</div></div>` },
         ],
-        data.recent_decisions || []
+        data.recent_decisions || [],
+        "No recent decisions."
       );
 
       document.getElementById("recent-failures").innerHTML = renderTable(
         [
-          { label: "Kind", render: row => `<div>${escapeHtml(row.kind)}</div><div class="small">${escapeHtml(row.category)}</div>` },
-          { label: "Target", render: row => escapeHtml(row.market || row.loop || row.proposal_id || "") },
-          { label: "When", render: row => `<div>${escapeHtml(row.timestamp || "")}</div><div class="small">${escapeHtml(row.status || "")}</div>` },
-          { label: "Message", render: row => `<span class="small">${escapeHtml((row.message || "").slice(0, 220))}</span>` },
+          { label: "Kind", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.kind || "failure")}</div><div class="cell-sub">${escapeHtml(row.category || "")}</div></div>` },
+          { label: "Target", render: row => `<div class="cell-stack"><div class="cell-sub mono-wrap">${escapeHtml(row.market || row.loop || row.proposal_id || "")}</div></div>` },
+          { label: "When", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.timestamp)}</div><div class="cell-sub ${statusTone(row.status)}">${escapeHtml(row.status || "")}</div></div>` },
+          { label: "Message", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2 mono-wrap">${escapeHtml((row.message || "").slice(0, 220))}</div></div>` },
         ],
-        data.recent_failures || []
+        data.recent_failures || [],
+        "No recent failures."
       );
+
+      document.getElementById("recent-events").innerHTML = renderRecentEvents(data.recent_events || []);
     }
 
     async function refresh() {
@@ -332,12 +701,392 @@ OPS_DASHBOARD_TEMPLATE = """
       }
     }
 
+    async function controlSystem(action) {
+      const log = document.getElementById("control-log");
+      log.textContent = `sending ${action}...`;
+      try {
+        const response = await fetch("/api/ops/system-control", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ action }),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || `status ${response.status}`);
+        }
+        log.textContent = payload.message || `${action} accepted`;
+        window.setTimeout(refresh, 1500);
+      } catch (error) {
+        log.textContent = `control failed: ${error}`;
+      }
+    }
+
+    document.querySelectorAll("[data-action]").forEach(button => {
+      button.addEventListener("click", () => {
+        const action = button.getAttribute("data-action");
+        if (!action) return;
+        controlSystem(action);
+      });
+    });
+
     renderSnapshot(initial);
     window.setInterval(refresh, 5000);
   </script>
 </body>
 </html>
 """
+
+
+def _dashboard_initial_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=False).replace("</", "<\\/")
+
+
+def _launch_agent_specs() -> List[Dict[str, str]]:
+    home = os.path.expanduser("~")
+    launch_agents = os.path.join(home, "Library", "LaunchAgents")
+    return [
+        {
+            "name": "autopilot",
+            "label": "com.polymarket.autopilot",
+            "plist": os.path.join(launch_agents, "com.polymarket.autopilot.plist"),
+        },
+        {
+            "name": "tg-webhook",
+            "label": "com.polymarket.tg-webhook",
+            "plist": os.path.join(launch_agents, "com.polymarket.tg-webhook.plist"),
+        },
+    ]
+
+
+def _launchctl_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _manual_service_specs() -> List[Dict[str, Any]]:
+    root = _repo_root()
+    venv_bin = root / ".venv311" / "bin"
+    return [
+        {
+            "name": "autopilot",
+            "kind": "process_match",
+            "argv": [str(venv_bin / "python"), "-m", "polymarket_mvp.autopilot"],
+            "markers": [" -m polymarket_mvp.autopilot", "/polymarket-autopilot"],
+            "log": root / "var" / "log" / "autopilot.dashboard.log",
+        },
+        {
+            "name": "tg-webhook",
+            "kind": "port_listener",
+            "port": 8787,
+            "argv": [str(venv_bin / "tg-approver"), "serve", "--port", "8787"],
+            "markers": ["tg-approver", "polymarket_mvp.tg_approver"],
+            "log": root / "var" / "log" / "tg-webhook.dashboard.log",
+        },
+    ]
+
+
+def _run_launchctl(*args: str) -> Dict[str, Any]:
+    command = ["launchctl", *args]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": (result.stdout or "").strip(),
+        "stderr": (result.stderr or "").strip(),
+    }
+
+
+def _ps_processes() -> List[Dict[str, str]]:
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False)
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    items: List[Dict[str, str]] = []
+    for raw in (result.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        pid = parts[0]
+        command = parts[1] if len(parts) > 1 else ""
+        if pid.isdigit():
+            items.append({"pid": pid, "command": command})
+    return items
+
+
+def _matching_pids(markers: List[str]) -> List[int]:
+    current_pid = os.getpid()
+    matched: List[int] = []
+    for item in _ps_processes():
+        pid = int(item["pid"])
+        command = item["command"]
+        if pid == current_pid:
+            continue
+        if any(marker in command for marker in markers):
+            matched.append(pid)
+    return matched
+
+
+def _listener_pids(port: int) -> List[int]:
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    pids: List[int] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def _manual_running(spec: Dict[str, Any]) -> bool:
+    if spec["kind"] == "port_listener":
+        return bool(_listener_pids(int(spec["port"])))
+    return bool(_matching_pids(list(spec["markers"])))
+
+
+def _start_manual_service(spec: Dict[str, Any]) -> Dict[str, Any]:
+    if _manual_running(spec):
+        if spec["name"] == "autopilot":
+            time.sleep(1.0)
+            if _manual_running(spec):
+                return {"name": spec["name"], "mode": "manual", "status": "already_running"}
+        else:
+            return {"name": spec["name"], "mode": "manual", "status": "already_running"}
+    log_path = Path(spec["log"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        subprocess.Popen(
+            list(spec["argv"]),
+            cwd=str(_repo_root()),
+            stdout=handle,
+            stderr=handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    return {"name": spec["name"], "mode": "manual", "status": "started", "log": str(log_path)}
+
+
+def _stop_manual_service(spec: Dict[str, Any], *, include_self: bool = False) -> Dict[str, Any]:
+    if spec["kind"] == "port_listener":
+        pids = _listener_pids(int(spec["port"]))
+    else:
+        pids = _matching_pids(list(spec["markers"]))
+    if not include_self:
+        pids = [pid for pid in pids if pid != os.getpid()]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    return {"name": spec["name"], "mode": "manual", "status": "stopped" if pids else "not_running", "pids": pids}
+
+
+def _restart_manual_service(spec: Dict[str, Any]) -> Dict[str, Any]:
+    stop_result = _stop_manual_service(spec, include_self=False)
+    time.sleep(0.2)
+    start_result = _start_manual_service(spec)
+    return {"name": spec["name"], "mode": "manual", "status": "restarted", "stop": stop_result, "start": start_result}
+
+
+def _launchctl_service_loaded(label: str) -> bool:
+    result = _run_launchctl("print", f"{_launchctl_domain()}/{label}")
+    return result["returncode"] == 0
+
+
+def _schedule_tg_webhook_control(action: str, delay_seconds: float = 1.0) -> None:
+    agent_specs = [item for item in _launch_agent_specs() if item["name"] == "tg-webhook"]
+    manual_specs = [item for item in _manual_service_specs() if item["name"] == "tg-webhook"]
+    payload = {
+        "action": action,
+        "delay": delay_seconds,
+        "domain": _launchctl_domain(),
+        "repo_root": str(_repo_root()),
+        "agents": agent_specs,
+        "manual": [
+            {
+                "name": item["name"],
+                "kind": item["kind"],
+                "argv": list(item["argv"]),
+                "markers": list(item["markers"]),
+                "port": item.get("port"),
+                "log": str(item["log"]),
+            }
+            for item in manual_specs
+        ],
+    }
+    script = """
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+payload = json.loads(sys.argv[1])
+time.sleep(float(payload["delay"]))
+domain = payload["domain"]
+repo_root = payload["repo_root"]
+agents = payload["agents"]
+action = payload["action"]
+manual = payload["manual"]
+
+def run(*args):
+    subprocess.run(["launchctl", *args], capture_output=True, text=True, check=False)
+
+def listener_pids(port):
+    result = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, check=False)
+    return [int(line.strip()) for line in (result.stdout or "").splitlines() if line.strip().isdigit()]
+
+def matching_pids(markers):
+    result = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False)
+    items = []
+    for raw in (result.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if not parts or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        command = parts[1] if len(parts) > 1 else ""
+        if any(marker in command for marker in markers):
+            items.append(pid)
+    return items
+
+def stop_manual(item):
+    pids = listener_pids(int(item["port"])) if item["kind"] == "port_listener" else matching_pids(item["markers"])
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+def start_manual(item):
+    log_path = item["log"]
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as handle:
+        subprocess.Popen(item["argv"], cwd=repo_root, stdout=handle, stderr=handle, stdin=subprocess.DEVNULL, start_new_session=True)
+
+if action == "stop_system":
+    for item in reversed(agents):
+        run("bootout", domain, f"{domain}/{item['label']}")
+    for item in reversed(manual):
+        stop_manual(item)
+elif action == "restart_system":
+    for item in agents:
+        run("kickstart", "-k", f"{domain}/{item['label']}")
+    for item in manual:
+        stop_manual(item)
+    time.sleep(0.5)
+    for item in manual:
+        start_manual(item)
+"""
+    subprocess.Popen(
+        [sys.executable, "-c", script, json.dumps(payload, sort_keys=False)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def control_system(action: str) -> Dict[str, Any]:
+    allowed = {"start_system", "stop_system", "restart_system"}
+    if action not in allowed:
+        raise ValueError(f"unsupported action: {action}")
+    domain = _launchctl_domain()
+    agents = _launch_agent_specs()
+    manual_specs = _manual_service_specs()
+    autopilot_agent = next((item for item in agents if item["name"] == "autopilot"), None)
+    tg_agent = next((item for item in agents if item["name"] == "tg-webhook"), None)
+    autopilot_manual = next((item for item in manual_specs if item["name"] == "autopilot"), None)
+    tg_manual = next((item for item in manual_specs if item["name"] == "tg-webhook"), None)
+    if action == "start_system":
+        results = []
+        for item in agents:
+            if os.path.exists(item["plist"]):
+                results.append(_run_launchctl("bootstrap", domain, item["plist"]))
+            if _launchctl_service_loaded(item["label"]):
+                results.append(_run_launchctl("kickstart", "-k", f"{domain}/{item['label']}"))
+        if autopilot_manual and not (autopilot_agent and _launchctl_service_loaded(autopilot_agent["label"])):
+            results.append(_start_manual_service(autopilot_manual))
+        if tg_manual and not (tg_agent and _launchctl_service_loaded(tg_agent["label"])):
+            results.append(_start_manual_service(tg_manual))
+        return {
+            "ok": True,
+            "action": action,
+            "message": "Start requested for autopilot and tg-webhook.",
+            "results": results,
+        }
+    results = []
+    if autopilot_agent and _launchctl_service_loaded(autopilot_agent["label"]):
+        if action == "stop_system":
+            results.append(_run_launchctl("bootout", domain, f"{domain}/{autopilot_agent['label']}"))
+        else:
+            results.append(_run_launchctl("kickstart", "-k", f"{domain}/{autopilot_agent['label']}"))
+    elif autopilot_manual:
+        if action == "stop_system":
+            results.append(_stop_manual_service(autopilot_manual, include_self=False))
+        else:
+            results.append(_restart_manual_service(autopilot_manual))
+
+    if action == "stop_system":
+        _schedule_tg_webhook_control(action)
+        message = "Stop requested for autopilot and tg-webhook."
+    else:
+        _schedule_tg_webhook_control(action)
+        message = "Restart requested for autopilot and tg-webhook."
+    return {"ok": True, "action": action, "message": message, "results": results}
+
+
+def system_control_status() -> Dict[str, Any]:
+    domain = _launchctl_domain()
+    agents = _launch_agent_specs()
+    manual_specs = _manual_service_specs()
+    items: List[Dict[str, Any]] = []
+    for item in agents:
+        loaded = _launchctl_service_loaded(item["label"])
+        items.append(
+            {
+                "name": item["name"],
+                "manager": "launchd",
+                "loaded": loaded,
+                "label": item["label"],
+                "target": f"{domain}/{item['label']}",
+            }
+        )
+    for item in manual_specs:
+        if item["kind"] == "port_listener":
+            pids = _listener_pids(int(item["port"]))
+        else:
+            pids = _matching_pids(list(item["markers"]))
+        items.append(
+            {
+                "name": item["name"],
+                "manager": "manual",
+                "running": bool(pids),
+                "pids": pids,
+                "port": item.get("port"),
+                "log": str(item["log"]),
+            }
+        )
+    return {"timestamp": utc_now_iso(), "services": items}
 
 
 def tg_base_url() -> str:
@@ -625,13 +1374,25 @@ def create_app() -> Flask:
             snapshot = build_ops_snapshot(conn)
         return jsonify({"timestamp": snapshot["timestamp"], "recent_events": snapshot["recent_events"]})
 
+    @app.post("/api/ops/system-control")
+    def ops_system_control():
+        payload = request.get_json(force=True, silent=True) or {}
+        action = str(payload.get("action") or "").strip()
+        try:
+            result = control_system(action)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify(result)
+
     @app.get("/ops")
     def ops_dashboard():
         with connect_db() as conn:
             snapshot = build_ops_snapshot(conn)
         return render_template_string(
             OPS_DASHBOARD_TEMPLATE,
-            initial_json=json.dumps(snapshot, sort_keys=False),
+            initial_json=_dashboard_initial_json(snapshot),
         )
 
     @app.post("/telegram/webhook")
@@ -700,11 +1461,19 @@ def create_app() -> Flask:
                     },
                 )
         try:
+            callback_text = f"Decision recorded: {result['status']}"
+            if result["status"] == "approved" and isinstance(auto_exec, dict):
+                if auto_exec.get("executed") and auto_exec.get("execution_status") in {"submitted", "live", "filled"}:
+                    callback_text = f"Approved. Execution status: {auto_exec.get('execution_status')}"
+                elif auto_exec.get("error_message"):
+                    callback_text = f"Approved, but execution failed: {auto_exec['error_message'][:160]}"
+                elif auto_exec.get("reason"):
+                    callback_text = f"Approved, but execution skipped: {auto_exec['reason']}"
             tg_post(
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query["id"],
-                    "text": f"Decision recorded: {result['status']}",
+                    "text": callback_text,
                 },
             )
             message = callback_query.get("message", {})
@@ -717,8 +1486,16 @@ def create_app() -> Flask:
                         "reply_markup": {"inline_keyboard": []},
                     },
                 )
-        except Exception:
-            append_jsonl(debug_events_path("approvals"), {"timestamp": utc_now_iso(), "type": "telegram_followup_failed", "proposal_id": proposal_id})
+        except Exception as exc:
+            append_jsonl(
+                debug_events_path("approvals"),
+                {
+                    "timestamp": utc_now_iso(),
+                    "type": "telegram_followup_failed",
+                    "proposal_id": proposal_id,
+                    "error": str(exc),
+                },
+            )
         return jsonify({"ok": True, "proposal_id": proposal_id, "status": result["status"], "auto_execute": auto_exec})
 
     return app

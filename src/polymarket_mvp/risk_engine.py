@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, read_proposals, resolve_token_id, utc_now_iso
+from .common import dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, price_is_tradable, read_proposals, resolve_token_id, tradable_price_bounds, utc_now_iso
 from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_workflow_fields
 from .services.authorization_service import evaluate_authorization
 from .services.portfolio_risk_service import evaluate_portfolio_risk
@@ -54,11 +54,47 @@ def _selected_outcome_has_live_price(record: Dict[str, Any]) -> bool:
     return snapshot_has_price
 
 
+def _real_available_balance_usdc() -> float | None:
+    """Best-effort real collateral balance lookup for risk gating.
+
+    Falls back to env-configured balance when real execution dependencies or
+    credentials are unavailable.
+    """
+    try:
+        from .poly_executor import _build_clob_client, _coerce_float, _extract_balance_value
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return None
+    try:
+        signature_type_raw = os.getenv("POLY_CLOB_SIGNATURE_TYPE") or os.getenv("SIGNATURE_TYPE")
+        if not signature_type_raw:
+            return None
+        signature_type = int(signature_type_raw)
+        client = _build_clob_client()
+        collateral = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=signature_type)
+        )
+        raw_collateral_balance = None
+        if isinstance(collateral, dict):
+            raw_collateral_balance = _coerce_float(collateral.get("balance"))
+        if raw_collateral_balance is not None:
+            return raw_collateral_balance / 1_000_000.0
+        return _extract_balance_value(collateral)
+    except Exception:
+        return None
+
+
 def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     max_order_usdc = get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0)
     min_confidence = get_env_float("POLY_RISK_MIN_CONFIDENCE", 0.6)
     max_slippage_bps = get_env_int("POLY_RISK_MAX_SLIPPAGE_BPS", 500)
-    available_balance = get_env_float("POLYMARKET_AVAILABLE_BALANCE_U", 100.0)
+    configured_balance = get_env_float("POLYMARKET_AVAILABLE_BALANCE_U", 100.0)
+    real_available_balance = _real_available_balance_usdc()
+    available_balance = (
+        min(configured_balance, real_available_balance)
+        if real_available_balance is not None
+        else configured_balance
+    )
     require_executable_market = get_env_bool("POLY_RISK_REQUIRE_EXECUTABLE_MARKET", True)
     reasons: List[str] = []
     market = record.get("market")
@@ -78,10 +114,14 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("insufficient_balance")
     if require_executable_market and market is not None and not _selected_outcome_has_live_price(record):
         reasons.append("selected_outcome_has_no_live_price")
+    selected_snapshot_price = market_reference_price(market["market_json"], proposal["outcome"]) if market is not None else None
+    if market is not None and selected_snapshot_price is not None and not price_is_tradable(selected_snapshot_price):
+        min_price, max_price = tradable_price_bounds()
+        reasons.append(f"selected_outcome_price_outside_tradable_band[{min_price:.2f},{max_price:.2f}]")
     if require_executable_market and market is not None and not reasons:
         max_divergence_bps = get_env_int("POLY_RISK_MAX_GAMMA_CLOB_DIVERGENCE_BPS", 500)
         clob_price = _clob_buy_price(record)
-        gamma_price = market_reference_price(market["market_json"], proposal["outcome"])
+        gamma_price = selected_snapshot_price
         if clob_price is not None and gamma_price is not None and gamma_price > 0:
             divergence_bps = abs(clob_price - gamma_price) / gamma_price * 10000
             if divergence_bps > max_divergence_bps:
@@ -96,6 +136,8 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
             "min_confidence": min_confidence,
             "max_slippage_bps": max_slippage_bps,
             "available_balance_usdc": available_balance,
+            "configured_balance_usdc": configured_balance,
+            "real_available_balance_usdc": real_available_balance,
             "require_executable_market": require_executable_market,
             "reasons": reasons,
         },

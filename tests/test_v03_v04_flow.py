@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from polymarket_mvp.common import append_jsonl, debug_events_path, parse_iso8601, proposal_id_for, utc_now_iso
+from polymarket_mvp.autopilot import Autopilot
 from polymarket_mvp.autopilot_status import main as autopilot_status_main
 from polymarket_mvp.db import (
     connect_db,
@@ -31,7 +32,7 @@ from polymarket_mvp.ops_snapshot import build_ops_snapshot
 from polymarket_mvp.event_fetcher import fetch_contexts_for_market
 from polymarket_mvp.poly_executor import execute_record
 from polymarket_mvp.proposer import build_openclaw_proposals
-from polymarket_mvp.risk_engine import evaluate_full_record
+from polymarket_mvp.risk_engine import evaluate_full_record, evaluate_proposal
 from polymarket_mvp.agents.supervisor_agent import supervise_record
 from polymarket_mvp.services.position_manager import sync_all_positions, update_position_marks
 from polymarket_mvp.services.openclaw_adapter import chat_json
@@ -126,6 +127,19 @@ def sample_updown_market() -> dict:
     return market
 
 
+def sample_extreme_market() -> dict:
+    market = sample_market()
+    market["market_id"] = "m-extreme"
+    market["slug"] = "extreme-market"
+    market["condition_id"] = "cond-extreme"
+    market["question"] = "Will ETH be above $2300 on April 2?"
+    market["outcomes"] = [
+        {"name": "Yes", "price": 0.0005, "token_id": "tok_extreme_yes"},
+        {"name": "No", "price": 0.9995, "token_id": "tok_extreme_no"},
+    ]
+    return market
+
+
 def active_authorization_window() -> tuple[str, str]:
     now = parse_iso8601(utc_now_iso())
     return (
@@ -153,6 +167,9 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.tmpdir.cleanup()
         os.environ.pop("POLYMARKET_MVP_DB_PATH", None)
         os.environ.pop("POLYMARKET_MVP_STATE_DIR", None)
+        os.environ.pop("TG_CHAT_ID", None)
+        os.environ.pop("POLY_AUTOPILOT_MAX_PENDING_APPROVALS", None)
+        os.environ.pop("POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP", None)
 
     def test_init_db_contains_new_v03_v04_tables(self) -> None:
         init_db(self.db_path)
@@ -189,6 +206,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
         with connect_db(self.db_path) as conn:
             upsert_market_snapshot(conn, sample_market())
             proposal = sample_proposal()
+            proposal["recommended_size_usdc"] = 10.0
             upsert_proposal(
                 conn,
                 proposal,
@@ -271,6 +289,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
         with connect_db(self.db_path) as conn:
             upsert_market_snapshot(conn, sample_market())
             proposal = sample_proposal()
+            proposal["recommended_size_usdc"] = 10.0
             upsert_proposal(
                 conn,
                 proposal,
@@ -288,6 +307,61 @@ class TradingOSUpgradeTests(unittest.TestCase):
             with patch("polymarket_mvp.risk_engine.requests.get", return_value=mocked):
                 result = evaluate_full_record(conn, record)
         self.assertNotIn("selected_outcome_has_no_live_price", result["risk_summary"]["reasons"])
+
+    def test_risk_engine_uses_real_balance_floor_when_available(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            proposal = sample_proposal()
+            proposal["recommended_size_usdc"] = 10.0
+            upsert_proposal(
+                conn,
+                proposal,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(proposal))
+            self.assertIsNotNone(record)
+            with patch("polymarket_mvp.risk_engine._real_available_balance_usdc", return_value=8.52):
+                result = evaluate_proposal(record)
+
+        self.assertIn("insufficient_balance", result["risk_summary"]["reasons"])
+        self.assertEqual(result["risk_summary"]["real_available_balance_usdc"], 8.52)
+        self.assertEqual(result["risk_summary"]["configured_balance_usdc"], 1000.0)
+
+    def test_risk_engine_rejects_extreme_price_market(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_extreme_market())
+            proposal = {
+                "market_id": "m-extreme",
+                "outcome": "No",
+                "confidence_score": 0.9995,
+                "recommended_size_usdc": 5.0,
+                "reasoning": "Near-certain market.",
+                "max_slippage_bps": 500,
+            }
+            upsert_proposal(
+                conn,
+                proposal,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "ETH", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="ETH",
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(proposal))
+            self.assertIsNotNone(record)
+            result = evaluate_proposal(record)
+
+        self.assertTrue(
+            any(reason.startswith("selected_outcome_price_outside_tradable_band") for reason in result["risk_summary"]["reasons"])
+        )
 
     def test_update_position_marks_skips_open_requested_positions(self) -> None:
         init_db(self.db_path)
@@ -487,6 +561,29 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertIn("invalid outcomes", str(exc.exception))
         self.assertIn("allowed=['Up', 'Down']", str(exc.exception))
 
+    def test_build_openclaw_proposals_filters_extreme_price_candidates(self) -> None:
+        markets = [sample_extreme_market()]
+        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+            mocked.return_value = [
+                {
+                    "market_id": "m-extreme",
+                    "outcome": "No",
+                    "confidence_score": 0.9995,
+                    "recommended_size_usdc": 5.0,
+                    "reasoning": "Certain but low-upside.",
+                    "max_slippage_bps": 500,
+                }
+            ]
+            proposals = build_openclaw_proposals(
+                markets,
+                context_file=None,
+                size_usdc=5.0,
+                top=1,
+                max_slippage_bps=500,
+            )
+
+        self.assertEqual(proposals, [])
+
     def test_openclaw_cli_json_is_parsed_from_wrapped_response(self) -> None:
         completed = Mock()
         completed.returncode = 0
@@ -612,6 +709,99 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertIn("temporarily unavailable", contexts[0]["display_text"])
         self.assertEqual(contexts[1]["source_type"], "apify_twitter")
         self.assertIn("market chatter", result["context_payload"]["assembled_text"])
+
+    def test_autopilot_send_unsent_to_telegram_limits_batch_and_sorts_by_priority(self) -> None:
+        init_db(self.db_path)
+        os.environ["TG_CHAT_ID"] = "12345"
+        os.environ["POLY_AUTOPILOT_MAX_PENDING_APPROVALS"] = "3"
+        os.environ["POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP"] = "2"
+        with connect_db(self.db_path) as conn:
+            for idx, priority in enumerate([0.1, 0.9, 0.5, 0.8], start=1):
+                market = sample_market()
+                market["market_id"] = f"m-send-{idx}"
+                market["condition_id"] = f"cond-send-{idx}"
+                market["slug"] = f"send-{idx}"
+                market["question"] = f"Market {idx}?"
+                upsert_market_snapshot(conn, market)
+                proposal = {
+                    "market_id": market["market_id"],
+                    "outcome": "Yes",
+                    "confidence_score": 0.7 + idx / 100.0,
+                    "recommended_size_usdc": 5.0,
+                    "reasoning": f"proposal {idx}",
+                    "max_slippage_bps": 500,
+                }
+                stored = upsert_proposal(
+                    conn,
+                    proposal,
+                    decision_engine="openclaw_llm",
+                    status="pending_approval",
+                    context_payload={"topic": "BTC", "assembled_text": "summary"},
+                    strategy_name="near_expiry_conviction",
+                    topic="BTC",
+                )
+                update_proposal_workflow_fields(
+                    conn,
+                    stored["proposal_id"],
+                    priority_score=priority,
+                    status="pending_approval",
+                )
+
+            sent_market = sample_market()
+            sent_market["market_id"] = "m-send-already"
+            sent_market["condition_id"] = "cond-send-already"
+            sent_market["slug"] = "send-already"
+            sent_market["question"] = "Already sent?"
+            upsert_market_snapshot(conn, sent_market)
+            sent_proposal = upsert_proposal(
+                conn,
+                {
+                    "market_id": sent_market["market_id"],
+                    "outcome": "Yes",
+                    "confidence_score": 0.99,
+                    "recommended_size_usdc": 5.0,
+                    "reasoning": "already sent",
+                    "max_slippage_bps": 500,
+                },
+                decision_engine="openclaw_llm",
+                status="pending_approval",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            update_proposal_workflow_fields(
+                conn,
+                sent_proposal["proposal_id"],
+                priority_score=1.0,
+                status="pending_approval",
+                telegram_message_id="999",
+                telegram_chat_id="12345",
+            )
+            conn.commit()
+
+            pilot = Autopilot(max_iterations=1)
+            with patch("polymarket_mvp.tg_approver.send_proposals") as mocked_send:
+                pilot._send_unsent_to_telegram(conn)
+
+        mocked_send.assert_called_once()
+        sent_ids = mocked_send.call_args.args[0]
+        self.assertEqual(len(sent_ids), 2)
+        self.assertEqual(sent_ids[0], proposal_id_for({
+            "market_id": "m-send-2",
+            "outcome": "Yes",
+            "confidence_score": 0.72,
+            "recommended_size_usdc": 5.0,
+            "reasoning": "proposal 2",
+            "max_slippage_bps": 500,
+        }))
+        self.assertEqual(sent_ids[1], proposal_id_for({
+            "market_id": "m-send-4",
+            "outcome": "Yes",
+            "confidence_score": 0.74,
+            "recommended_size_usdc": 5.0,
+            "reasoning": "proposal 4",
+            "max_slippage_bps": 500,
+        }))
 
     def test_reconciler_fills_live_order_and_position_updates(self) -> None:
         init_db(self.db_path)

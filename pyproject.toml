@@ -43,6 +43,7 @@ run-review-agent = "polymarket_mvp.run_review_agent:main"
 position-report = "polymarket_mvp.position_report:main"
 polymarket-autopilot = "polymarket_mvp.autopilot:main"
 autopilot-status = "polymarket_mvp.autopilot_status:main"
+system-control-plane = "polymarket_mvp.control_plane:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -5,11 +5,14 @@ from typing import Any, Dict, List, Mapping
 
 from .common import (
     dump_json,
+    get_env_float,
     load_json,
     market_reference_price,
     normalize_proposal,
+    price_is_tradable,
     proposal_id_for,
     read_proposals,
+    tradable_price_bounds,
     utc_now_iso,
 )
 from .db import (
@@ -64,6 +67,8 @@ def build_heuristic_proposals(
             continue
         favored = "Yes" if prices["Yes"] >= prices["No"] else "No"
         confidence = round(max(prices["Yes"], prices["No"]), 4)
+        if not price_is_tradable(confidence):
+            continue
         if confidence < min_confidence:
             continue
         reason = (
@@ -114,14 +119,22 @@ def build_openclaw_proposals(
     max_slippage_bps: int,
 ) -> List[Dict[str, Any]]:
     market_outcomes = {str(market["market_id"]): _market_outcome_names(market) for market in markets[:25]}
+    min_tradable_price, max_tradable_price = tradable_price_bounds()
     prompt_payload = {
         "constraints": {
             "top": top,
             "default_recommended_size_usdc": size_usdc,
             "max_slippage_bps": max_slippage_bps,
+            "min_tradable_price": min_tradable_price,
+            "max_tradable_price": max_tradable_price,
             "outcome_rule": "Each proposal outcome must exactly match one of the provided outcomes for that market.",
             "duplicate_rule": "Do not return duplicate proposals or multiple outcomes for the same market unless explicitly requested.",
             "empty_result_rule": "If there is not enough evidence for a valid proposal, return an empty proposals list.",
+            "tradeability_rule": (
+                "Only propose entries with meaningful upside and realistic fill potential. "
+                f"Reject outcomes priced below {min_tradable_price:.2f} or above {max_tradable_price:.2f}. "
+                "Do not select near-certain, low-upside markets even if confidence is high."
+            ),
         },
         "output_contract": {
             "json_only": True,
@@ -214,7 +227,14 @@ def build_openclaw_proposals(
             "OpenClaw proposal generation returned only invalid outcomes: "
             + "; ".join(invalid_items[:5])
         )
-    return proposals
+    tradable: List[Dict[str, Any]] = []
+    for proposal in proposals:
+        market = next((item for item in markets if str(item["market_id"]) == str(proposal["market_id"])), None)
+        reference_price = market_reference_price(market or {}, proposal["outcome"]) if market is not None else None
+        if not price_is_tradable(reference_price):
+            continue
+        tradable.append(proposal)
+    return tradable
 
 
 def run_proposal_pipeline(

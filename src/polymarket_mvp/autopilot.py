@@ -56,6 +56,9 @@ class Autopilot:
         }
         self.last_run: Dict[str, float] = {}
 
+    def _max_pending_approvals(self) -> int:
+        return get_env_int("POLY_AUTOPILOT_MAX_PENDING_APPROVALS", 5)
+
     def should_run(self, loop_name: str) -> bool:
         last = self.last_run.get(loop_name, 0)
         return (time.time() - last) >= self.cadences[loop_name]
@@ -151,6 +154,10 @@ class Autopilot:
         from .proposer import run_proposal_pipeline
         from .risk_engine import evaluate_full_record
 
+        current_pending = list_proposals_by_status(conn, ["pending_approval"])
+        if len(current_pending) >= self._max_pending_approvals():
+            return 0
+
         rows = conn.execute(
             "SELECT * FROM market_snapshots WHERE active = 1 AND accepting_orders = 1 ORDER BY last_scanned_at DESC LIMIT ?",
             (get_env_int("POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP", 25),),
@@ -172,7 +179,7 @@ class Autopilot:
 
         proposals = run_proposal_pipeline(conn, markets, engine="openclaw_llm",
                                           size_usdc=get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0),
-                                          top=get_env_int("POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP", 25))
+                                          top=get_env_int("POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP", 3))
         # Run risk engine on each
         for p in proposals:
             record = proposal_record(conn, p["proposal_id"])
@@ -198,12 +205,31 @@ class Autopilot:
         if not chat_id:
             return
         pending = list_proposals_by_status(conn, ["pending_approval"])
+        already_sent = [p for p in pending if p.get("telegram_message_id")]
         unsent = [p for p in pending if not p.get("telegram_message_id")]
         if not unsent:
             return
+        max_pending = self._max_pending_approvals()
+        remaining_capacity = max(0, max_pending - len(already_sent))
+        if remaining_capacity <= 0:
+            return
+        unsent.sort(
+            key=lambda item: (
+                -float(item.get("priority_score") or 0.0),
+                str(item.get("updated_at") or ""),
+                str(item.get("proposal_id") or ""),
+            )
+        )
+        send_limit = min(
+            get_env_int("POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP", 3),
+            remaining_capacity,
+            len(unsent),
+        )
+        if send_limit <= 0:
+            return
         try:
             from .tg_approver import send_proposals
-            send_proposals([p["proposal_id"] for p in unsent], chat_id=chat_id, conn=conn)
+            send_proposals([p["proposal_id"] for p in unsent[:send_limit]], chat_id=chat_id, conn=conn)
         except Exception:
             _log(f"telegram send failed: {traceback.format_exc()}")
 

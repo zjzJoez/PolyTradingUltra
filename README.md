@@ -172,6 +172,8 @@ Important variable groups:
   - `POLY_RISK_MIN_CONFIDENCE`
   - `POLY_RISK_MAX_SLIPPAGE_BPS`
   - `POLY_RISK_REQUIRE_EXECUTABLE_MARKET`
+  - `POLY_MIN_TRADABLE_PRICE`
+  - `POLY_MAX_TRADABLE_PRICE`
   - `POLY_RISK_MAX_TOPIC_EXPOSURE_USDC`
   - `POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC`
   - `POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC`
@@ -555,10 +557,12 @@ JSON observability endpoints:
 # Copy plist templates
 cp deploy/com.polymarket.autopilot.plist ~/Library/LaunchAgents/
 cp deploy/com.polymarket.tg-webhook.plist ~/Library/LaunchAgents/
+cp deploy/com.polymarket.control-plane.plist ~/Library/LaunchAgents/
 
 # Edit paths in plists to match your setup, then load
 launchctl load ~/Library/LaunchAgents/com.polymarket.autopilot.plist
 launchctl load ~/Library/LaunchAgents/com.polymarket.tg-webhook.plist
+launchctl load ~/Library/LaunchAgents/com.polymarket.control-plane.plist
 
 # Set Telegram webhook (one-time)
 tg-approver set-webhook --webhook-url https://your-ngrok-domain
@@ -566,6 +570,11 @@ tg-approver set-webhook --webhook-url https://your-ngrok-domain
 # Verify
 autopilot-status
 ```
+
+Control plane:
+
+- `http://127.0.0.1:8788/`
+- Stays outside the main trading system so it can start `autopilot` and `tg-webhook` even when port `8787` is down
 
 Autopilot environment variables:
 - `POLY_SCAN_INTERVAL_SECONDS` (default 30)
@@ -577,6 +586,9 @@ Autopilot environment variables:
 - `POLY_APPROVAL_EXPIRY_BUFFER_SECONDS` (default 120)
 - `POLY_ORDER_MAX_LIVE_TTL_SECONDS` (default 300)
 - `POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP` (default 25)
+- `POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP` (default 3)
+- `POLY_AUTOPILOT_MAX_PENDING_APPROVALS` (default 5)
+- `POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP` (default 3)
 - `POLY_AUTOPILOT_MAX_EXIT_PROPOSALS_PER_LOOP` (default 5)
 
 ## Notes
