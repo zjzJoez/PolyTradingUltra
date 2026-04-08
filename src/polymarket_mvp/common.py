@@ -329,6 +329,14 @@ KNOWN_SYMBOLS = {
     "ADA": ("ADA", "CARDANO"),
     "TRUMP": ("TRUMP",),
 }
+BLOCKED_CRYPTO_DIRECTIONAL_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA"}
+_SHORT_TERM_MARKET_RE = re.compile(
+    r"\b(next\s+\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|week|weeks)"
+    r"|next\s+(?:hour|day|week)"
+    r"|today|tomorrow|this\s+(?:hour|day|week)"
+    r"|\d+\s*(?:m|h|d))\b",
+    re.IGNORECASE,
+)
 
 
 def infer_market_symbol(market: Mapping[str, Any]) -> str | None:
@@ -351,6 +359,53 @@ def market_topic(market: Mapping[str, Any]) -> str:
         return symbol
     question = sanitize_text(str(market.get("question") or ""))
     return question[:180] if question else str(market.get("market_id"))
+
+
+def blocked_market_reason(market: Mapping[str, Any]) -> str | None:
+    if not get_env_bool("POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS", True):
+        return None
+
+    base_market = market.get("market_json") if isinstance(market.get("market_json"), Mapping) else market
+    symbol = infer_market_symbol(base_market)
+    if symbol not in BLOCKED_CRYPTO_DIRECTIONAL_SYMBOLS:
+        return None
+
+    question = sanitize_text(str(base_market.get("question") or "")).lower()
+    slug = sanitize_text(str(base_market.get("slug") or "")).lower()
+    outcome_names = {
+        sanitize_text(str(item.get("name") or "")).lower()
+        for item in base_market.get("outcomes", [])
+        if isinstance(item, Mapping)
+    }
+    directional = (
+        "updown" in slug
+        or bool(re.search(r"\bup\b|\bdown\b", question))
+        or outcome_names == {"up", "down"}
+    )
+    if not directional:
+        return None
+
+    max_expiry_days = get_env_float("POLY_BLOCK_CRYPTO_DIRECTIONAL_MAX_EXPIRY_DAYS", 7.0)
+    days_to_expiry = base_market.get("days_to_expiry")
+    seconds_to_expiry = base_market.get("seconds_to_expiry")
+    short_term = False
+    try:
+        if days_to_expiry is not None and float(days_to_expiry) <= max_expiry_days:
+            short_term = True
+    except (TypeError, ValueError):
+        short_term = False
+    if not short_term:
+        try:
+            if seconds_to_expiry is not None and float(seconds_to_expiry) <= max_expiry_days * 86400:
+                short_term = True
+        except (TypeError, ValueError):
+            short_term = False
+    if not short_term:
+        short_term = bool(_SHORT_TERM_MARKET_RE.search(f"{question} {slug}"))
+    if not short_term:
+        return None
+
+    return "blocked_crypto_short_term_directional_market"
 
 
 def short_context_line(prefix: str, text: str, limit: int) -> str:

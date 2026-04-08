@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from polymarket_mvp.common import (
+    blocked_market_reason,
     clamp_approval_ttl,
     clamp_order_live_ttl,
     parse_iso8601,
@@ -78,11 +79,15 @@ class AutopilotTests(unittest.TestCase):
         os.environ["POLY_RISK_MAX_ORDER_USDC"] = "10"
         os.environ["POLY_RISK_MIN_CONFIDENCE"] = "0.5"
         os.environ["POLY_RISK_MAX_SLIPPAGE_BPS"] = "600"
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "false"
+        os.environ["SIGNATURE_TYPE"] = ""
         os.environ["TG_WEBHOOK_SECRET"] = ""
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
         os.environ.pop("POLYMARKET_MVP_DB_PATH", None)
+        os.environ.pop("POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS", None)
+        os.environ.pop("SIGNATURE_TYPE", None)
 
     # --- TTL clamping tests ---
 
@@ -205,6 +210,21 @@ class AutopilotTests(unittest.TestCase):
             record = proposal_record(conn, pid)
             self.assertEqual(record["status"], "pending_approval")
             self.assertIsNone(record.get("approval"))
+
+    def test_autopilot_propose_loop_skips_blocked_crypto_directional_markets(self) -> None:
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "true"
+        self.assertEqual(blocked_market_reason(sample_market()), "blocked_crypto_short_term_directional_market")
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            conn.commit()
+            from polymarket_mvp.autopilot import Autopilot
+
+            pilot = Autopilot(max_iterations=1)
+            with patch("polymarket_mvp.proposer.run_proposal_pipeline") as mocked:
+                count = pilot._loop_propose(conn)
+        self.assertEqual(count, 0)
+        mocked.assert_not_called()
 
     # --- Stale order cancellation ---
 

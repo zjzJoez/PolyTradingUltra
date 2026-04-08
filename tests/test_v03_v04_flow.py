@@ -10,7 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from polymarket_mvp.common import append_jsonl, debug_events_path, parse_iso8601, proposal_id_for, utc_now_iso
+from polymarket_mvp.common import append_jsonl, blocked_market_reason, debug_events_path, parse_iso8601, proposal_id_for, utc_now_iso
 from polymarket_mvp.autopilot import Autopilot
 from polymarket_mvp.autopilot_status import main as autopilot_status_main
 from polymarket_mvp.db import (
@@ -162,11 +162,15 @@ class TradingOSUpgradeTests(unittest.TestCase):
         os.environ["POLY_RISK_MAX_TOPIC_EXPOSURE_USDC"] = "50"
         os.environ["POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC"] = "50"
         os.environ["POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC"] = "50"
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "false"
+        os.environ["SIGNATURE_TYPE"] = ""
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
         os.environ.pop("POLYMARKET_MVP_DB_PATH", None)
         os.environ.pop("POLYMARKET_MVP_STATE_DIR", None)
+        os.environ.pop("POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS", None)
+        os.environ.pop("SIGNATURE_TYPE", None)
         os.environ.pop("TG_CHAT_ID", None)
         os.environ.pop("POLY_AUTOPILOT_MAX_PENDING_APPROVALS", None)
         os.environ.pop("POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP", None)
@@ -362,6 +366,48 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertTrue(
             any(reason.startswith("selected_outcome_price_outside_tradable_band") for reason in result["risk_summary"]["reasons"])
         )
+
+    def test_risk_engine_blocks_crypto_short_term_directional_market(self) -> None:
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "true"
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(sample_proposal()))
+            self.assertIsNotNone(record)
+            result = evaluate_proposal(record)
+
+        self.assertIn("blocked_crypto_short_term_directional_market", result["risk_summary"]["reasons"])
+        self.assertFalse(result["approved_for_approval_gate"])
+
+    def test_execute_record_blocks_crypto_short_term_directional_market(self) -> None:
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "true"
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="approved",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+            )
+            conn.commit()
+            record = proposal_record(conn, proposal_id_for(sample_proposal()))
+            self.assertIsNotNone(record)
+            execution = execute_record(conn, record, mode="mock")
+
+        self.assertEqual(execution["status"], "failed")
+        self.assertEqual(execution["error_message"], "blocked_crypto_short_term_directional_market")
 
     def test_update_position_marks_skips_open_requested_positions(self) -> None:
         init_db(self.db_path)
@@ -560,6 +606,11 @@ class TradingOSUpgradeTests(unittest.TestCase):
 
         self.assertIn("invalid outcomes", str(exc.exception))
         self.assertIn("allowed=['Up', 'Down']", str(exc.exception))
+
+    def test_blocked_market_reason_targets_crypto_short_term_directional_only(self) -> None:
+        os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "true"
+        self.assertEqual(blocked_market_reason(sample_market()), "blocked_crypto_short_term_directional_market")
+        self.assertIsNone(blocked_market_reason(sample_extreme_market()))
 
     def test_build_openclaw_proposals_filters_extreme_price_candidates(self) -> None:
         markets = [sample_extreme_market()]

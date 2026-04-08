@@ -120,7 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 CREATE TABLE IF NOT EXISTS position_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   position_id INTEGER NOT NULL,
-  event_type TEXT NOT NULL CHECK(event_type IN ('open', 'mark_update', 'reduce', 'close', 'stop', 'resolve', 'reconcile')),
+  event_type TEXT NOT NULL CHECK(event_type IN ('open', 'mark_update', 'reduce', 'close', 'stop', 'resolve', 'reconcile', 'redeem')),
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE CASCADE

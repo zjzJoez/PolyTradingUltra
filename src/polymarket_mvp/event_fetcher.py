@@ -179,9 +179,9 @@ class PerplexityAdapter:
         self.session = session or requests.Session()
 
     def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        api_key = os.getenv("PERPLEXITY_API_KEY")
+        api_key = (os.getenv("PERPLEXITY_API_KEY") or "").strip()
         if not api_key:
-            raise RuntimeError("PERPLEXITY_API_KEY is required for PerplexityAdapter.")
+            return []
         topic = market_topic(market)
         payload = {
             "model": os.getenv("PERPLEXITY_MODEL", "sonar"),
@@ -192,14 +192,17 @@ class PerplexityAdapter:
                 }
             ],
         }
-        response = self.session.post(
-            self.endpoint,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=40,
-        )
-        response.raise_for_status()
-        body = response.json()
+        try:
+            response = self.session.post(
+                self.endpoint,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=40,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            return []
         content = body["choices"][0]["message"]["content"]
         summary = sanitize_text(content)
         return [
@@ -221,11 +224,58 @@ class PerplexityAdapter:
         ]
 
 
+class WebSearchAdapter:
+    """Free news context via DuckDuckGo Instant Answer API. No API key required."""
+
+    endpoint = "https://api.duckduckgo.com/"
+
+    def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        question = (market.get("question") or "")[:120].strip()
+        if not question:
+            return []
+        try:
+            resp = requests.get(
+                self.endpoint,
+                params={"q": question, "format": "json", "no_html": "1", "skip_disambig": "1"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception:
+            return []
+        snippets: List[str] = []
+        abstract = (body.get("AbstractText") or "").strip()
+        if abstract:
+            snippets.append(abstract)
+        for topic in (body.get("RelatedTopics") or [])[:4]:
+            if not isinstance(topic, dict):
+                continue
+            text = (topic.get("Text") or "").strip()
+            if text and text not in snippets:
+                snippets.append(text)
+        return [
+            {
+                "source_type": "web_search",
+                "source_id": None,
+                "title": f"Web: {question[:80]}",
+                "published_at": utc_now_iso(),
+                "url": None,
+                "raw_text": s,
+                "display_text": short_context_line("WEB: ", s, limit=300),
+                "importance_weight": 0.6,
+                "normalized_payload_json": {"query": question, "snippet": s},
+            }
+            for s in snippets
+            if s
+        ]
+
+
 def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, Any]], max_chars: int) -> Dict[str, Any]:
+    _source_order = {"perplexity": 0, "cryptopanic": 1, "web_search": 2, "apify_twitter": 3}
     ordered = sorted(
         contexts,
         key=lambda item: (
-            {"perplexity": 0, "cryptopanic": 1, "apify_twitter": 2}[item["source_type"]],
+            _source_order.get(item["source_type"], 99),
             -(float(item.get("importance_weight") or 0)),
             str(item.get("published_at") or ""),
         ),
@@ -235,7 +285,7 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
     lines: List[str] = []
     for item in ordered:
         source_type = item["source_type"]
-        prefix = "SUMMARY: " if source_type == "perplexity" else "NEWS: " if source_type == "cryptopanic" else "X: "
+        prefix = "SUMMARY: " if source_type == "perplexity" else "NEWS: " if source_type == "cryptopanic" else "WEB: " if source_type == "web_search" else "X: "
         display_text = str(item.get("display_text") or "")
         if display_text.startswith(prefix):
             display_text = display_text[len(prefix) :].lstrip()
@@ -268,7 +318,13 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
 
 
 def provider_names(value: str | None) -> List[str]:
-    raw = value or "perplexity,cryptopanic,apify_twitter"
+    # Default: cryptopanic for crypto/prediction markets, web_search (DuckDuckGo) as free fallback.
+    # Perplexity included only when PERPLEXITY_API_KEY is set and non-empty.
+    import os as _os
+    default = "cryptopanic,web_search"
+    if (_os.getenv("PERPLEXITY_API_KEY") or "").strip():
+        default = "perplexity,cryptopanic,web_search"
+    raw = value or default
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
@@ -290,12 +346,20 @@ def fetch_contexts_for_market(
     contexts: List[Dict[str, Any]] = []
     enabled = list(providers)
     if "perplexity" in enabled:
-        contexts.extend(PerplexityAdapter().fetch(market))
+        try:
+            contexts.extend(PerplexityAdapter().fetch(market))
+        except Exception:
+            pass
     if "cryptopanic" in enabled:
         try:
             contexts.extend(CryptoPanicAdapter().fetch(market, limit=limit))
         except Exception as exc:
             contexts.append(cryptopanic_soft_fail_context(str(exc)))
+    if "web_search" in enabled:
+        try:
+            contexts.extend(WebSearchAdapter().fetch(market))
+        except Exception:
+            pass
     if "apify_twitter" in enabled:
         try:
             contexts.extend(ApifyTwitterAdapter().fetch(market, limit=limit, min_favorite_count=min_favorite_count))

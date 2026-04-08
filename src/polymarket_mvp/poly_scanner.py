@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
-from .common import dump_json, load_repo_env, parse_iso8601, utc_now_iso
+from .common import blocked_market_reason, dump_json, load_repo_env, parse_iso8601, utc_now_iso
 from .db import connect_db, init_db, upsert_market_snapshot
 
 load_repo_env()
@@ -113,6 +113,8 @@ def fetch_markets(
             if market["seconds_to_expiry"] < 0:
                 continue
             if market["days_to_expiry"] > max_expiry_days:
+                continue
+            if blocked_market_reason(market):
                 continue
             matched.append(market)
 

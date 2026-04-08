@@ -14,6 +14,7 @@ import traceback
 from typing import Any, Dict, List
 
 from .common import (
+    blocked_market_reason,
     get_env_float,
     get_env_int,
     normalize_proposal,
@@ -147,6 +148,11 @@ class Autopilot:
                     m["outcomes_json"] = json.loads(m["outcomes_json"])
                 except Exception:
                     pass
+            if "outcomes" not in m and m.get("outcomes_json"):
+                m["outcomes"] = m["outcomes_json"]
+        markets = [m for m in markets if not blocked_market_reason(m)]
+        if not markets:
+            return 0
         results = fetch_and_persist_contexts(conn, markets)
         return len(results)
 
@@ -176,6 +182,9 @@ class Autopilot:
                         pass
             if "outcomes" not in m and m.get("outcomes_json"):
                 m["outcomes"] = m["outcomes_json"]
+        markets = [m for m in markets if not blocked_market_reason(m)]
+        if not markets:
+            return 0
 
         proposals = run_proposal_pipeline(conn, markets, engine="openclaw_llm",
                                           size_usdc=get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0),
@@ -257,14 +266,34 @@ class Autopilot:
         return count
 
     def _loop_reconcile(self, conn) -> int:
-        from .services.reconciler import cancel_stale_orders, reconcile_live_orders
+        from .services.reconciler import cancel_orphaned_positions, cancel_stale_orders, check_and_backfill_resolutions, reconcile_live_orders
         from .services.position_manager import sync_all_positions, update_position_marks
+        from .services.redeemer import redeem_resolved_positions
 
+        cancel_orphaned_positions(conn)
         cancelled = cancel_stale_orders(conn)
         reconciled = reconcile_live_orders(conn)
+        newly_resolved = check_and_backfill_resolutions(conn)
+        if newly_resolved:
+            for item in newly_resolved:
+                _log(f"market resolved: {item['market_id']} → {item['resolved_outcome']}")
         sync_all_positions(conn)
         update_position_marks(conn)
-        return len(cancelled) + len(reconciled)
+        conn.commit()
+
+        # Auto-redeem winning conditional tokens after resolution
+        try:
+            redeemed = redeem_resolved_positions(conn)
+            for r in redeemed:
+                if r.get("success"):
+                    _log(f"redeemed: market {r['market_id']} tx={r['tx_hash'][:16]}… balances={r.get('balances_before')}")
+                else:
+                    _log(f"redeem failed: market {r.get('market_id')} error={r.get('error', 'unknown')}")
+            conn.commit()
+        except Exception as exc:
+            _log(f"redeem error: {exc}")
+
+        return len(cancelled) + len(reconciled) + len(newly_resolved)
 
     def _loop_exit(self, conn) -> int:
         from .agents.exit_agent import run_exit_agent

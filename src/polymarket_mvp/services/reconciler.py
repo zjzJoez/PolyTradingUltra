@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import timedelta
 from typing import Any, Dict, List
+
+import requests
 
 from ..common import parse_iso8601, utc_now_iso
 from ..db import (
     list_executions,
+    list_positions,
     position_for_execution,
     record_order_reconciliation,
     record_position,
     record_position_event,
     update_execution,
+    upsert_market_resolution,
 )
 from ..poly_executor import _build_clob_client, _normalize_order_status
 
@@ -25,8 +31,10 @@ def cancel_stale_orders(conn) -> List[Dict[str, Any]]:
     client = None
     for execution in executions:
         intent = execution.get("order_intent_json") or {}
-        ttl = intent.get("order_live_ttl_seconds")
-        posted_at = intent.get("order_posted_at")
+        # After real execution the intent is nested under "request": {"request": {...}, "response": ..., "preflight": ...}
+        request = intent.get("request") or intent
+        ttl = request.get("order_live_ttl_seconds")
+        posted_at = request.get("order_posted_at")
         if not ttl or not posted_at:
             continue
         deadline = parse_iso8601(posted_at) + timedelta(seconds=int(ttl))
@@ -59,6 +67,84 @@ def cancel_stale_orders(conn) -> List[Dict[str, Any]]:
             "ttl": ttl,
         })
     return results
+
+
+def cancel_orphaned_positions(conn) -> int:
+    """Cancel open_requested positions whose execution already failed (e.g. API errors).
+
+    This cleans up positions stuck in open_requested when the underlying execution
+    never actually reached the exchange.
+    """
+    count = conn.execute(
+        """
+        UPDATE positions SET status = 'cancelled', updated_at = ?
+        WHERE status = 'open_requested'
+          AND execution_id IN (
+              SELECT id FROM executions WHERE status = 'failed'
+          )
+        """,
+        (utc_now_iso(),),
+    ).rowcount
+    return count
+
+
+def check_and_backfill_resolutions(conn) -> List[Dict[str, Any]]:
+    """Check open positions against Gamma API — detect resolved markets and write to market_resolutions.
+
+    Returns a list of newly resolved markets detected this pass.
+    """
+    gamma_base = (os.getenv("POLYMARKET_GAMMA_API") or "https://gamma-api.polymarket.com").rstrip("/")
+    positions = list_positions(conn, statuses=["open", "partially_filled", "closing"])
+    if not positions:
+        return []
+    # De-duplicate market IDs
+    market_ids = list({str(pos["market_id"]) for pos in positions})
+    resolved: List[Dict[str, Any]] = []
+    for market_id in market_ids:
+        # Skip if already recorded
+        existing = conn.execute("SELECT market_id FROM market_resolutions WHERE market_id = ?", (market_id,)).fetchone()
+        if existing:
+            continue
+        try:
+            resp = requests.get(f"{gamma_base}/markets/{market_id}", timeout=10)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+        if not data.get("closed"):
+            continue
+        # Parse outcomes + prices to detect winner
+        raw_outcomes = data.get("outcomes")
+        raw_prices = data.get("outcomePrices")
+        if isinstance(raw_outcomes, str):
+            try:
+                raw_outcomes = json.loads(raw_outcomes)
+            except Exception:
+                raw_outcomes = None
+        if isinstance(raw_prices, str):
+            try:
+                raw_prices = json.loads(raw_prices)
+            except Exception:
+                raw_prices = None
+        if not raw_outcomes or not raw_prices or len(raw_outcomes) != len(raw_prices):
+            continue
+        # Find the outcome that resolved to price ~1.0
+        winning_outcome = None
+        for name, price_str in zip(raw_outcomes, raw_prices):
+            try:
+                price = float(price_str)
+            except (TypeError, ValueError):
+                continue
+            if price >= 0.99:
+                winning_outcome = str(name)
+                break
+        if winning_outcome is None:
+            continue
+        upsert_market_resolution(conn, market_id, winning_outcome, data)
+        resolved.append({"market_id": market_id, "resolved_outcome": winning_outcome})
+    return resolved
 
 
 def reconcile_live_orders(conn) -> List[Dict[str, Any]]:

@@ -50,6 +50,7 @@ def _strategy_daily_gross(conn, strategy_name: str | None) -> float:
         JOIN proposals p ON p.proposal_id = e.proposal_id
         WHERE p.strategy_name = ?
           AND substr(e.created_at, 1, 10) = ?
+          AND e.status NOT IN ('failed')
         """,
         (strategy_name, today),
     ).fetchone()

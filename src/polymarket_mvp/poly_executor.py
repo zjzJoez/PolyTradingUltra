@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import clamp_order_live_ttl, dump_json, get_env_float, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
+from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
 from .db import connect_db, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
@@ -368,6 +368,9 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     is_approved = approval.get("decision") == "approved" or record.get("status") in {"approved", "authorized_for_execution"}
     if not is_approved:
         return _failed_execution(record, mode, "proposal_not_authorized")
+    blocked_reason = blocked_market_reason(record.get("market") or {})
+    if blocked_reason:
+        return _failed_execution(record, mode, blocked_reason)
 
     kill_check = check_kill_switch(conn, record)
     if kill_check["blocked"]:
@@ -391,23 +394,36 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     client = None
     preflight = None
     if mode == "real":
-        try:
-            client = _build_clob_client()
-            token_id_for_preflight = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
-            preflight = _real_preflight_check(client, proposal, token_id=token_id_for_preflight)
-            print(
-                f"[poly-executor] real preflight proposal_id={record['proposal_id']} "
-                f"{json.dumps({'account_identity': preflight['account_identity'], 'api_keys_count': preflight['api_keys_count'], 'collateral_balance_available': preflight['collateral_balance_available']}, sort_keys=True)}",
-                file=sys.stderr,
-            )
-        except Exception as exc:
-            return _failed_execution(record, mode, f"real_preflight_failed: {exc}")
+        import time as _time
+        last_preflight_exc: Exception | None = None
+        for _attempt in range(2):
+            try:
+                client = _build_clob_client()
+                token_id_for_preflight = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
+                preflight = _real_preflight_check(client, proposal, token_id=token_id_for_preflight)
+                print(
+                    f"[poly-executor] real preflight proposal_id={record['proposal_id']} "
+                    f"{json.dumps({'account_identity': preflight['account_identity'], 'api_keys_count': preflight['api_keys_count'], 'collateral_balance_available': preflight['collateral_balance_available']}, sort_keys=True)}",
+                    file=sys.stderr,
+                )
+                last_preflight_exc = None
+                break
+            except Exception as exc:
+                last_preflight_exc = exc
+                if _attempt == 0:
+                    _time.sleep(3)
+        if last_preflight_exc is not None:
+            return _failed_execution(record, mode, f"real_preflight_failed: {last_preflight_exc}")
 
-    reference_price = float(proposal["confidence_score"])
     try:
         observed_worst_price = _current_worst_price(record, mode=mode, client=client)
     except Exception as exc:
         return _failed_execution(record, mode, f"price_fetch_failed: {exc}", preflight=preflight)
+
+    # Use market snapshot price as slippage reference (detects price drift between scan and execution)
+    # Falls back to observed_worst_price if snapshot unavailable (slippage check always passes)
+    snapshot_price = market_reference_price(record["market"]["market_json"], proposal["outcome"]) if record.get("market") else None
+    reference_price = float(snapshot_price) if snapshot_price is not None else float(observed_worst_price)
     max_allowed_price = min(1.0, reference_price * (1 + proposal["max_slippage_bps"] / 10000.0))
     slippage_bps = ((observed_worst_price - reference_price) / reference_price) * 10000 if reference_price else None
     if observed_worst_price > max_allowed_price:
@@ -436,7 +452,9 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
             "updated_at": utc_now_iso(),
         }
 
-    requested_price = observed_worst_price
+    # Apply a small fill premium so the limit order is more likely to match immediately
+    fill_premium_bps = get_env_int("POLY_FILL_PREMIUM_BPS", 150)
+    requested_price = min(1.0, round(observed_worst_price * (1.0 + fill_premium_bps / 10000.0), 4))
     requested_size_usdc = proposal["recommended_size_usdc"]
     share_size = requested_size_usdc / requested_price if requested_price else 0.0
     token_id = resolve_token_id(record["market"]["market_json"], proposal["outcome"])

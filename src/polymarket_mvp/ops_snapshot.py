@@ -201,8 +201,10 @@ def _build_live_orders(conn, now_iso: str) -> tuple[list[dict[str, Any]], list[d
         proposal = proposal_record(conn, execution["proposal_id"])
         market = (proposal or {}).get("market") or {}
         intent = execution.get("order_intent_json") or {}
-        posted_at = intent.get("order_posted_at") or execution.get("created_at")
-        ttl_seconds = intent.get("order_live_ttl_seconds") or (proposal or {}).get("order_live_ttl_seconds")
+        # After real execution the intent is nested: {"request": {..., "order_live_ttl_seconds": N, ...}, "response": ...}
+        intent_request = intent.get("request") or intent
+        posted_at = intent_request.get("order_posted_at") or intent.get("order_posted_at") or execution.get("created_at")
+        ttl_seconds = intent_request.get("order_live_ttl_seconds") or intent.get("order_live_ttl_seconds") or (proposal or {}).get("order_live_ttl_seconds")
         age_seconds = _seconds_since(now_iso, posted_at)
         ttl_remaining = None
         if isinstance(ttl_seconds, (int, float)) and age_seconds is not None:
@@ -235,6 +237,152 @@ def _build_live_orders(conn, now_iso: str) -> tuple[list[dict[str, Any]], list[d
                 }
             )
     return items, attention
+
+
+def _build_portfolio_summary(conn) -> dict[str, Any]:
+    """Aggregate portfolio stats: balance, P&L, win/loss, position breakdown."""
+    import time as _time
+    # -- USDC balance (cached, graceful fallback) --
+    usdc_balance: float | None = None
+    cache = getattr(_build_portfolio_summary, "_cache", None)
+    now = _time.monotonic()
+    if cache and now - cache["ts"] < 30:
+        usdc_balance = cache["bal"]
+    else:
+        try:
+            from .common import load_repo_env
+            load_repo_env()
+            from .poly_executor import _build_clob_client
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            client = _build_clob_client()
+            raw = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0))
+            usdc_balance = int(raw["balance"]) / 1e6
+            _build_portfolio_summary._cache = {"ts": now, "bal": usdc_balance}
+        except Exception:
+            usdc_balance = None
+
+    # -- Position stats from DB --
+    row = conn.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE status IN ('open','open_requested','partially_filled')) AS open_count,
+            COUNT(*) FILTER (WHERE status = 'resolved') AS resolved_count,
+            COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_count,
+            COALESCE(SUM(CASE WHEN status IN ('open','open_requested','partially_filled') THEN size_usdc ELSE 0 END), 0) AS open_exposure_usdc,
+            COALESCE(SUM(CASE WHEN status IN ('open','open_requested','partially_filled') THEN unrealized_pnl ELSE 0 END), 0) AS total_unrealized_pnl,
+            COALESCE(SUM(CASE WHEN status = 'resolved' THEN realized_pnl ELSE 0 END), 0) AS total_realized_pnl,
+            COUNT(*) FILTER (WHERE status = 'resolved' AND realized_pnl > 0) AS wins,
+            COUNT(*) FILTER (WHERE status = 'resolved' AND realized_pnl < 0) AS losses,
+            COUNT(*) FILTER (WHERE status = 'resolved' AND realized_pnl = 0) AS breakeven
+        FROM positions WHERE mode = 'real'
+    """).fetchone()
+
+    open_count = row[0] or 0
+    resolved_count = row[1] or 0
+    cancelled_count = row[2] or 0
+    open_exposure = round(row[3] or 0, 2)
+    total_unrealized = round(row[4] or 0, 2)
+    total_realized = round(row[5] or 0, 2)
+    wins = row[6] or 0
+    losses = row[7] or 0
+    breakeven = row[8] or 0
+    total_pnl = round(total_realized + total_unrealized, 2)
+
+    # -- MATIC balance (for gas) --
+    matic_balance: float | None = None
+    matic_cache = getattr(_build_portfolio_summary, "_matic_cache", None)
+    if matic_cache and now - matic_cache["ts"] < 60:
+        matic_balance = matic_cache["bal"]
+    else:
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"))
+            funder = os.getenv("FUNDER") or ""
+            if funder and w3.is_connected():
+                raw_bal = w3.eth.get_balance(w3.to_checksum_address(funder))
+                matic_balance = round(float(w3.from_wei(raw_bal, "ether")), 4)
+                _build_portfolio_summary._matic_cache = {"ts": now, "bal": matic_balance}
+        except Exception:
+            pass
+
+    # -- Unredeemed tokens on-chain for resolved markets (cached) --
+    unredeemed_value: float = 0.0
+    neg_cache = getattr(_build_portfolio_summary, "_neg_cache", None)
+    if neg_cache and now - neg_cache["ts"] < 120:
+        unredeemed_value = neg_cache["val"]
+    else:
+        try:
+            from web3 import Web3 as _W3
+            from .services.redeemer import CTF_ADDRESS, CTF_ABI
+            _w3 = _W3(_W3.HTTPProvider(os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"))
+            _ctf = _w3.eth.contract(address=_w3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+            funder = os.getenv("FUNDER") or ""
+            if funder and _w3.is_connected():
+                res_rows = conn.execute("""
+                    SELECT ms.market_id, ms.outcomes_json, mr.resolved_outcome
+                    FROM market_resolutions mr
+                    JOIN market_snapshots ms ON ms.market_id = mr.market_id
+                """).fetchall()
+                for rr in res_rows:
+                    outcomes = json.loads(rr["outcomes_json"])
+                    for o in outcomes:
+                        tid = o.get("token_id")
+                        if not tid:
+                            continue
+                        bal = _ctf.functions.balanceOf(
+                            _w3.to_checksum_address(funder), int(tid)
+                        ).call()
+                        if bal > 0 and o["name"] == rr["resolved_outcome"]:
+                            unredeemed_value += bal / 1e6
+                _build_portfolio_summary._neg_cache = {"ts": now, "val": unredeemed_value}
+        except Exception:
+            pass
+
+    net_asset_value = round(
+        (usdc_balance or 0) + open_exposure + unredeemed_value, 2
+    )
+
+    return {
+        "usdc_balance": usdc_balance,
+        "matic_balance": matic_balance,
+        "open_exposure_usdc": open_exposure,
+        "total_unrealized_pnl": total_unrealized,
+        "total_realized_pnl": total_realized,
+        "total_pnl": total_pnl,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else None,
+        "open_count": open_count,
+        "resolved_count": resolved_count,
+        "cancelled_count": cancelled_count,
+        "neg_risk_unredeemed_usdc": round(unredeemed_value, 2),
+        "net_asset_value": net_asset_value,
+    }
+
+
+def _build_resolved_positions(conn, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recently resolved positions for history display."""
+    positions = list_positions(conn, statuses=["resolved"])
+    # Sort by updated_at descending
+    positions.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
+    items: list[dict[str, Any]] = []
+    for position in positions[:limit]:
+        market_row = conn.execute(
+            "SELECT question, market_url FROM market_snapshots WHERE market_id = ?",
+            (position["market_id"],),
+        ).fetchone()
+        items.append({
+            "id": position["id"],
+            "market_id": position["market_id"],
+            "market": (market_row["question"] if market_row else None) or position["market_id"],
+            "market_url": market_row["market_url"] if market_row else None,
+            "outcome": position["outcome"],
+            "size_usdc": position["size_usdc"],
+            "entry_price": position.get("entry_price"),
+            "realized_pnl": position.get("realized_pnl"),
+            "updated_at": position.get("updated_at"),
+        })
+    return items
 
 
 def _build_open_positions(conn) -> list[dict[str, Any]]:
@@ -450,16 +598,19 @@ def build_ops_snapshot(conn, *, limits: Mapping[str, int] | None = None) -> dict
         effective_limits.update({key: int(value) for key, value in limits.items()})
     now_iso = utc_now_iso()
 
+    portfolio = _build_portfolio_summary(conn)
     system_health, health_attention = _build_heartbeat_section(conn, now_iso)
     pending_approvals, approval_attention = _build_pending_approvals(conn, now_iso)
     live_orders, live_attention = _build_live_orders(conn, now_iso)
     open_positions = _build_open_positions(conn)
+    resolved_positions = _build_resolved_positions(conn)
     recent_decisions = _build_recent_decisions(conn, effective_limits["recent_decisions"])
     recent_failures = _build_recent_failures(conn, effective_limits["recent_failures"])
     recent_events = load_recent_ops_events(limit=effective_limits["recent_events"])
 
     return {
         "timestamp": now_iso,
+        "portfolio": portfolio,
         "system_health": system_health,
         "needs_attention": health_attention + approval_attention + live_attention + recent_failures[:5],
         "pending_approvals": pending_approvals,
@@ -468,6 +619,7 @@ def build_ops_snapshot(conn, *, limits: Mapping[str, int] | None = None) -> dict
         "live_order_count": len(live_orders),
         "open_positions": open_positions,
         "open_position_count": len(open_positions),
+        "resolved_positions": resolved_positions,
         "recent_decisions": recent_decisions,
         "recent_failures": recent_failures,
         "recent_events": recent_events,

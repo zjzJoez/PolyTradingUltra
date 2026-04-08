@@ -4,6 +4,7 @@ import argparse
 from typing import Any, Dict, List, Mapping
 
 from .common import (
+    blocked_market_reason,
     dump_json,
     get_env_float,
     load_json,
@@ -62,6 +63,8 @@ def build_heuristic_proposals(
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for market in markets:
+        if blocked_market_reason(market):
+            continue
         prices = _extract_yes_no_prices(market)
         if set(prices.keys()) != {"Yes", "No"}:
             continue
@@ -118,7 +121,10 @@ def build_openclaw_proposals(
     top: int,
     max_slippage_bps: int,
 ) -> List[Dict[str, Any]]:
-    market_outcomes = {str(market["market_id"]): _market_outcome_names(market) for market in markets[:25]}
+    eligible_markets = [market for market in markets if not blocked_market_reason(market)]
+    if not eligible_markets:
+        return []
+    market_outcomes = {str(market["market_id"]): _market_outcome_names(market) for market in eligible_markets[:25]}
     min_tradable_price, max_tradable_price = tradable_price_bounds()
     prompt_payload = {
         "constraints": {
@@ -129,7 +135,12 @@ def build_openclaw_proposals(
             "max_tradable_price": max_tradable_price,
             "outcome_rule": "Each proposal outcome must exactly match one of the provided outcomes for that market.",
             "duplicate_rule": "Do not return duplicate proposals or multiple outcomes for the same market unless explicitly requested.",
-            "empty_result_rule": "If there is not enough evidence for a valid proposal, return an empty proposals list.",
+            "always_propose_rule": (
+                f"Always try to return at least {min(top, 3)} proposals. "
+                "When external context is absent, use pricing patterns, market structure, liquidity, and statistical reasoning "
+                "(e.g. spread markets near 0.5 can still offer value when one side is mispriced by even 2-3%). "
+                "Only return fewer proposals if the market list itself has fewer than that many tradable opportunities."
+            ),
             "tradeability_rule": (
                 "Only propose entries with meaningful upside and realistic fill potential. "
                 f"Reject outcomes priced below {min_tradable_price:.2f} or above {max_tradable_price:.2f}. "
@@ -151,7 +162,7 @@ def build_openclaw_proposals(
             "proposal_field_rules": {
                 "market_id": "must exactly match a provided market_id",
                 "outcome": "must exactly match one provided allowed_outcomes entry for that market",
-                "confidence_score": "number in [0, 1]",
+                "confidence_score": "number in [0, 1] — your independent probability estimate, NOT the current market price. Only propose when your estimate exceeds market price (you see alpha).",
                 "recommended_size_usdc": "positive number",
                 "reasoning": "concise factual plain text grounded only in the provided payload",
                 "max_slippage_bps": f"positive integer <= {max_slippage_bps}",
@@ -161,7 +172,7 @@ def build_openclaw_proposals(
         },
         "markets": [],
     }
-    for market in markets[:25]:
+    for market in eligible_markets[:25]:
         context_blob = resolve_context_payload(context_file, str(market["market_id"]))
         prompt_payload["markets"].append(
             {
@@ -189,10 +200,13 @@ def build_openclaw_proposals(
         )
     generated = maybe_generate_trade_proposals(prompt_payload)
     if not generated:
-        raise RuntimeError(
-            "OpenClaw proposal generation returned no JSON proposals. "
-            "Configure OpenClaw transport or pass --proposal-file."
+        import sys as _sys
+        print(
+            "[proposer] OpenClaw returned no proposals this cycle (LLM may have found no edge). "
+            "Will retry next cycle.",
+            file=_sys.stderr,
         )
+        return []
     proposals: List[Dict[str, Any]] = []
     invalid_items: List[str] = []
     seen_ids = set()
@@ -249,6 +263,9 @@ def run_proposal_pipeline(
     min_confidence: float = 0.6,
 ) -> List[Dict[str, Any]]:
     """Generate proposals, enrich with memos/supervision, and persist. Returns enriched records."""
+    markets = [dict(item) for item in markets if not blocked_market_reason(item)]
+    if not markets:
+        return []
     if engine == "openclaw_llm":
         proposals = build_openclaw_proposals(
             markets,
@@ -349,7 +366,7 @@ def main() -> int:
         raise RuntimeError("--market-file is required")
     size_usdc = args.legacy_size_usdc if args.legacy_size_usdc is not None else args.size_usdc
     markets_payload = load_json(market_file)
-    markets = list(markets_payload.get("markets", []))
+    markets = [dict(item) for item in markets_payload.get("markets", []) if not blocked_market_reason(item)]
     context_payload = load_json(args.context_file) if args.context_file else None
     if args.engine == "openclaw_llm":
         if args.proposal_file:

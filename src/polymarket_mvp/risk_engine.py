@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, price_is_tradable, read_proposals, resolve_token_id, tradable_price_bounds, utc_now_iso
+from .common import blocked_market_reason, dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, price_is_tradable, read_proposals, resolve_token_id, tradable_price_bounds, utc_now_iso
 from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_workflow_fields
 from .services.authorization_service import evaluate_authorization
 from .services.portfolio_risk_service import evaluate_portfolio_risk
@@ -102,6 +102,9 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     if market is None:
         reasons.append("market_missing_from_db")
     else:
+        blocked_reason = blocked_market_reason(market)
+        if blocked_reason:
+            reasons.append(blocked_reason)
         if not market.get("active") or market.get("closed") or not market.get("accepting_orders"):
             reasons.append("market_not_tradeable")
     if proposal["recommended_size_usdc"] > max_order_usdc:
@@ -115,6 +118,12 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     if require_executable_market and market is not None and not _selected_outcome_has_live_price(record):
         reasons.append("selected_outcome_has_no_live_price")
     selected_snapshot_price = market_reference_price(market["market_json"], proposal["outcome"]) if market is not None else None
+    # Polymarket enforces a minimum of 5 shares per order; reject if order size can't meet that
+    poly_min_shares = get_env_float("POLY_MIN_SHARES_PER_ORDER", 5.0)
+    if selected_snapshot_price and selected_snapshot_price > 0:
+        estimated_shares = proposal["recommended_size_usdc"] / selected_snapshot_price
+        if estimated_shares < poly_min_shares:
+            reasons.append(f"shares_below_polymarket_minimum[need={poly_min_shares},got={estimated_shares:.2f}]")
     if market is not None and selected_snapshot_price is not None and not price_is_tradable(selected_snapshot_price):
         min_price, max_price = tradable_price_bounds()
         reasons.append(f"selected_outcome_price_outside_tradable_band[{min_price:.2f},{max_price:.2f}]")

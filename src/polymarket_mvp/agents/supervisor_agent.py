@@ -27,12 +27,14 @@ def supervise_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         )
     except Exception:
         generated = None
+    _VALID_DECISIONS = {"promote", "discard", "merged"}
     if isinstance(generated, dict):
+        raw_decision = str(generated.get("decision") or "").strip().lower()
         deterministic.update(
             {
                 "strategy_name": str(generated.get("strategy_name") or deterministic["strategy_name"]),
                 "topic": str(generated.get("topic") or deterministic["topic"]),
-                "decision": str(generated.get("decision") or deterministic["decision"]),
+                "decision": raw_decision if raw_decision in _VALID_DECISIONS else deterministic["decision"],
                 "priority_score": float(generated.get("priority_score") or deterministic["priority_score"]),
                 "merge_group": generated.get("merge_group"),
                 "notes": str(generated.get("notes") or deterministic["notes"]),

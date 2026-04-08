@@ -123,6 +123,59 @@ OPS_DASHBOARD_TEMPLATE = """
       gap: 10px;
       margin-top: 18px;
     }
+    /* ── Portfolio banner ── */
+    .portfolio-banner {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .port-card {
+      background: linear-gradient(135deg, rgba(255,255,255,0.92), rgba(246,239,228,0.95));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 20px 22px;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .port-card .port-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    .port-card .port-value {
+      font-size: 32px;
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+    }
+    .port-card .port-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .port-card.highlight {
+      background: linear-gradient(135deg, #0b5fff0a, #0b5fff08), linear-gradient(135deg, rgba(255,255,255,0.92), rgba(246,239,228,0.95));
+      border-color: rgba(11,95,255,0.25);
+    }
+    .port-card .port-value.green { color: var(--good); }
+    .port-card .port-value.red { color: var(--bad); }
+    .port-card .port-value.yellow { color: var(--warn); }
+    .port-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .port-tag.green { background: rgba(15,138,95,0.1); color: var(--good); }
+    .port-tag.red { background: rgba(197,60,76,0.1); color: var(--bad); }
+    .port-tag.neutral { background: rgba(107,98,86,0.1); color: var(--muted); }
     .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
     .panel {
       background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.52)), var(--panel);
@@ -315,24 +368,25 @@ OPS_DASHBOARD_TEMPLATE = """
 </head>
 <body>
   <div class="page">
+    <div id="portfolio-banner" class="portfolio-banner"></div>
+
     <div class="header">
       <div class="hero">
         <div class="eyebrow">Ops Console</div>
         <div class="title">
         <h1>Polymarket Ops</h1>
-          <p>Readable at a glance: approvals, live execution, open positions, and the few things that actually need intervention.</p>
+          <p id="header-meta">Loading...</p>
         </div>
         <div id="hero-metrics" class="hero-metrics"></div>
       </div>
       <div class="meta-card">
         <div>
-          <div class="eyebrow">Snapshot</div>
+          <div class="eyebrow">System</div>
           <div class="metric small-metric" id="snapshot-status">Loading...</div>
-          <p class="meta" id="header-meta"></p>
         </div>
         <div class="muted-block">
           <div class="tiny">Dashboard</div>
-          <div class="small">Auto-refreshes every 5 seconds. Long text is clamped and IDs wrap instead of blowing out the layout.</div>
+          <div class="small">Auto-refreshes every 5 s.</div>
         </div>
       </div>
     </div>
@@ -412,6 +466,16 @@ OPS_DASHBOARD_TEMPLATE = """
           </div>
         </div>
         <div id="open-positions"></div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-head">
+          <div>
+            <h2>Resolved Positions</h2>
+            <p class="panel-copy">Completed trades with final P&L.</p>
+          </div>
+        </div>
+        <div id="resolved-positions"></div>
       </section>
 
       <section class="panel span-6">
@@ -529,6 +593,50 @@ OPS_DASHBOARD_TEMPLATE = """
       return `<div class="table-shell"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
     }
 
+    function renderPortfolioBanner(data) {
+      const p = data.portfolio || {};
+      const bal = p.usdc_balance;
+      const nav = p.net_asset_value;
+      const pnl = p.total_pnl;
+      const pnlClass = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
+      const pnlSign = pnl > 0 ? "+" : "";
+      const wr = p.win_rate;
+      const wrClass = wr >= 50 ? "green" : wr != null ? "red" : "";
+      const negRisk = p.neg_risk_unredeemed_usdc || 0;
+      return `
+        <div class="port-card highlight">
+          <div class="port-label">Net Asset Value</div>
+          <div class="port-value">${nav != null ? "$" + nav.toFixed(2) : "..."}</div>
+          <div class="port-sub">
+            $${(bal || 0).toFixed(2)} cash
+            + $${(p.open_exposure_usdc || 0).toFixed(2)} in positions
+            ${negRisk > 0 ? `+ $${negRisk.toFixed(2)} pending claim` : ""}
+          </div>
+        </div>
+        <div class="port-card">
+          <div class="port-label">Total P&L</div>
+          <div class="port-value ${pnlClass}">${pnl != null ? pnlSign + "$" + Math.abs(pnl).toFixed(2) : "..."}</div>
+          <div class="port-sub">
+            <span class="port-tag green">R ${fmtSignedMoney(p.total_realized_pnl)}</span>
+            <span class="port-tag ${(p.total_unrealized_pnl||0) >= 0 ? 'green' : 'red'}">U ${fmtSignedMoney(p.total_unrealized_pnl)}</span>
+          </div>
+        </div>
+        <div class="port-card">
+          <div class="port-label">Win Rate</div>
+          <div class="port-value ${wrClass}">${wr != null ? wr.toFixed(0) + "%" : "n/a"}</div>
+          <div class="port-sub">${p.wins || 0}W ${p.losses || 0}L ${p.breakeven || 0}B of ${p.resolved_count || 0} resolved</div>
+        </div>
+        <div class="port-card">
+          <div class="port-label">Open Positions</div>
+          <div class="port-value">${p.open_count || 0}</div>
+          <div class="port-sub">
+            $${(p.open_exposure_usdc || 0).toFixed(2)} exposure
+            ${p.matic_balance != null ? "| " + p.matic_balance.toFixed(2) + " MATIC gas" : ""}
+          </div>
+        </div>
+      `;
+    }
+
     function renderHeroMetrics(data) {
       const metrics = [
         { label: "Pending", value: data.pending_count || 0, tone: data.pending_count ? "yellow" : "green" },
@@ -622,10 +730,29 @@ OPS_DASHBOARD_TEMPLATE = """
       );
     }
 
+    function renderResolvedPositions(items) {
+      return renderTable(
+        [
+          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
+          { label: "Entry", render: row => `<div class="cell-main">${fmtPrice(row.entry_price)}</div>` },
+          { label: "Size", render: row => `<div class="cell-main">${fmtMoney(row.size_usdc)}</div>` },
+          { label: "P&L", render: row => {
+            const pnl = toNumberOrNull(row.realized_pnl);
+            const cls = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
+            return `<div class="cell-main ${cls}">${fmtSignedMoney(row.realized_pnl)}</div>`;
+          }},
+          { label: "Resolved", render: row => `<div class="cell-sub">${fmtTimestamp(row.updated_at)}</div>` },
+        ],
+        items || [],
+        "No resolved positions yet."
+      );
+    }
+
     function renderSnapshot(data) {
-      document.getElementById("snapshot-status").textContent = "Live snapshot";
+      document.getElementById("portfolio-banner").innerHTML = renderPortfolioBanner(data);
+      document.getElementById("snapshot-status").textContent = "Live";
       document.getElementById("header-meta").textContent =
-        `updated ${new Date(data.timestamp).toLocaleString()} | pending ${data.pending_count || 0} | live orders ${data.live_order_count || 0} | open positions ${data.open_position_count || 0}`;
+        `Updated ${new Date(data.timestamp).toLocaleString()} | pending ${data.pending_count || 0} | live ${data.live_order_count || 0} | open ${data.open_position_count || 0}`;
       document.getElementById("hero-metrics").innerHTML = renderHeroMetrics(data);
 
       document.getElementById("system-health").innerHTML = renderHealth(data.system_health || []);
@@ -665,6 +792,8 @@ OPS_DASHBOARD_TEMPLATE = """
         data.open_positions || [],
         "No open positions."
       );
+
+      document.getElementById("resolved-positions").innerHTML = renderResolvedPositions(data.resolved_positions);
 
       document.getElementById("recent-decisions").innerHTML = renderTable(
         [
