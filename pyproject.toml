@@ -44,6 +44,7 @@ position-report = "polymarket_mvp.position_report:main"
 polymarket-autopilot = "polymarket_mvp.autopilot:main"
 autopilot-status = "polymarket_mvp.autopilot_status:main"
 system-control-plane = "polymarket_mvp.control_plane:main"
+import-alpha-signals = "polymarket_mvp.alpha_signal_importer:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

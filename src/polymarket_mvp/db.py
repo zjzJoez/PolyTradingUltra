@@ -323,6 +323,13 @@ def upsert_proposal(
     target_position_id: int | None = None,
     approval_ttl_seconds: int | None = None,
     order_live_ttl_seconds: int | None = None,
+    alpha_signal_id: str | None = None,
+    alpha_fair_probability: float | None = None,
+    alpha_market_probability: float | None = None,
+    alpha_gross_edge_bps: float | None = None,
+    alpha_net_edge_bps: float | None = None,
+    alpha_model_version: str | None = None,
+    alpha_mapping_confidence: float | None = None,
 ) -> Dict[str, Any]:
     normalized = normalize_proposal(proposal)
     proposal_id = proposal_id_for(normalized)
@@ -348,6 +355,13 @@ def upsert_proposal(
         "target_position_id": target_position_id,
         "approval_ttl_seconds": approval_ttl_seconds,
         "order_live_ttl_seconds": order_live_ttl_seconds,
+        "alpha_signal_id": alpha_signal_id,
+        "alpha_fair_probability": alpha_fair_probability,
+        "alpha_market_probability": alpha_market_probability,
+        "alpha_gross_edge_bps": alpha_gross_edge_bps,
+        "alpha_net_edge_bps": alpha_net_edge_bps,
+        "alpha_model_version": alpha_model_version,
+        "alpha_mapping_confidence": alpha_mapping_confidence,
         "proposal_json": json.dumps(normalized, sort_keys=False),
         "context_payload_json": json.dumps(context_payload, sort_keys=False),
         "created_at": now,
@@ -360,8 +374,10 @@ def upsert_proposal(
           decision_engine, status, max_slippage_bps, strategy_name, topic, event_cluster_id,
           source_memo_id, authorization_status, supervisor_decision, priority_score,
           proposal_kind, target_position_id, approval_ttl_seconds, order_live_ttl_seconds,
+          alpha_signal_id, alpha_fair_probability, alpha_market_probability,
+          alpha_gross_edge_bps, alpha_net_edge_bps, alpha_model_version, alpha_mapping_confidence,
           proposal_json, context_payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id) DO UPDATE SET
           market_id=excluded.market_id,
           outcome=excluded.outcome,
@@ -382,6 +398,13 @@ def upsert_proposal(
           target_position_id=excluded.target_position_id,
           approval_ttl_seconds=excluded.approval_ttl_seconds,
           order_live_ttl_seconds=excluded.order_live_ttl_seconds,
+          alpha_signal_id=excluded.alpha_signal_id,
+          alpha_fair_probability=excluded.alpha_fair_probability,
+          alpha_market_probability=excluded.alpha_market_probability,
+          alpha_gross_edge_bps=excluded.alpha_gross_edge_bps,
+          alpha_net_edge_bps=excluded.alpha_net_edge_bps,
+          alpha_model_version=excluded.alpha_model_version,
+          alpha_mapping_confidence=excluded.alpha_mapping_confidence,
           proposal_json=excluded.proposal_json,
           context_payload_json=excluded.context_payload_json,
           updated_at=excluded.updated_at

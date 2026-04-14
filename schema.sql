@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS proposals (
   confidence_score REAL NOT NULL,
   recommended_size_usdc REAL NOT NULL,
   reasoning TEXT NOT NULL,
-  decision_engine TEXT NOT NULL CHECK(decision_engine IN ('heuristic', 'openclaw_llm')),
+  decision_engine TEXT NOT NULL CHECK(decision_engine IN ('heuristic', 'openclaw_llm', 'alpha_lab')),
   status TEXT NOT NULL CHECK(status IN ('proposed', 'risk_blocked', 'pending_approval', 'approved', 'rejected', 'authorized_for_execution', 'executed', 'failed', 'expired', 'cancelled')),
   max_slippage_bps INTEGER NOT NULL DEFAULT 500,
   strategy_name TEXT,
@@ -117,6 +117,13 @@ CREATE TABLE IF NOT EXISTS proposals (
   approval_expires_at TEXT,
   telegram_message_id TEXT,
   telegram_chat_id TEXT,
+  alpha_signal_id TEXT,
+  alpha_fair_probability REAL,
+  alpha_market_probability REAL,
+  alpha_gross_edge_bps REAL,
+  alpha_net_edge_bps REAL,
+  alpha_model_version TEXT,
+  alpha_mapping_confidence REAL,
   proposal_json TEXT NOT NULL,
   context_payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -131,6 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_proposals_market ON proposals(market_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_strategy ON proposals(strategy_name);
 CREATE INDEX IF NOT EXISTS idx_proposals_cluster ON proposals(event_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_alpha_signal ON proposals(alpha_signal_id);
 
 CREATE TABLE IF NOT EXISTS proposal_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
