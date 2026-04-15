@@ -271,6 +271,7 @@ class Autopilot:
         from .services.redeemer import redeem_resolved_positions
 
         cancel_orphaned_positions(conn)
+        conn.commit()
         cancelled = cancel_stale_orders(conn)
         reconciled = reconcile_live_orders(conn)
         newly_resolved = check_and_backfill_resolutions(conn)

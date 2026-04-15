@@ -7,6 +7,8 @@ from datetime import timedelta
 from typing import Any, Dict, List, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .common import blocked_market_reason, dump_json, load_repo_env, parse_iso8601, utc_now_iso
 from .db import connect_db, init_db, upsert_market_snapshot
@@ -24,6 +26,24 @@ def _parse_json_list(value: Any) -> List[Any]:
     if isinstance(value, str) and value:
         return json.loads(value)
     return []
+
+
+def _build_retrying_session() -> requests.Session:
+    attempts = max(1, int(os.getenv("POLY_HTTP_RETRY_ATTEMPTS", "4")))
+    retries = Retry(
+        total=attempts,
+        connect=attempts,
+        read=attempts,
+        status=attempts,
+        backoff_factor=float(os.getenv("POLY_HTTP_RETRY_BACKOFF_SECONDS", "1.0")),
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def normalize_market(raw: Dict[str, Any], now_utc) -> Dict[str, Any]:
@@ -76,7 +96,7 @@ def fetch_markets(
     max_pages: int,
     session: requests.Session | None = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    client = session or requests.Session()
+    client = session or _build_retrying_session()
     now_utc = parse_iso8601(utc_now_iso())
     end_date_max = now_utc + timedelta(days=max_expiry_days)
     matched: List[Dict[str, Any]] = []

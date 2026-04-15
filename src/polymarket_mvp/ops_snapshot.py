@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from .common import debug_events_path, get_env_int, parse_iso8601, utc_now_iso
+from .common import debug_events_path, get_env_bool, get_env_int, parse_iso8601, utc_now_iso
 from .db import (
     latest_execution,
     list_executions,
@@ -242,13 +242,14 @@ def _build_live_orders(conn, now_iso: str) -> tuple[list[dict[str, Any]], list[d
 def _build_portfolio_summary(conn) -> dict[str, Any]:
     """Aggregate portfolio stats: balance, P&L, win/loss, position breakdown."""
     import time as _time
+    fetch_external_balances = get_env_bool("POLY_OPS_FETCH_EXTERNAL_BALANCES", False)
     # -- USDC balance (cached, graceful fallback) --
     usdc_balance: float | None = None
     cache = getattr(_build_portfolio_summary, "_cache", None)
     now = _time.monotonic()
     if cache and now - cache["ts"] < 30:
         usdc_balance = cache["bal"]
-    else:
+    elif fetch_external_balances:
         try:
             from .common import load_repo_env
             load_repo_env()
@@ -292,7 +293,7 @@ def _build_portfolio_summary(conn) -> dict[str, Any]:
     matic_cache = getattr(_build_portfolio_summary, "_matic_cache", None)
     if matic_cache and now - matic_cache["ts"] < 60:
         matic_balance = matic_cache["bal"]
-    else:
+    elif fetch_external_balances:
         try:
             from web3 import Web3
             w3 = Web3(Web3.HTTPProvider(os.getenv("POLYGON_RPC_URL") or "https://polygon-bor-rpc.publicnode.com"))
@@ -309,7 +310,7 @@ def _build_portfolio_summary(conn) -> dict[str, Any]:
     neg_cache = getattr(_build_portfolio_summary, "_neg_cache", None)
     if neg_cache and now - neg_cache["ts"] < 120:
         unredeemed_value = neg_cache["val"]
-    else:
+    elif fetch_external_balances:
         try:
             from web3 import Web3 as _W3
             from .services.redeemer import CTF_ADDRESS, CTF_ABI

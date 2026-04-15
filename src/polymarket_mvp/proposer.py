@@ -283,19 +283,27 @@ def run_proposal_pipeline(
             max_slippage_bps=max_slippage_bps,
         )
     market_map = {str(item["market_id"]): dict(item) for item in markets}
+    cluster_map: Dict[str, Dict[str, Any]] = {}
     for m in market_map.values():
         upsert_market_snapshot(conn, m)
-        cluster_market(conn, m)
+        cluster_map[str(m["market_id"])] = cluster_market(conn, m)
+    conn.commit()
     persisted = []
     for proposal in proposals:
         market_id = str(proposal["market_id"])
         market = market_map.get(market_id) or market_snapshot(conn, market_id)
         if market is None:
             continue
-        cluster_result = cluster_market(conn, market)
+        cluster_result = cluster_map.get(market_id)
+        if cluster_result is None:
+            cluster_result = cluster_market(conn, market)
+            conn.commit()
         memo = latest_research_memo(conn, market_id)
-        if memo is None and market_contexts(conn, market_id):
+        contexts = market_contexts(conn, market_id)
+        if memo is None and contexts:
+            conn.commit()
             memo = build_and_store_memo(conn, market_id, cluster=cluster_result["cluster"])
+            conn.commit()
         context_blob = resolve_context_payload(context_payload, market_id)
         default_topic = (
             (memo or {}).get("topic")
@@ -315,7 +323,8 @@ def run_proposal_pipeline(
             event_cluster_id=cluster_result["cluster"]["id"],
             source_memo_id=(memo or {}).get("id"),
         )
-        replace_proposal_contexts(conn, record["proposal_id"], market_contexts(conn, market_id))
+        replace_proposal_contexts(conn, record["proposal_id"], contexts)
+        conn.commit()
         enriched = proposal_record(conn, record["proposal_id"])
         if enriched is None:
             continue
@@ -330,6 +339,7 @@ def run_proposal_pipeline(
             supervisor_decision=supervisor.get("decision"),
             priority_score=supervisor.get("priority_score"),
         )
+        conn.commit()
         persisted.append({
             "proposal_id": record["proposal_id"],
             "proposal": normalize_proposal(proposal),

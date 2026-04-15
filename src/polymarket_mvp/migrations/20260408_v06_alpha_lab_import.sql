@@ -1,5 +1,7 @@
 -- v0.6 alpha lab integration: extend proposals for alpha signal import
 
+PRAGMA foreign_keys = OFF;
+
 -- SQLite does not support ALTER TABLE ... ALTER CONSTRAINT, so we recreate
 -- the CHECK via a trigger-based approach. The CHECK constraint on decision_engine
 -- is relaxed by creating proposals through the new column-based approach.
@@ -90,3 +92,5 @@ CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_strategy ON proposals(strategy_name);
 CREATE INDEX IF NOT EXISTS idx_proposals_cluster ON proposals(event_cluster_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_alpha_signal ON proposals(alpha_signal_id);
+
+PRAGMA foreign_keys = ON;

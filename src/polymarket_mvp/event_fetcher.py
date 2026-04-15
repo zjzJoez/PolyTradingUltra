@@ -390,8 +390,9 @@ def fetch_and_persist_contexts(conn, markets: List[Dict[str, Any]], *,
             min_favorite_count=min_favorite_count,
             budget_chars=budget_chars,
         )
-        replace_market_contexts(conn, str(market["market_id"]), result["contexts"])
         results.append(result)
+    for market, result in zip(markets, results):
+        replace_market_contexts(conn, str(market["market_id"]), result["contexts"])
     return results
 
 

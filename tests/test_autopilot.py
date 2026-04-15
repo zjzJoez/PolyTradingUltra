@@ -169,6 +169,45 @@ class AutopilotTests(unittest.TestCase):
             record = proposal_record(conn, pid)
             self.assertEqual(record["status"], "expired")
 
+    def test_expire_stale_proposals_commits_before_telegram_edit(self) -> None:
+        """Expiry sweep should release SQLite write lock before Telegram calls."""
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            proposal = sample_proposal()
+            upsert_proposal(
+                conn, proposal, decision_engine="heuristic",
+                status="proposed", context_payload={},
+            )
+            pid = proposal_id_for(proposal)
+            update_proposal_status(conn, pid, "pending_approval")
+            past_time = (parse_iso8601(utc_now_iso()) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            update_proposal_workflow_fields(
+                conn, pid,
+                approval_requested_at=past_time,
+                approval_expires_at=past_time,
+                telegram_message_id="123",
+                telegram_chat_id="456",
+            )
+            conn.commit()
+
+            from polymarket_mvp.tg_approver import expire_stale_proposals
+
+            def fake_tg_post(method, payload):
+                del method, payload
+                with connect_db(self.db_path) as verify_conn:
+                    record = proposal_record(verify_conn, pid)
+                    self.assertIsNotNone(record)
+                    self.assertEqual(record["status"], "expired")
+                return {"ok": True}
+
+            with patch("polymarket_mvp.tg_approver.tg_post", side_effect=fake_tg_post):
+                results = expire_stale_proposals(conn)
+
+            self.assertEqual(len(results), 1)
+            record = proposal_record(conn, pid)
+            self.assertEqual(record["status"], "expired")
+
     def test_late_telegram_callback_rejected(self) -> None:
         """Expired proposal callback is rejected, no approval recorded."""
         init_db(self.db_path)
@@ -486,6 +525,12 @@ class AutopilotTests(unittest.TestCase):
             columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()
             }
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
         self.assertIn("proposal_kind", columns)
         self.assertIn("target_position_id", columns)
         self.assertIn("approval_ttl_seconds", columns)
@@ -494,14 +539,6 @@ class AutopilotTests(unittest.TestCase):
         self.assertIn("approval_expires_at", columns)
         self.assertIn("telegram_message_id", columns)
         self.assertIn("telegram_chat_id", columns)
-
-        # Verify autopilot_heartbeats table exists
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
         self.assertIn("autopilot_heartbeats", tables)
 
 

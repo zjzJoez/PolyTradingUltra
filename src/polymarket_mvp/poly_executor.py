@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 import requests
 
 from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
-from .db import connect_db, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
+from .db import connect_db, has_active_execution, has_active_market_outcome_exposure, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
 
@@ -26,6 +26,24 @@ KNOWN_NEG_RISK_SPENDERS = [
     "0xC5d563A36AE78145C45a50134d48A1215220f80a",
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
 ]
+
+
+def _looks_retryable_request_error(exc: Exception) -> bool:
+    if isinstance(exc, requests.RequestException):
+        return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "request exception",
+            "connection reset",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "connection aborted",
+            "remote end closed",
+        )
+    )
 
 
 def _maybe_notify_auto_execution(record: Dict[str, Any], execution: Dict[str, Any]) -> None:
@@ -376,9 +394,18 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     if kill_check["blocked"]:
         return _failed_execution(record, mode, f"blocked_by_kill_switch: {kill_check['reason']}")
 
-    prior = latest_execution(conn, record["proposal_id"], mode="real") if mode == "real" else None
-    if mode == "real" and prior and prior.get("status") in {"filled", "submitted", "live"}:
-        raise RuntimeError(f"Proposal {record['proposal_id']} already has a real execution record.")
+    # Guard: proposal-level active execution uniqueness (any mode)
+    if has_active_execution(conn, record["proposal_id"]):
+        return _failed_execution(record, mode, "proposal_already_has_active_execution")
+
+    # Guard: block duplicate same-direction live exposure on the same market_id + outcome
+    if record.get("proposal_kind", "entry") != "exit":
+        market_id = record.get("market_id") or proposal.get("market_id")
+        outcome = proposal.get("outcome")
+        if market_id and outcome and has_active_market_outcome_exposure(
+            conn, market_id, outcome, exclude_proposal_id=record["proposal_id"]
+        ):
+            return _failed_execution(record, mode, "duplicate_market_outcome_exposure")
 
     if mode == "mock":
         available_balance = get_env_float("POLYMARKET_AVAILABLE_BALANCE_U", 100.0)
@@ -396,7 +423,9 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     if mode == "real":
         import time as _time
         last_preflight_exc: Exception | None = None
-        for _attempt in range(2):
+        preflight_attempts = max(1, get_env_int("POLY_REAL_PREFLIGHT_ATTEMPTS", 4))
+        preflight_backoff_seconds = max(1.0, get_env_float("POLY_REAL_PREFLIGHT_BACKOFF_SECONDS", 2.0))
+        for attempt in range(preflight_attempts):
             try:
                 client = _build_clob_client()
                 token_id_for_preflight = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
@@ -410,15 +439,35 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
                 break
             except Exception as exc:
                 last_preflight_exc = exc
-                if _attempt == 0:
-                    _time.sleep(3)
+                if attempt + 1 < preflight_attempts and _looks_retryable_request_error(exc):
+                    _time.sleep(preflight_backoff_seconds * (2 ** attempt))
+                    continue
+                break
         if last_preflight_exc is not None:
             return _failed_execution(record, mode, f"real_preflight_failed: {last_preflight_exc}")
 
-    try:
-        observed_worst_price = _current_worst_price(record, mode=mode, client=client)
-    except Exception as exc:
-        return _failed_execution(record, mode, f"price_fetch_failed: {exc}", preflight=preflight)
+    observed_worst_price = None
+    last_price_exc: Exception | None = None
+    if mode == "real":
+        import time as _time
+        price_fetch_attempts = max(1, get_env_int("POLY_PRICE_FETCH_ATTEMPTS", 3))
+        price_fetch_backoff_seconds = max(1.0, get_env_float("POLY_PRICE_FETCH_BACKOFF_SECONDS", 1.5))
+    else:
+        price_fetch_attempts = 1
+        price_fetch_backoff_seconds = 0.0
+    for attempt in range(price_fetch_attempts):
+        try:
+            observed_worst_price = _current_worst_price(record, mode=mode, client=client)
+            last_price_exc = None
+            break
+        except Exception as exc:
+            last_price_exc = exc
+            if mode == "real" and attempt + 1 < price_fetch_attempts and _looks_retryable_request_error(exc):
+                _time.sleep(price_fetch_backoff_seconds * (2 ** attempt))
+                continue
+            break
+    if last_price_exc is not None or observed_worst_price is None:
+        return _failed_execution(record, mode, f"price_fetch_failed: {last_price_exc}", preflight=preflight)
 
     # Use market snapshot price as slippage reference (detects price drift between scan and execution)
     # Falls back to observed_worst_price if snapshot unavailable (slippage check always passes)
@@ -491,7 +540,16 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     }
     if mode == "real":
         try:
-            create_shadow_execution(conn, record, simulated_fill_price=requested_price, simulated_status="pretrade_shadow")
+            # Use a dedicated short-lived transaction so network submission does not
+            # keep a SQLite write lock open after the shadow record is inserted.
+            with connect_db() as shadow_conn:
+                create_shadow_execution(
+                    shadow_conn,
+                    record,
+                    simulated_fill_price=requested_price,
+                    simulated_status="pretrade_shadow",
+                )
+                shadow_conn.commit()
         except Exception:
             pass
         if client is None:

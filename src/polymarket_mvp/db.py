@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from .common import (
     get_db_path,
+    get_env_int,
     json_dumps_compact,
     normalize_proposal,
     proposal_id_for,
@@ -18,13 +19,27 @@ from .common import (
 from .migrations import apply_pending_migrations, ensure_schema_migrations, mark_all_migrations_applied
 
 
+class ManagedSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 def connect_db(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=15)
+    busy_timeout_seconds = max(5, get_env_int("POLY_SQLITE_BUSY_TIMEOUT_SECONDS", 60))
+    conn = sqlite3.connect(
+        db_path,
+        timeout=busy_timeout_seconds,
+        factory=ManagedSQLiteConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_seconds * 1000}")
     return conn
 
 
@@ -809,6 +824,37 @@ def update_execution(conn: sqlite3.Connection, execution_id: int, fields: Mappin
     if item.get("status") in {"filled", "submitted", "live"}:
         _sync_position_for_execution(conn, execution_id)
     return item
+
+
+def has_active_execution(conn: sqlite3.Connection, proposal_id: str) -> bool:
+    """Return True if the proposal already has a submitted/live/filled execution."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM executions WHERE proposal_id = ? AND status IN ('submitted', 'live', 'filled')",
+        (proposal_id,),
+    ).fetchone()
+    return int(row[0]) > 0
+
+
+def has_active_market_outcome_exposure(
+    conn: sqlite3.Connection, market_id: str, outcome: str, exclude_proposal_id: str | None = None
+) -> bool:
+    """Return True if another entry proposal for the same market_id+outcome has an active execution."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM executions e
+        JOIN proposals p ON p.proposal_id = e.proposal_id
+        LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
+        WHERE p.proposal_kind = 'entry'
+          AND p.market_id = ?
+          AND p.outcome = ?
+          AND e.status IN ('submitted', 'live', 'filled')
+          AND mr.market_id IS NULL
+          AND p.proposal_id != COALESCE(?, '')
+        """,
+        (market_id, outcome, exclude_proposal_id),
+    ).fetchone()
+    return int(row[0]) > 0
 
 
 def latest_execution(conn: sqlite3.Connection, proposal_id: str, mode: str | None = None) -> Dict[str, Any] | None:

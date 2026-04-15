@@ -21,6 +21,38 @@ from ..db import (
 from ..poly_executor import _build_clob_client, _normalize_order_status
 
 
+def _parse_resolution_prices(raw_outcomes: Any, raw_prices: Any) -> tuple[list[str], list[float]] | None:
+    if isinstance(raw_outcomes, str):
+        try:
+            raw_outcomes = json.loads(raw_outcomes)
+        except Exception:
+            raw_outcomes = None
+    if isinstance(raw_prices, str):
+        try:
+            raw_prices = json.loads(raw_prices)
+        except Exception:
+            raw_prices = None
+    if not raw_outcomes or not raw_prices or len(raw_outcomes) != len(raw_prices):
+        return None
+    outcomes = [str(name) for name in raw_outcomes]
+    prices: list[float] = []
+    for price_value in raw_prices:
+        try:
+            prices.append(float(price_value))
+        except (TypeError, ValueError):
+            return None
+    return outcomes, prices
+
+
+def _resolved_outcome_label(outcomes: list[str], prices: list[float]) -> str | None:
+    for name, price in zip(outcomes, prices):
+        if price >= 0.99:
+            return name
+    if len(prices) == 2 and all(abs(price - 0.5) <= 0.001 for price in prices):
+        return "50-50"
+    return None
+
+
 def cancel_stale_orders(conn) -> List[Dict[str, Any]]:
     """Auto-cancel submitted/live orders that exceed their order_live_ttl_seconds."""
     executions = list_executions(conn, statuses=["submitted", "live"], mode="real")
@@ -66,6 +98,7 @@ def cancel_stale_orders(conn) -> List[Dict[str, Any]]:
             "action": "auto_cancelled",
             "ttl": ttl,
         })
+        conn.commit()
     return results
 
 
@@ -115,35 +148,16 @@ def check_and_backfill_resolutions(conn) -> List[Dict[str, Any]]:
             continue
         if not data.get("closed"):
             continue
-        # Parse outcomes + prices to detect winner
-        raw_outcomes = data.get("outcomes")
-        raw_prices = data.get("outcomePrices")
-        if isinstance(raw_outcomes, str):
-            try:
-                raw_outcomes = json.loads(raw_outcomes)
-            except Exception:
-                raw_outcomes = None
-        if isinstance(raw_prices, str):
-            try:
-                raw_prices = json.loads(raw_prices)
-            except Exception:
-                raw_prices = None
-        if not raw_outcomes or not raw_prices or len(raw_outcomes) != len(raw_prices):
+        parsed = _parse_resolution_prices(data.get("outcomes"), data.get("outcomePrices"))
+        if parsed is None:
             continue
-        # Find the outcome that resolved to price ~1.0
-        winning_outcome = None
-        for name, price_str in zip(raw_outcomes, raw_prices):
-            try:
-                price = float(price_str)
-            except (TypeError, ValueError):
-                continue
-            if price >= 0.99:
-                winning_outcome = str(name)
-                break
-        if winning_outcome is None:
+        outcomes, prices = parsed
+        resolved_outcome = _resolved_outcome_label(outcomes, prices)
+        if resolved_outcome is None:
             continue
-        upsert_market_resolution(conn, market_id, winning_outcome, data)
-        resolved.append({"market_id": market_id, "resolved_outcome": winning_outcome})
+        upsert_market_resolution(conn, market_id, resolved_outcome, data)
+        resolved.append({"market_id": market_id, "resolved_outcome": resolved_outcome})
+        conn.commit()
     return resolved
 
 
@@ -191,6 +205,7 @@ def reconcile_live_orders(conn) -> List[Dict[str, Any]]:
             )
             if updated.get("status") == "failed":
                 results[-1]["reconciliation_result"] = "failed"
+            conn.commit()
         except Exception as exc:
             results.append(
                 record_order_reconciliation(
@@ -206,4 +221,5 @@ def reconcile_live_orders(conn) -> List[Dict[str, Any]]:
                     },
                 )
             )
+            conn.commit()
     return results

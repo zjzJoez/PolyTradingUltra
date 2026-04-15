@@ -903,7 +903,11 @@ def _manual_service_specs() -> List[Dict[str, Any]]:
             "name": "autopilot",
             "kind": "process_match",
             "argv": [str(venv_bin / "python"), "-m", "polymarket_mvp.autopilot"],
-            "markers": [" -m polymarket_mvp.autopilot", "/polymarket-autopilot"],
+            "markers": [
+                "polymarket_mvp.autopilot",
+                "src.polymarket_mvp.autopilot",
+                "/polymarket-autopilot",
+            ],
             "log": root / "var" / "log" / "autopilot.dashboard.log",
         },
         {
@@ -911,7 +915,7 @@ def _manual_service_specs() -> List[Dict[str, Any]]:
             "kind": "port_listener",
             "port": 8787,
             "argv": [str(venv_bin / "tg-approver"), "serve", "--port", "8787"],
-            "markers": ["tg-approver", "polymarket_mvp.tg_approver"],
+            "markers": ["tg-approver", "polymarket_mvp.tg_approver", "src.polymarket_mvp.tg_approver"],
             "log": root / "var" / "log" / "tg-webhook.dashboard.log",
         },
     ]
@@ -1287,7 +1291,7 @@ def send_proposals(proposal_ids: List[str], chat_id: str, dry_run: bool = False,
     results = []
     _own_conn = conn is None
     if _own_conn:
-        conn = connect_db().__enter__()
+        conn = connect_db()
     try:
         for proposal_id in proposal_ids:
             record = proposal_record(conn, proposal_id)
@@ -1432,6 +1436,14 @@ def expire_stale_proposals(conn=None) -> List[Dict[str, Any]]:
         results = []
         for record in expired:
             update_proposal_status(conn, record["proposal_id"], "expired")
+            append_jsonl(debug_events_path("approvals"), {
+                "timestamp": utc_now_iso(),
+                "type": "proposal_expired",
+                "proposal_id": record["proposal_id"],
+                "approval_expires_at": record.get("approval_expires_at"),
+            })
+            # Release the SQLite write lock before making Telegram API calls.
+            conn.commit()
             if record.get("telegram_message_id") and record.get("telegram_chat_id"):
                 try:
                     tg_post("editMessageText", {
@@ -1442,15 +1454,7 @@ def expire_stale_proposals(conn=None) -> List[Dict[str, Any]]:
                     })
                 except Exception:
                     pass
-            append_jsonl(debug_events_path("approvals"), {
-                "timestamp": utc_now_iso(),
-                "type": "proposal_expired",
-                "proposal_id": record["proposal_id"],
-                "approval_expires_at": record.get("approval_expires_at"),
-            })
             results.append({"proposal_id": record["proposal_id"], "action": "expired"})
-        if own_conn:
-            conn.commit()
         return results
     finally:
         if own_conn:

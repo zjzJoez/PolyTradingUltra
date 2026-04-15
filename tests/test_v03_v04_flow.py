@@ -492,6 +492,39 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(position["last_mark_price"], 1.0)
         self.assertGreater(position["realized_pnl"], 0.0)
 
+    def test_update_position_marks_handles_split_resolution(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            execution = execute_record(conn, proposal_record(conn, stored["proposal_id"]), mode="mock", session_state={"cumulative_spend_usdc": 0.0})
+            record_execution(conn, execution)
+            upsert_market_resolution(
+                conn,
+                "m1",
+                "50-50",
+                {"market_id": "m1", "outcomes": ["Yes", "No"], "outcomePrices": ["0.5", "0.5"]},
+            )
+            conn.commit()
+
+            sync_all_positions(conn)
+            updated = update_position_marks(conn)
+            position = list_positions(conn)[0]
+
+        self.assertEqual(len(updated), 1)
+        self.assertEqual(position["status"], "resolved")
+        self.assertEqual(position["last_mark_price"], 0.5)
+        expected_realized = round((0.5 - float(position["entry_price"])) * float(position["filled_qty"]), 6)
+        self.assertAlmostEqual(position["realized_pnl"], expected_realized, places=6)
+
     def test_sync_all_positions_cancels_existing_open_requested_when_execution_fails(self) -> None:
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
@@ -543,6 +576,140 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(position["status"], "cancelled")
         self.assertEqual(events[0]["event_type"], "open")
         self.assertEqual(events[-1]["event_type"], "reconcile")
+
+    def test_sync_all_positions_cancels_existing_open_requested_when_execution_is_canceled(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            execution = {
+                "proposal_id": stored["proposal_id"],
+                "mode": "real",
+                "client_order_id": f"{stored['proposal_id']}-submitted",
+                "order_intent_json": {"request": {}},
+                "requested_price": 0.4,
+                "requested_size_usdc": 10.0,
+                "max_slippage_bps": 500,
+                "observed_worst_price": 0.4,
+                "slippage_check_status": "passed",
+                "status": "submitted",
+                "filled_size_usdc": None,
+                "avg_fill_price": None,
+                "txhash_or_order_id": "order-cancel-market-resolved",
+                "slippage_bps": None,
+                "error_message": None,
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            }
+            record_execution(conn, execution)
+            conn.commit()
+
+            sync_all_positions(conn)
+            conn.execute(
+                "UPDATE executions SET status = ?, updated_at = ? WHERE txhash_or_order_id = ?",
+                ("canceled_market_resolved", utc_now_iso(), "order-cancel-market-resolved"),
+            )
+            conn.commit()
+
+            sync_all_positions(conn)
+            position = list_positions(conn)[0]
+            events = conn.execute(
+                "SELECT event_type FROM position_events WHERE position_id = 1 ORDER BY id ASC"
+            ).fetchall()
+
+        self.assertEqual(position["status"], "cancelled")
+        self.assertEqual(events[0]["event_type"], "open")
+        self.assertEqual(events[-1]["event_type"], "reconcile")
+
+    def test_portfolio_risk_blocks_duplicate_market_outcome_entry_when_active_exposure_exists(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            first = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(
+                conn,
+                {
+                    "proposal_id": first["proposal_id"],
+                    "mode": "real",
+                    "client_order_id": f"{first['proposal_id']}-filled",
+                    "order_intent_json": {"request": {}},
+                    "requested_price": 0.62,
+                    "requested_size_usdc": 5.0,
+                    "max_slippage_bps": 500,
+                    "observed_worst_price": 0.62,
+                    "slippage_check_status": "passed",
+                    "status": "filled",
+                    "filled_size_usdc": 5.0,
+                    "avg_fill_price": 0.62,
+                    "txhash_or_order_id": "order-duplicate-risk",
+                    "slippage_bps": 0,
+                    "error_message": None,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            second = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+
+            result = evaluate_full_record(conn, proposal_record(conn, second["proposal_id"]))
+
+        self.assertEqual(result["next_status"], "risk_blocked")
+        self.assertIn("market_outcome_exposure_exists", result["portfolio_risk"]["reasons"])
+
+    def test_portfolio_risk_blocks_duplicate_market_outcome_entry_when_pending_entry_exists(self) -> None:
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="pending_approval",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            duplicate = sample_proposal()
+            duplicate["reasoning"] = "Second copy"
+            stored = upsert_proposal(
+                conn,
+                duplicate,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+
+            result = evaluate_full_record(conn, proposal_record(conn, stored["proposal_id"]))
+
+        self.assertEqual(result["next_status"], "risk_blocked")
+        self.assertIn("market_outcome_entry_already_pending", result["portfolio_risk"]["reasons"])
 
     def test_build_openclaw_proposals_generates_from_adapter(self) -> None:
         markets = [sample_market()]
@@ -1271,6 +1438,161 @@ class TradingOSUpgradeTests(unittest.TestCase):
         cli_payload = json.loads(buffer.getvalue())
         self.assertIn("pending_approvals", cli_payload)
         self.assertIn("recent_events", cli_payload)
+
+
+    def test_executor_blocks_duplicate_execution_for_same_proposal(self) -> None:
+        """A proposal that already has a filled execution cannot be executed again."""
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            record = proposal_record(conn, stored["proposal_id"])
+            first = execute_record(conn, record, mode="mock")
+            record_execution(conn, first)
+            conn.commit()
+            self.assertEqual(first["status"], "filled")
+
+            # Re-fetch the record (status may have changed to 'executed')
+            record2 = proposal_record(conn, stored["proposal_id"])
+            # Force status back so the "not authorized" check doesn't fire first
+            record2["status"] = "authorized_for_execution"
+            second = execute_record(conn, record2, mode="mock")
+
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["error_message"], "proposal_already_has_active_execution")
+
+    def test_executor_blocks_duplicate_market_outcome_exposure(self) -> None:
+        """A second entry proposal on the same market_id + outcome is blocked at execution."""
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            # First proposal: execute and fill
+            p1 = sample_proposal()
+            stored1 = upsert_proposal(
+                conn,
+                p1,
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            rec1 = proposal_record(conn, stored1["proposal_id"])
+            exec1 = execute_record(conn, rec1, mode="mock")
+            record_execution(conn, exec1)
+            conn.commit()
+            self.assertEqual(exec1["status"], "filled")
+
+            # Second proposal: different reasoning so different proposal_id, same market+outcome
+            p2 = sample_proposal()
+            p2["reasoning"] = "Different thesis, same direction"
+            stored2 = upsert_proposal(
+                conn,
+                p2,
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary v2"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            rec2 = proposal_record(conn, stored2["proposal_id"])
+            exec2 = execute_record(conn, rec2, mode="mock")
+
+        self.assertEqual(exec2["status"], "failed")
+        self.assertEqual(exec2["error_message"], "duplicate_market_outcome_exposure")
+
+    def test_executor_allows_exit_despite_existing_exposure(self) -> None:
+        """Exit proposals must not be blocked by the duplicate exposure guard."""
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            # Entry proposal: execute and fill
+            stored1 = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            rec1 = proposal_record(conn, stored1["proposal_id"])
+            exec1 = execute_record(conn, rec1, mode="mock")
+            record_execution(conn, exec1)
+            conn.commit()
+
+            # Exit proposal on the same market+outcome
+            p_exit = sample_proposal()
+            p_exit["reasoning"] = "Exit thesis"
+            stored2 = upsert_proposal(
+                conn,
+                p_exit,
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "exit"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+                proposal_kind="exit",
+            )
+            conn.commit()
+            rec2 = proposal_record(conn, stored2["proposal_id"])
+            exec2 = execute_record(conn, rec2, mode="mock")
+
+        # Exit should NOT be blocked by duplicate exposure guard
+        self.assertNotEqual(exec2.get("error_message"), "duplicate_market_outcome_exposure")
+
+    def test_executor_allows_same_market_different_outcome(self) -> None:
+        """Entries on the same market but different outcomes should not block each other."""
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            # First proposal: Yes
+            stored1 = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            rec1 = proposal_record(conn, stored1["proposal_id"])
+            exec1 = execute_record(conn, rec1, mode="mock")
+            record_execution(conn, exec1)
+            conn.commit()
+            self.assertEqual(exec1["status"], "filled")
+
+            # Second proposal: No (different outcome)
+            p2 = sample_proposal()
+            p2["outcome"] = "No"
+            p2["confidence_score"] = 0.55
+            stored2 = upsert_proposal(
+                conn,
+                p2,
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "bearish"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+            rec2 = proposal_record(conn, stored2["proposal_id"])
+            exec2 = execute_record(conn, rec2, mode="mock")
+
+        self.assertNotEqual(exec2.get("error_message"), "duplicate_market_outcome_exposure")
 
 
 if __name__ == "__main__":

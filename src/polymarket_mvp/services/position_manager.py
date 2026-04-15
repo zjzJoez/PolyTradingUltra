@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict
 
 from ..common import market_reference_price, utc_now_iso
@@ -22,6 +23,39 @@ def _position_status_from_execution_status(status: str) -> str | None:
     return None
 
 
+def _is_cancelled_execution_status(status: str) -> bool:
+    normalized = str(status or "").strip().lower()
+    return normalized == "failed" or normalized.startswith("canceled") or normalized.startswith("cancelled")
+
+
+def _resolution_payout(resolution: Dict[str, Any], outcome: str) -> float | None:
+    payload = resolution.get("source_payload_json") or {}
+    raw_outcomes = payload.get("outcomes")
+    raw_prices = payload.get("outcomePrices")
+    if isinstance(raw_outcomes, str):
+        try:
+            raw_outcomes = json.loads(raw_outcomes)
+        except Exception:
+            raw_outcomes = None
+    if isinstance(raw_prices, str):
+        try:
+            raw_prices = json.loads(raw_prices)
+        except Exception:
+            raw_prices = None
+    if isinstance(raw_outcomes, list) and isinstance(raw_prices, list) and len(raw_outcomes) == len(raw_prices):
+        for name, price_value in zip(raw_outcomes, raw_prices):
+            if str(name) != str(outcome):
+                continue
+            try:
+                return float(price_value)
+            except (TypeError, ValueError):
+                return None
+    resolved_outcome = resolution.get("resolved_outcome")
+    if resolved_outcome is None:
+        return None
+    return 1.0 if str(resolved_outcome) == str(outcome) else 0.0
+
+
 def sync_position_for_execution(conn, execution_id: int) -> Dict[str, Any] | None:
     row = conn.execute("SELECT * FROM executions WHERE id = ?", (execution_id,)).fetchone()
     if row is None:
@@ -36,7 +70,7 @@ def sync_position_for_execution(conn, execution_id: int) -> Dict[str, Any] | Non
     if existing is not None and existing.get("status") == "resolved":
         return existing
     if status is None:
-        if existing is not None and execution_status == "failed":
+        if existing is not None and _is_cancelled_execution_status(execution_status):
             payload = {
                 **existing,
                 "status": "cancelled",
@@ -135,12 +169,11 @@ def update_position_marks(conn) -> list[Dict[str, Any]]:
         resolution = market_resolution(conn, market_id)
         if resolution is not None:
             resolved_outcome = resolution["resolved_outcome"]
-            if resolved_outcome == outcome:
-                realized_pnl = round((1.0 - entry_price) * filled_qty, 6)
-                mark = 1.0
-            else:
-                realized_pnl = round(-entry_price * filled_qty, 6)
-                mark = 0.0
+            payout = _resolution_payout(resolution, outcome)
+            if payout is None:
+                continue
+            realized_pnl = round((payout - entry_price) * filled_qty, 6)
+            mark = payout
             payload = {
                 **pos,
                 "status": "resolved",
