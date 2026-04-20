@@ -1,0 +1,10 @@
+[Unit]
+Description=Run DB backup daily at 03:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Unit=db-backup.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

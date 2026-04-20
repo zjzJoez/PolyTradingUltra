@@ -1,0 +1,17 @@
+[Unit]
+Description=Alpha Lab Polymarket CLOB orderbook ingest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-alpha-lab
+EnvironmentFile=/home/ubuntu/polymarket-alpha-lab/.env
+ExecStart=/home/ubuntu/polymarket-alpha-lab/.venv/bin/alpha-lab-ingest-polymarket-clob
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

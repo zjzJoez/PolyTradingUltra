@@ -1,0 +1,13 @@
+[Unit]
+Description=Run alpha_signals importer every 5 minutes
+
+[Timer]
+# Staggered 30s off mvp-autopilot.timer to avoid SQLite write contention.
+OnBootSec=4min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=alpha-lab-import.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Alpha Lab price-research cycle every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Unit=alpha-lab-cycle.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

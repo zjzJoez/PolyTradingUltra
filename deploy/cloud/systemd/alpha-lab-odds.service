@@ -1,0 +1,22 @@
+[Unit]
+Description=Alpha Lab odds ingest (The Odds API, soccer_epl h2h+totals)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-alpha-lab
+EnvironmentFile=/home/ubuntu/polymarket-alpha-lab/.env
+# Free tier = 500 req/month. Timer runs every 120 min = 12 ticks/day = 360/month.
+# Current coverage: soccer_epl, regions=eu, markets=h2h+totals (1 league per tick).
+# Adding a second league would double request count -> breaks the quota.
+# To expand stay within quota by (a) alternating leagues via separate services
+# pinned to different OnCalendar slots, or (b) upgrading to paid tier.
+ExecStart=/bin/sh -c '/home/ubuntu/polymarket-alpha-lab/.venv/bin/alpha-lab-ingest-odds-api --sport soccer_epl --regions eu --markets h2h,totals'
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

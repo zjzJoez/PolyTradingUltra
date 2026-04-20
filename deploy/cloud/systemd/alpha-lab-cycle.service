@@ -1,0 +1,17 @@
+[Unit]
+Description=Alpha Lab pricing + signal publish cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-alpha-lab
+EnvironmentFile=/home/ubuntu/polymarket-alpha-lab/.env
+ExecStart=/home/ubuntu/polymarket-alpha-lab/.venv/bin/alpha-lab-price-research-cycle --model-version v1
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

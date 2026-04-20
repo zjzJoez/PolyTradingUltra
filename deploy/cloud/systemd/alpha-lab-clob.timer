@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Alpha Lab CLOB ingest every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Unit=alpha-lab-clob.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

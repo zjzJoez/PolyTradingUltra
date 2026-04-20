@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily backup of MVP SQLite DB (local rotation; S3 when creds provided)
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/polymarket-mvp/deploy/cloud/scripts/backup.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600

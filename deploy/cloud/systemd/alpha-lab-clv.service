@@ -1,0 +1,17 @@
+[Unit]
+Description=Alpha Lab CLV observation (closing line snapshot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-alpha-lab
+EnvironmentFile=/home/ubuntu/polymarket-alpha-lab/.env
+ExecStart=/home/ubuntu/polymarket-alpha-lab/.venv/bin/alpha-lab-observe-clv
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

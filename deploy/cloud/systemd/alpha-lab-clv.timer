@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Alpha Lab CLV observer every 60 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=60min
+Unit=alpha-lab-clv.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

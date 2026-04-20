@@ -1,0 +1,17 @@
+[Unit]
+Description=Import ready alpha_signals into MVP proposals
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-mvp
+EnvironmentFile=/home/ubuntu/polymarket-mvp/.env
+ExecStart=/home/ubuntu/polymarket-mvp/.venv/bin/import-alpha-signals
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
