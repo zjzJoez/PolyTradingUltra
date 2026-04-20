@@ -273,6 +273,26 @@ class Autopilot:
             except Exception:
                 _log(f"risk eval failed for {p['proposal_id']}: {traceback.format_exc()}")
 
+        # Also evaluate any `proposed`-status records that bypassed run_proposal_pipeline
+        # (e.g. alpha_lab signals imported via `import-alpha-signals`). Without this
+        # sweep they stay at `proposed` forever and never reach the execute loop.
+        other_proposed = list_proposals_by_status(conn, ["proposed"])
+        for item in other_proposed:
+            pid = item["proposal_id"]
+            record = proposal_record(conn, pid)
+            if record is None:
+                continue
+            try:
+                result = evaluate_full_record(conn, record)
+                update_proposal_workflow_fields(
+                    conn,
+                    pid,
+                    authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                    status=result["next_status"],
+                )
+            except Exception:
+                _log(f"risk eval failed for imported {pid}: {traceback.format_exc()}")
+
         # Shadow-mode auto-approval: proposals that passed risk but lack matching
         # auto-execute authorization would normally sit in `pending_approval`
         # waiting for a human. In shadow mode we auto-record an approval so they
@@ -337,7 +357,12 @@ class Autopilot:
     def _loop_reconcile(self, conn) -> int:
         from .services.reconciler import assert_position_consistency, cancel_orphaned_positions, cancel_stale_orders, check_and_backfill_resolutions, reconcile_live_orders
         from .services.position_manager import sync_all_positions, update_position_marks
-        from .services.redeemer import redeem_resolved_positions
+        # Redeemer pulls in web3 for on-chain claim txs; on shadow-mode deployments
+        # without web3 installed, skip redemption rather than crashing the loop.
+        try:
+            from .services.redeemer import redeem_resolved_positions
+        except ImportError:
+            redeem_resolved_positions = None
 
         cancel_orphaned_positions(conn)
         assert_position_consistency(conn)
@@ -353,6 +378,8 @@ class Autopilot:
         conn.commit()
 
         # Auto-redeem winning conditional tokens after resolution
+        if redeem_resolved_positions is None:
+            return 0
         try:
             redeemed = redeem_resolved_positions(conn)
             for r in redeemed:
