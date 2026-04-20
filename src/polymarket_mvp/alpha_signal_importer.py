@@ -26,6 +26,10 @@ from .db import (
     market_snapshot,
     upsert_proposal,
 )
+from .services.event_cluster_service import (
+    MARKET_CLASS_CONFIG,
+    classify_market_class,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +214,24 @@ def import_signals(
         # Convert signal to proposal
         proposal = signal_to_proposal(signal)
         context = signal_context_payload(signal)
+
+        # Clamp recommended_size_usdc to the market-class cap so the downstream
+        # risk engine doesn't reject the proposal with market_class_size_exceeded.
+        # The risk engine reads the same MARKET_CLASS_CONFIG, so clamping here
+        # keeps the importer in lockstep with the policy.
+        try:
+            market_class = classify_market_class(mkt)
+            class_config = MARKET_CLASS_CONFIG.get(market_class) or MARKET_CLASS_CONFIG.get("other") or {}
+            class_cap = class_config.get("max_order_usdc")
+            if class_cap is not None and class_cap > 0:
+                proposal["recommended_size_usdc"] = min(
+                    float(proposal["recommended_size_usdc"]),
+                    float(class_cap),
+                )
+        except Exception:
+            # If classification fails for any reason, fall through — risk engine
+            # will still guard the downstream proposal.
+            pass
 
         if dry_run:
             results.append({
