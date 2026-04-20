@@ -32,12 +32,15 @@ from .common import (
 from .db import (
     connect_db,
     init_db,
+    list_expired_pending_proposals,
     list_kill_switches,
     list_positions,
     list_proposals_by_status,
     proposal_record,
+    record_approval,
     record_execution,
     record_heartbeat,
+    update_proposal_status,
     update_proposal_workflow_fields,
 )
 
@@ -270,53 +273,54 @@ class Autopilot:
             except Exception:
                 _log(f"risk eval failed for {p['proposal_id']}: {traceback.format_exc()}")
 
-        # Send unsent pending_approval proposals to Telegram
-        self._send_unsent_to_telegram(conn)
+        # Shadow-mode auto-approval: proposals that passed risk but lack matching
+        # auto-execute authorization would normally sit in `pending_approval`
+        # waiting for a human. In shadow mode we auto-record an approval so they
+        # flow through to `_loop_execute`, which is in turn gated by
+        # MVP_SHADOW_MODE at the top of `poly_executor.execute_record`.
+        if os.getenv("MVP_SHADOW_MODE") == "1":
+            self._shadow_auto_approve_pending(conn)
         return len(proposals)
 
-    def _send_unsent_to_telegram(self, conn) -> None:
-        chat_id = os.getenv("TG_CHAT_ID")
-        if not chat_id:
-            return
+    def _shadow_auto_approve_pending(self, conn) -> None:
         pending = list_proposals_by_status(conn, ["pending_approval"])
-        already_sent = [p for p in pending if p.get("telegram_message_id")]
-        unsent = [p for p in pending if not p.get("telegram_message_id")]
-        if not unsent:
-            return
-        max_pending = self._max_pending_approvals()
-        remaining_capacity = max(0, max_pending - len(already_sent))
-        if remaining_capacity <= 0:
-            return
-        unsent.sort(
-            key=lambda item: (
-                -float(item.get("priority_score") or 0.0),
-                str(item.get("updated_at") or ""),
-                str(item.get("proposal_id") or ""),
-            )
-        )
-        send_limit = min(
-            get_env_int("POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP", 3),
-            remaining_capacity,
-            len(unsent),
-        )
-        if send_limit <= 0:
-            return
-        try:
-            from .tg_approver import send_proposals
-            send_proposals([p["proposal_id"] for p in unsent[:send_limit]], chat_id=chat_id, conn=conn)
-        except Exception:
-            _log(f"telegram send failed: {traceback.format_exc()}")
+        for item in pending:
+            pid = item["proposal_id"]
+            if (item.get("approval") or {}).get("decision") == "approved":
+                # already has a shadow-auto approval row; just ensure status advances
+                if item.get("status") == "pending_approval":
+                    update_proposal_status(conn, pid, "authorized_for_execution")
+                continue
+            try:
+                record_approval(
+                    conn,
+                    proposal_id=pid,
+                    decision="approved",
+                    decided_at=utc_now_iso(),
+                    callback_query_id=f"shadow:{pid}",
+                    raw_callback_json={"source": "shadow_auto"},
+                )
+                # record_approval transitions pending_approval -> approved;
+                # bump to authorized_for_execution so the execute loop picks it up.
+                update_proposal_status(conn, pid, "authorized_for_execution")
+            except Exception:
+                _log(f"shadow auto-approve failed for {pid}: {traceback.format_exc()}")
 
     def _loop_expiry(self, conn) -> int:
-        from .tg_approver import expire_stale_proposals
-        expired = expire_stale_proposals(conn)
-        return len(expired)
+        """Sweep pending_approval proposals past their deadline to `expired`."""
+        expired_records = list_expired_pending_proposals(conn)
+        for record in expired_records:
+            try:
+                update_proposal_status(conn, record["proposal_id"], "expired")
+            except Exception:
+                _log(f"expire sweep failed for {record['proposal_id']}: {traceback.format_exc()}")
+        return len(expired_records)
 
     def _loop_execute(self, conn) -> int:
         from .poly_executor import execute_record
 
         authorized = list_proposals_by_status(conn, ["authorized_for_execution"])
-        mode = (os.getenv("TG_AUTO_EXECUTE_MODE") or "real").strip().lower()
+        mode = (os.getenv("POLY_AUTOPILOT_EXECUTE_MODE") or "real").strip().lower()
         if mode not in ("mock", "real"):
             mode = "real"
         count = 0

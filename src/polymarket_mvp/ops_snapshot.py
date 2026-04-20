@@ -88,8 +88,6 @@ def _normalize_failure_category(message: str | None, *, source: str) -> str:
         return "insufficient_balance"
     if "gamma_clob_price_divergence_exceeded" in text:
         return "gamma_clob_divergence"
-    if source == "telegram":
-        return "telegram_error"
     if source == "reconcile":
         return "order_reconcile_error"
     if source == "autopilot":
@@ -177,8 +175,6 @@ def _build_pending_approvals(conn, now_iso: str) -> tuple[list[dict[str, Any]], 
             "approval_requested_at": record.get("approval_requested_at"),
             "approval_expires_at": record.get("approval_expires_at"),
             "seconds_remaining": expires_in,
-            "telegram_message_id": record.get("telegram_message_id"),
-            "telegram_chat_id": record.get("telegram_chat_id"),
         }
         items.append(item)
         if expires_in is not None and expires_in <= 60:
@@ -430,11 +426,11 @@ def _build_recent_decisions(conn, limit: int) -> list[dict[str, Any]]:
         elif record.get("status") == "expired":
             reason = "Approval expired before operator response"
         elif record.get("status") == "pending_approval":
-            reason = "Awaiting Telegram approval"
+            reason = "Awaiting approval"
         elif record.get("status") == "risk_blocked":
             reason = "Blocked by risk engine"
         elif record.get("approval"):
-            reason = f"Telegram decision: {record['approval']['decision']}"
+            reason = f"Approval decision: {record['approval']['decision']}"
         items.append(
             {
                 "proposal_id": record["proposal_id"],
@@ -559,35 +555,12 @@ def _recent_heartbeat_failures(conn, limit: int) -> list[dict[str, Any]]:
     return items
 
 
-def _recent_telegram_failures(limit: int) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for event in load_recent_ops_events(limit=limit * 3):
-        event_type = str(event.get("type") or "")
-        if event_type not in {"telegram_followup_failed", "auto_execute_failed"}:
-            continue
-        message = event.get("error") or event_type
-        items.append(
-            {
-                "kind": "telegram",
-                "category": _normalize_failure_category(message, source="telegram"),
-                "proposal_id": event.get("proposal_id"),
-                "status": event_type,
-                "message": message,
-                "timestamp": event.get("timestamp"),
-            }
-        )
-        if len(items) >= limit:
-            break
-    return items
-
-
 def _build_recent_failures(conn, limit: int) -> list[dict[str, Any]]:
     combined = (
         _recent_execution_failures(conn, limit)
         + _recent_risk_blocks(conn, limit)
         + _recent_reconcile_failures(conn, limit)
         + _recent_heartbeat_failures(conn, limit)
-        + _recent_telegram_failures(limit)
     )
     combined.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
     return combined[:limit]
@@ -628,6 +601,7 @@ def build_ops_snapshot(conn, *, limits: Mapping[str, int] | None = None) -> dict
             "kill_switches": list_kill_switches(conn, active_only=True),
             "loop_intervals_seconds": {loop: resolver() for loop, resolver in LOOP_CADENCES.items()},
             "openclaw_agent_id": os.getenv("OPENCLAW_AGENT_ID") or "",
-            "tg_auto_execute_mode": (os.getenv("TG_AUTO_EXECUTE_MODE") or "real").strip().lower(),
+            "shadow_mode": os.getenv("MVP_SHADOW_MODE") == "1",
+            "execute_mode": (os.getenv("POLY_AUTOPILOT_EXECUTE_MODE") or "real").strip().lower(),
         },
     }

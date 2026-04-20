@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 import requests
 
 from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, parse_iso8601, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
-from .db import connect_db, has_active_execution, has_active_market_outcome_exposure, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
+from .db import connect_db, has_active_execution, has_active_market_outcome_exposure, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution, update_proposal_status
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
 
@@ -53,37 +53,6 @@ def _looks_retryable_request_error(exc: Exception) -> bool:
             "remote end closed",
         )
     )
-
-
-def _maybe_notify_auto_execution(record: Dict[str, Any], execution: Dict[str, Any]) -> None:
-    token = os.getenv("TG_BOT_TOKEN")
-    chat_id = os.getenv("TG_CHAT_ID")
-    if not token or not chat_id:
-        return
-    if str(record.get("status")) != "authorized_for_execution":
-        return
-    base = (os.getenv("TG_BASE_URL") or "https://api.telegram.org").rstrip("/")
-    text = "\n".join(
-        [
-            "Polymarket auto-execution update",
-            f"Proposal ID: {record['proposal_id']}",
-            f"Market: {(record.get('market') or {}).get('question') or record['market_id']}",
-            f"Outcome: {record['proposal_json']['outcome']}",
-            f"Mode: {execution['mode']}",
-            f"Status: {execution['status']}",
-            f"Order ID: {execution.get('txhash_or_order_id') or 'n/a'}",
-            f"Error: {execution.get('error_message') or 'none'}",
-        ]
-    )
-    try:
-        response = requests.post(
-            f"{base}/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20,
-        )
-        response.raise_for_status()
-    except Exception:
-        return
 
 
 def _env_any(*names: str, required: bool = False, default: str | None = None) -> str | None:
@@ -409,7 +378,74 @@ def _failed_execution(record: Dict[str, Any], mode: str, reason: str, *, preflig
     }
 
 
+def _shadow_execute(conn, record: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Shadow-mode path for ``execute_record``.
+
+    Persists a ``shadow_executions`` row and returns a synthetic execution
+    record with ``status='shadow_simulated'``. Never contacts the CLOB.
+    """
+    proposal = record["proposal_json"]
+    try:
+        simulated_price = _current_worst_price(record, mode="mock")
+    except Exception:
+        simulated_price = float(proposal.get("max_entry_price") or 0.0) or 0.5
+    try:
+        create_shadow_execution(
+            conn,
+            record,
+            simulated_fill_price=simulated_price,
+            simulated_status="env_gated_shadow",
+        )
+    except Exception as exc:
+        print(
+            f"[poly-executor] shadow_execute persist failed proposal_id={record['proposal_id']} error={exc}",
+            file=sys.stderr,
+        )
+    # Advance the proposal out of `authorized_for_execution` so the execute loop
+    # does not re-fire every tick. `executed` is a terminal status.
+    try:
+        update_proposal_status(conn, record["proposal_id"], "executed")
+    except Exception as exc:
+        print(
+            f"[poly-executor] shadow_execute status bump failed proposal_id={record['proposal_id']} error={exc}",
+            file=sys.stderr,
+        )
+    now = utc_now_iso()
+    return {
+        "proposal_id": record["proposal_id"],
+        "mode": mode,
+        "client_order_id": f"shadow-{record['proposal_id']}",
+        "order_intent_json": {
+            "proposal_id": record["proposal_id"],
+            "source": "shadow_gate",
+            "simulated_fill_price": simulated_price,
+        },
+        "requested_price": simulated_price,
+        "requested_size_usdc": proposal["recommended_size_usdc"],
+        "max_slippage_bps": proposal["max_slippage_bps"],
+        "observed_worst_price": simulated_price,
+        "slippage_check_status": "skipped",
+        "status": "shadow_simulated",
+        "filled_size_usdc": 0.0,
+        "avg_fill_price": None,
+        "txhash_or_order_id": None,
+        "slippage_bps": 0,
+        "error_message": None,
+        "error_category": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
 def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Dict[str, float] | None = None) -> Dict[str, Any]:
+    # Shadow-mode gate: when MVP_SHADOW_MODE=1, never hit the CLOB. Instead we
+    # persist a shadow_executions row (so downstream reconcile/CLV paths still
+    # have structured data) and return a synthetic execution record flagged as
+    # `shadow_simulated`. MUST run before any client build / SDK import so that
+    # missing wallet credentials in shadow deployments don't crash the loop.
+    if os.getenv("MVP_SHADOW_MODE") == "1":
+        return _shadow_execute(conn, record, mode)
+
     proposal = record["proposal_json"]
     session_state = session_state or {"cumulative_spend_usdc": 0.0}
     approval = record.get("approval") or {}
@@ -686,7 +722,6 @@ def main() -> int:
             except Exception as exc:
                 execution = _failed_execution(record, args.mode, f"executor_unhandled: {exc}")
             stored = record_execution(conn, execution)
-            _maybe_notify_auto_execution(record, stored)
             executions.append(stored)
             if args.mode == "real" and isinstance(stored.get("error_message"), str) and BALANCE_SANITY_REASON in stored["error_message"]:
                 fatal_abort = True

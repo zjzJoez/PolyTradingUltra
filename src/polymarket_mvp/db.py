@@ -624,11 +624,11 @@ def record_approval(
     proposal_id: str,
     decision: str,
     decided_at: str,
-    telegram_user_id: str | None,
-    telegram_username: str | None,
     callback_query_id: str,
-    telegram_message_id: str | None,
     raw_callback_json: Mapping[str, Any],
+    telegram_user_id: str | None = None,
+    telegram_username: str | None = None,
+    telegram_message_id: str | None = None,
 ) -> Dict[str, Any]:
     conn.execute(
         """

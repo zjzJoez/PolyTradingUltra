@@ -37,7 +37,6 @@ from polymarket_mvp.agents.supervisor_agent import supervise_record
 from polymarket_mvp.services.position_manager import sync_all_positions, update_position_marks
 from polymarket_mvp.services.openclaw_adapter import chat_json
 from polymarket_mvp.services.reconciler import reconcile_live_orders
-from polymarket_mvp.tg_approver import create_app
 
 
 OLD_SCHEMA = """
@@ -173,9 +172,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
         os.environ.pop("POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS", None)
         os.environ.pop("POLY_RISK_MARKET_CLASS_ENABLED", None)
         os.environ.pop("SIGNATURE_TYPE", None)
-        os.environ.pop("TG_CHAT_ID", None)
         os.environ.pop("POLY_AUTOPILOT_MAX_PENDING_APPROVALS", None)
-        os.environ.pop("POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP", None)
 
     def test_init_db_contains_new_v03_v04_tables(self) -> None:
         init_db(self.db_path)
@@ -930,99 +927,6 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(contexts[1]["source_type"], "apify_twitter")
         self.assertIn("market chatter", result["context_payload"]["assembled_text"])
 
-    def test_autopilot_send_unsent_to_telegram_limits_batch_and_sorts_by_priority(self) -> None:
-        init_db(self.db_path)
-        os.environ["TG_CHAT_ID"] = "12345"
-        os.environ["POLY_AUTOPILOT_MAX_PENDING_APPROVALS"] = "3"
-        os.environ["POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP"] = "2"
-        with connect_db(self.db_path) as conn:
-            for idx, priority in enumerate([0.1, 0.9, 0.5, 0.8], start=1):
-                market = sample_market()
-                market["market_id"] = f"m-send-{idx}"
-                market["condition_id"] = f"cond-send-{idx}"
-                market["slug"] = f"send-{idx}"
-                market["question"] = f"Market {idx}?"
-                upsert_market_snapshot(conn, market)
-                proposal = {
-                    "market_id": market["market_id"],
-                    "outcome": "Yes",
-                    "confidence_score": 0.7 + idx / 100.0,
-                    "recommended_size_usdc": 5.0,
-                    "reasoning": f"proposal {idx}",
-                    "max_slippage_bps": 500,
-                }
-                stored = upsert_proposal(
-                    conn,
-                    proposal,
-                    decision_engine="openclaw_llm",
-                    status="pending_approval",
-                    context_payload={"topic": "BTC", "assembled_text": "summary"},
-                    strategy_name="near_expiry_conviction",
-                    topic="BTC",
-                )
-                update_proposal_workflow_fields(
-                    conn,
-                    stored["proposal_id"],
-                    priority_score=priority,
-                    status="pending_approval",
-                )
-
-            sent_market = sample_market()
-            sent_market["market_id"] = "m-send-already"
-            sent_market["condition_id"] = "cond-send-already"
-            sent_market["slug"] = "send-already"
-            sent_market["question"] = "Already sent?"
-            upsert_market_snapshot(conn, sent_market)
-            sent_proposal = upsert_proposal(
-                conn,
-                {
-                    "market_id": sent_market["market_id"],
-                    "outcome": "Yes",
-                    "confidence_score": 0.99,
-                    "recommended_size_usdc": 5.0,
-                    "reasoning": "already sent",
-                    "max_slippage_bps": 500,
-                },
-                decision_engine="openclaw_llm",
-                status="pending_approval",
-                context_payload={"topic": "BTC", "assembled_text": "summary"},
-                strategy_name="near_expiry_conviction",
-                topic="BTC",
-            )
-            update_proposal_workflow_fields(
-                conn,
-                sent_proposal["proposal_id"],
-                priority_score=1.0,
-                status="pending_approval",
-                telegram_message_id="999",
-                telegram_chat_id="12345",
-            )
-            conn.commit()
-
-            pilot = Autopilot(max_iterations=1)
-            with patch("polymarket_mvp.tg_approver.send_proposals") as mocked_send:
-                pilot._send_unsent_to_telegram(conn)
-
-        mocked_send.assert_called_once()
-        sent_ids = mocked_send.call_args.args[0]
-        self.assertEqual(len(sent_ids), 2)
-        self.assertEqual(sent_ids[0], proposal_id_for({
-            "market_id": "m-send-2",
-            "outcome": "Yes",
-            "confidence_score": 0.72,
-            "recommended_size_usdc": 5.0,
-            "reasoning": "proposal 2",
-            "max_slippage_bps": 500,
-        }))
-        self.assertEqual(sent_ids[1], proposal_id_for({
-            "market_id": "m-send-4",
-            "outcome": "Yes",
-            "confidence_score": 0.74,
-            "recommended_size_usdc": 5.0,
-            "reasoning": "proposal 4",
-            "max_slippage_bps": 500,
-        }))
-
     def test_reconciler_fills_live_order_and_position_updates(self) -> None:
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
@@ -1395,43 +1299,11 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertIn("allowance_missing", categories)
         self.assertIn("autopilot_loop_error", categories)
 
-    def test_ops_routes_and_page_render_with_empty_state(self) -> None:
+    def test_autopilot_status_cli_emits_shared_snapshot(self) -> None:
+        """The `autopilot-status` CLI should emit a JSON snapshot with the same
+        keys that the ops dashboard used to read (kept as a thin contract test
+        after the Flask /ops route was retired with the Telegram surface)."""
         init_db(self.db_path)
-        app = create_app()
-        client = app.test_client()
-
-        page = client.get("/ops")
-        self.assertEqual(page.status_code, 200)
-        html = page.get_data(as_text=True)
-        self.assertIn("System Health", html)
-        self.assertIn("Pending Approvals", html)
-
-        response = client.get("/api/ops/status")
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertIn("system_health", payload)
-        self.assertIn("recent_failures", payload)
-        self.assertIn("control_state", payload)
-
-    def test_ops_events_route_and_autopilot_status_cli_use_shared_snapshot(self) -> None:
-        init_db(self.db_path)
-        append_jsonl(
-            debug_events_path("approvals"),
-            {
-                "timestamp": utc_now_iso(),
-                "type": "telegram_followup_failed",
-                "proposal_id": "p1",
-                "error": "send failed",
-            },
-        )
-
-        app = create_app()
-        client = app.test_client()
-        response = client.get("/api/ops/events")
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["recent_events"][0]["type"], "telegram_followup_failed")
-
         buffer = io.StringIO()
         with patch("sys.argv", ["autopilot-status"]):
             with redirect_stdout(buffer):
@@ -1440,7 +1312,6 @@ class TradingOSUpgradeTests(unittest.TestCase):
         cli_payload = json.loads(buffer.getvalue())
         self.assertIn("pending_approvals", cli_payload)
         self.assertIn("recent_events", cli_payload)
-
 
     def test_executor_blocks_duplicate_execution_for_same_proposal(self) -> None:
         """A proposal that already has a filled execution cannot be executed again."""

@@ -81,7 +81,6 @@ class AutopilotTests(unittest.TestCase):
         os.environ["POLY_RISK_MAX_SLIPPAGE_BPS"] = "600"
         os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "false"
         os.environ["SIGNATURE_TYPE"] = ""
-        os.environ["TG_WEBHOOK_SECRET"] = ""
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
@@ -133,7 +132,7 @@ class AutopilotTests(unittest.TestCase):
     # --- Approval expiry tests ---
 
     def test_expire_stale_proposals(self) -> None:
-        """Proposal past its approval_expires_at gets expired."""
+        """Autopilot `_loop_expiry` sweeps past-deadline pending_approval proposals to `expired`."""
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
             upsert_market_snapshot(conn, sample_market())
@@ -149,8 +148,6 @@ class AutopilotTests(unittest.TestCase):
                 conn, pid,
                 approval_requested_at=past_time,
                 approval_expires_at=past_time,
-                telegram_message_id="123",
-                telegram_chat_id="456",
             )
             conn.commit()
 
@@ -158,97 +155,43 @@ class AutopilotTests(unittest.TestCase):
             self.assertEqual(len(expired), 1)
             self.assertEqual(expired[0]["proposal_id"], pid)
 
-            # Call expire sweep (mock Telegram)
-            from polymarket_mvp.tg_approver import expire_stale_proposals
-            with patch("polymarket_mvp.tg_approver.tg_post"):
-                results = expire_stale_proposals(conn)
+            from polymarket_mvp.autopilot import Autopilot
+            pilot = Autopilot(max_iterations=1)
+            count = pilot._loop_expiry(conn)
             conn.commit()
 
-            self.assertEqual(len(results), 1)
-            self.assertEqual(results[0]["action"], "expired")
+            self.assertEqual(count, 1)
             record = proposal_record(conn, pid)
             self.assertEqual(record["status"], "expired")
 
-    def test_expire_stale_proposals_commits_before_telegram_edit(self) -> None:
-        """Expiry sweep should release SQLite write lock before Telegram calls."""
+    def test_shadow_mode_auto_approves_pending(self) -> None:
+        """When MVP_SHADOW_MODE=1, autopilot auto-approves proposals stuck in pending_approval."""
         init_db(self.db_path)
-        with connect_db(self.db_path) as conn:
-            upsert_market_snapshot(conn, sample_market())
-            proposal = sample_proposal()
-            upsert_proposal(
-                conn, proposal, decision_engine="heuristic",
-                status="proposed", context_payload={},
-            )
-            pid = proposal_id_for(proposal)
-            update_proposal_status(conn, pid, "pending_approval")
-            past_time = (parse_iso8601(utc_now_iso()) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            update_proposal_workflow_fields(
-                conn, pid,
-                approval_requested_at=past_time,
-                approval_expires_at=past_time,
-                telegram_message_id="123",
-                telegram_chat_id="456",
-            )
-            conn.commit()
+        os.environ["MVP_SHADOW_MODE"] = "1"
+        try:
+            with connect_db(self.db_path) as conn:
+                upsert_market_snapshot(conn, sample_market())
+                proposal = sample_proposal()
+                upsert_proposal(
+                    conn, proposal, decision_engine="heuristic",
+                    status="proposed", context_payload={},
+                )
+                pid = proposal_id_for(proposal)
+                update_proposal_status(conn, pid, "pending_approval")
+                conn.commit()
 
-            from polymarket_mvp.tg_approver import expire_stale_proposals
+                from polymarket_mvp.autopilot import Autopilot
+                pilot = Autopilot(max_iterations=1)
+                pilot._shadow_auto_approve_pending(conn)
+                conn.commit()
 
-            def fake_tg_post(method, payload):
-                del method, payload
-                with connect_db(self.db_path) as verify_conn:
-                    record = proposal_record(verify_conn, pid)
-                    self.assertIsNotNone(record)
-                    self.assertEqual(record["status"], "expired")
-                return {"ok": True}
-
-            with patch("polymarket_mvp.tg_approver.tg_post", side_effect=fake_tg_post):
-                results = expire_stale_proposals(conn)
-
-            self.assertEqual(len(results), 1)
-            record = proposal_record(conn, pid)
-            self.assertEqual(record["status"], "expired")
-
-    def test_late_telegram_callback_rejected(self) -> None:
-        """Expired proposal callback is rejected, no approval recorded."""
-        init_db(self.db_path)
-        with connect_db(self.db_path) as conn:
-            upsert_market_snapshot(conn, sample_market())
-            proposal = sample_proposal()
-            upsert_proposal(
-                conn, proposal, decision_engine="heuristic",
-                status="proposed", context_payload={},
-            )
-            pid = proposal_id_for(proposal)
-            update_proposal_status(conn, pid, "pending_approval")
-            past_time = (parse_iso8601(utc_now_iso()) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            update_proposal_workflow_fields(
-                conn, pid,
-                approval_requested_at=past_time,
-                approval_expires_at=past_time,
-            )
-            conn.commit()
-
-        # Simulate a late callback via the Flask app
-        from polymarket_mvp.tg_approver import create_app
-        with patch("polymarket_mvp.tg_approver.tg_post"):
-            app = create_app()
-            client = app.test_client()
-            resp = client.post("/telegram/webhook", json={
-                "callback_query": {
-                    "id": "cb_late_1",
-                    "data": f"approve:{pid}",
-                    "from": {"id": 1, "username": "tester"},
-                    "message": {"message_id": 123, "chat": {"id": 456}},
-                }
-            })
-        data = resp.get_json()
-        self.assertEqual(data.get("reason"), "expired")
-
-        # Verify no approval was recorded
-        with connect_db(self.db_path) as conn:
-            record = proposal_record(conn, pid)
-            self.assertEqual(record["status"], "pending_approval")
-            self.assertIsNone(record.get("approval"))
+                record = proposal_record(conn, pid)
+                self.assertEqual(record["status"], "authorized_for_execution")
+                approval = record.get("approval")
+                self.assertIsNotNone(approval)
+                self.assertEqual(approval["decision"], "approved")
+        finally:
+            os.environ.pop("MVP_SHADOW_MODE", None)
 
     def test_autopilot_propose_loop_skips_blocked_crypto_directional_markets(self) -> None:
         os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "true"
@@ -471,50 +414,6 @@ class AutopilotTests(unittest.TestCase):
             loop_names = {row["loop_name"] for row in heartbeats}
         # All 8 loops should have at least one heartbeat
         self.assertEqual(loop_names, {"scan", "context", "propose", "expiry", "execute", "reconcile", "exit", "review"})
-
-    def test_autopilot_idempotency_no_duplicate_sends(self) -> None:
-        """Running two ticks does not duplicate Telegram sends for already-sent proposals."""
-        init_db(self.db_path)
-        with connect_db(self.db_path) as conn:
-            upsert_market_snapshot(conn, sample_market())
-            proposal = sample_proposal()
-            upsert_proposal(
-                conn, proposal, decision_engine="heuristic",
-                status="proposed", context_payload={},
-            )
-            pid = proposal_id_for(proposal)
-            update_proposal_status(conn, pid, "pending_approval")
-            # Simulate already-sent: set telegram_message_id
-            update_proposal_workflow_fields(
-                conn, pid,
-                telegram_message_id="already_sent_123",
-                telegram_chat_id="456",
-            )
-            conn.commit()
-
-        from polymarket_mvp.autopilot import Autopilot
-        pilot = Autopilot(max_iterations=1)
-
-        send_calls = []
-        original_send = None
-
-        def mock_send(proposal_ids, **kwargs):
-            send_calls.extend(proposal_ids)
-            return {"sent_count": len(proposal_ids), "events": []}
-
-        # Only mock the propose loop to test send behavior
-        with patch("polymarket_mvp.autopilot.Autopilot._loop_scan", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_context", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_propose", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_expiry", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_execute", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_reconcile", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_exit", return_value=0), \
-             patch("polymarket_mvp.autopilot.Autopilot._loop_review", return_value=0):
-            pilot.run_forever()
-
-        # No proposals should have been sent (already has telegram_message_id)
-        self.assertEqual(send_calls, [])
 
     # --- Schema migration test ---
 
