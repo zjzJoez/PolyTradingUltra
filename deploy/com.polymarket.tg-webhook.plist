@@ -7,16 +7,22 @@
 
   <key>ProgramArguments</key>
   <array>
-    <!-- UPDATE: absolute path to your venv Python -->
-    <string>/Users/joez/Desktop/polymarket-mvp/.venv311/bin/tg-approver</string>
+    <string>/Users/joez/Desktop/polymarket-mvp/.venv311/bin/python</string>
+    <string>-m</string>
+    <string>polymarket_mvp.tg_approver</string>
     <string>serve</string>
     <string>--port</string>
     <string>8787</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <!-- UPDATE: absolute path to your repo -->
   <string>/Users/joez/Desktop/polymarket-mvp</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
 
   <key>KeepAlive</key>
   <true/>

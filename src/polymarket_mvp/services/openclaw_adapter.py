@@ -4,12 +4,41 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
 import requests
 
 from ..common import sanitize_text
+
+
+# Transient-error throttled logging + cooldown for rate-limited upstream calls.
+_TRANSIENT_STATE: dict[str, float] = {"last_log": 0.0, "cooldown_until": 0.0}
+
+
+def _log_transient(status: int, retry_after: str | None) -> None:
+    now = time.time()
+    if now - _TRANSIENT_STATE["last_log"] < 30:
+        return
+    _TRANSIENT_STATE["last_log"] = now
+    hint = f" retry_after={retry_after}" if retry_after else ""
+    print(
+        f"[openclaw_adapter] upstream transient HTTP {status}{hint}; skipping this tick",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _set_cooldown(seconds: float) -> None:
+    _TRANSIENT_STATE["cooldown_until"] = max(
+        _TRANSIENT_STATE["cooldown_until"], time.time() + seconds
+    )
+
+
+def _in_cooldown() -> bool:
+    return time.time() < _TRANSIENT_STATE["cooldown_until"]
 
 
 def _transport_mode() -> str:
@@ -154,6 +183,8 @@ def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0
     if mode in {"http", "api", "openai"} or endpoint is not None:
         if endpoint is None:
             return None
+        if _in_cooldown():
+            return None
         payload = {
             "model": os.getenv("OPENCLAW_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini",
             "temperature": temperature,
@@ -162,8 +193,26 @@ def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0
                 {"role": "user", "content": user_prompt},
             ],
         }
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=45)
-        response.raise_for_status()
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=45)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            resp = exc.response
+            status = getattr(resp, "status_code", None)
+            if status in (408, 429, 500, 502, 503, 504):
+                retry_after = resp.headers.get("Retry-After") if resp is not None else None
+                try:
+                    cooldown = float(retry_after) if retry_after else 60.0
+                except ValueError:
+                    cooldown = 60.0
+                _set_cooldown(min(max(cooldown, 15.0), 900.0))
+                _log_transient(status, retry_after)
+                return None
+            raise
+        except requests.RequestException as exc:
+            _set_cooldown(30.0)
+            _log_transient(0, f"{type(exc).__name__}: {exc}")
+            return None
         return response.json()
     return _cli_payload(system_prompt, user_prompt)
 

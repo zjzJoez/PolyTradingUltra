@@ -34,10 +34,12 @@ def connect_db(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(
         db_path,
         timeout=busy_timeout_seconds,
+        isolation_level="IMMEDIATE",
         factory=ManagedSQLiteConnection,
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_seconds * 1000}")
     return conn
@@ -528,7 +530,31 @@ def list_proposals_by_status(conn: sqlite3.Connection, statuses: Sequence[str], 
     return [proposal_record(conn, str(row["proposal_id"])) for row in rows if proposal_record(conn, str(row["proposal_id"])) is not None]
 
 
+LEGAL_PROPOSAL_TRANSITIONS = {
+    "proposed":                    {"risk_blocked", "pending_approval"},
+    "risk_blocked":                {"proposed"},
+    "pending_approval":            {"approved", "rejected", "expired", "authorized_for_execution"},
+    "approved":                    {"authorized_for_execution", "executed", "failed"},
+    "authorized_for_execution":    {"executed", "failed"},
+    "executed":                    set(),
+    "failed":                      {"proposed"},
+    "expired":                     set(),
+    "rejected":                    set(),
+    "cancelled":                   set(),
+}
+
+
 def update_proposal_status(conn: sqlite3.Connection, proposal_id: str, status: str) -> None:
+    current = conn.execute("SELECT status FROM proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    if current:
+        current_status = current["status"]
+        legal = LEGAL_PROPOSAL_TRANSITIONS.get(current_status, set())
+        if status != current_status and status not in legal:
+            import sys
+            print(
+                f"[db] WARNING: illegal proposal transition {current_status} -> {status} for {proposal_id}",
+                file=sys.stderr,
+            )
     conn.execute(
         "UPDATE proposals SET status = ?, updated_at = ? WHERE proposal_id = ?",
         (status, utc_now_iso(), proposal_id),
@@ -759,8 +785,9 @@ def record_execution(conn: sqlite3.Connection, execution: Mapping[str, Any]) -> 
         INSERT INTO executions (
           proposal_id, mode, client_order_id, order_intent_json, requested_price, requested_size_usdc,
           max_slippage_bps, observed_worst_price, slippage_check_status, status, filled_size_usdc,
-          avg_fill_price, txhash_or_order_id, slippage_bps, error_message, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          avg_fill_price, txhash_or_order_id, slippage_bps, error_message, error_category,
+          submitted_at, filled_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["proposal_id"],
@@ -778,6 +805,9 @@ def record_execution(conn: sqlite3.Connection, execution: Mapping[str, Any]) -> 
             payload.get("txhash_or_order_id"),
             payload.get("slippage_bps"),
             payload.get("error_message"),
+            payload.get("error_category"),
+            payload.get("submitted_at"),
+            payload.get("filled_at"),
             payload["created_at"],
             payload["updated_at"],
         ),
@@ -793,9 +823,54 @@ def record_execution(conn: sqlite3.Connection, execution: Mapping[str, Any]) -> 
     result = row_to_dict(row) or {}
     if result.get("order_intent_json"):
         result["order_intent_json"] = _json_loads_if_present(result["order_intent_json"])
+    # Position sync is decoupled: commit execution first, then attempt sync.
+    # If sync fails, the reconciler will heal the orphaned execution.
     if result.get("id") and result.get("status") in {"filled", "submitted", "live"}:
-        _sync_position_for_execution(conn, int(result["id"]))
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            _sync_position_for_execution(conn, int(result["id"]))
+        except Exception:
+            import sys
+            print(f"[db] WARNING: position sync failed for execution {result['id']}, reconciler will heal", file=sys.stderr)
+    # Record execution event for audit trail
+    if result.get("id"):
+        try:
+            record_execution_event(conn, {
+                "execution_id": int(result["id"]),
+                "from_status": None,
+                "to_status": result.get("status", "unknown"),
+                "trigger": "record_execution",
+                "payload_json": {"mode": payload.get("mode"), "error_category": payload.get("error_category")},
+            })
+        except Exception:
+            pass
     return result
+
+
+def record_execution_event(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Append-only audit trail for execution state transitions."""
+    conn.execute(
+        """
+        INSERT INTO execution_events (execution_id, from_status, to_status, trigger, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["execution_id"],
+            payload.get("from_status"),
+            payload["to_status"],
+            payload.get("trigger"),
+            json.dumps(payload.get("payload_json", {}), sort_keys=False),
+            payload.get("created_at", utc_now_iso()),
+        ),
+    )
+    row = conn.execute("SELECT * FROM execution_events WHERE id = last_insert_rowid()").fetchone()
+    item = row_to_dict(row) or {}
+    if item.get("payload_json"):
+        item["payload_json"] = _json_loads_if_present(item["payload_json"])
+    return item
 
 
 def update_execution(conn: sqlite3.Connection, execution_id: int, fields: Mapping[str, Any]) -> Dict[str, Any]:

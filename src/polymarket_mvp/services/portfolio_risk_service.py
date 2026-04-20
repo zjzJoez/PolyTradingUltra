@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
-from ..common import get_env_float, parse_iso8601, utc_now_iso
+from ..common import get_env_float, get_env_int, parse_iso8601, utc_now_iso
 
 
 def _active_exposure(conn, *, topic: str | None, event_cluster_id: int | None, strategy_name: str | None) -> Dict[str, float]:
@@ -95,6 +95,56 @@ def _pending_market_outcome_entries(conn, *, market_id: str | None, outcome: str
     return int(row[0] if row else 0)
 
 
+def _portfolio_daily_gross(conn) -> float:
+    """Total non-failed execution spend today across all strategies."""
+    today = parse_iso8601(utc_now_iso()).date().isoformat()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(e.requested_size_usdc), 0)
+        FROM executions e
+        WHERE substr(e.created_at, 1, 10) = ? AND e.status NOT IN ('failed')
+        """,
+        (today,),
+    ).fetchone()
+    return float(row[0] if row else 0.0)
+
+
+def _total_open_positions(conn) -> int:
+    """Count all open positions across strategies."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM positions WHERE status IN ('open', 'open_requested', 'partially_filled')"
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def check_drawdown_breaker(conn) -> Dict[str, Any]:
+    """Check portfolio drawdown from peak. Returns breaker status."""
+    max_drawdown = get_env_float("POLY_MAX_DRAWDOWN_USDC", 30.0)
+    # Sum all realized PnL
+    row = conn.execute(
+        "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions WHERE status = 'resolved'"
+    ).fetchone()
+    realized = float(row[0] if row else 0.0)
+    # Sum unrealized PnL from open positions
+    row2 = conn.execute(
+        "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions WHERE status IN ('open', 'partially_filled')"
+    ).fetchone()
+    unrealized = float(row2[0] if row2 else 0.0)
+    total_pnl = realized + unrealized
+    # Approximate peak: use the max of (realized PnL at any point)
+    # Since we don't track historical peaks, use 0 as baseline (initial capital)
+    drawdown = max(0.0, -total_pnl) if total_pnl < 0 else 0.0
+    breaker_active = drawdown >= max_drawdown
+    return {
+        "breaker_active": breaker_active,
+        "drawdown_usdc": drawdown,
+        "max_drawdown_usdc": max_drawdown,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "total_pnl": total_pnl,
+    }
+
+
 def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
     proposal = record["proposal_json"]
     exposures = _active_exposure(
@@ -106,6 +156,8 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
     topic_limit = get_env_float("POLY_RISK_MAX_TOPIC_EXPOSURE_USDC", 25.0)
     cluster_limit = get_env_float("POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC", 25.0)
     strategy_daily_limit = get_env_float("POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC", 100.0)
+    portfolio_daily_limit = get_env_float("POLY_RISK_MAX_DAILY_GROSS_USDC", 100.0)
+    max_open_positions = get_env_int("POLY_RISK_MAX_OPEN_POSITIONS", 10)
     exact_market_outcome_exposure = _active_market_outcome_exposure(
         conn,
         market_id=record.get("market_id") or proposal.get("market_id"),
@@ -120,7 +172,13 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
     projected_topic = exposures["topic_exposure_usdc"] + float(proposal["recommended_size_usdc"])
     projected_cluster = exposures["cluster_exposure_usdc"] + float(proposal["recommended_size_usdc"])
     projected_strategy_daily = _strategy_daily_gross(conn, record.get("strategy_name")) + float(proposal["recommended_size_usdc"])
+    projected_portfolio_daily = _portfolio_daily_gross(conn) + float(proposal["recommended_size_usdc"])
+    current_open_positions = _total_open_positions(conn)
     reasons: list[str] = []
+    # Drawdown circuit breaker
+    drawdown = check_drawdown_breaker(conn)
+    if drawdown["breaker_active"]:
+        reasons.append(f"drawdown_breaker_active[dd={drawdown['drawdown_usdc']:.2f}]")
     if record.get("proposal_kind") != "exit" and exact_market_outcome_exposure > 0:
         reasons.append("market_outcome_exposure_exists")
     if record.get("proposal_kind") != "exit" and pending_market_outcome_entries > 0:
@@ -131,6 +189,12 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
         reasons.append("cluster_exposure_limit_exceeded")
     if record.get("strategy_name") and projected_strategy_daily > strategy_daily_limit:
         reasons.append("strategy_daily_gross_limit_exceeded")
+    # Portfolio-level daily gross cap
+    if projected_portfolio_daily > portfolio_daily_limit:
+        reasons.append("portfolio_daily_gross_limit_exceeded")
+    # Portfolio-level open position cap
+    if record.get("proposal_kind") != "exit" and current_open_positions >= max_open_positions:
+        reasons.append("max_open_positions_reached")
     return {
         "approved": not reasons,
         "reasons": reasons,
@@ -138,6 +202,8 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
             "topic_limit_usdc": topic_limit,
             "cluster_limit_usdc": cluster_limit,
             "strategy_daily_gross_limit_usdc": strategy_daily_limit,
+            "portfolio_daily_gross_limit_usdc": portfolio_daily_limit,
+            "max_open_positions": max_open_positions,
         },
         "current_exposures": exposures,
         "market_outcome": {
@@ -148,5 +214,8 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
             "topic_exposure_usdc": projected_topic,
             "cluster_exposure_usdc": projected_cluster,
             "strategy_daily_gross_usdc": projected_strategy_daily,
+            "portfolio_daily_gross_usdc": projected_portfolio_daily,
         },
+        "drawdown": drawdown,
+        "open_positions": current_open_positions,
     }

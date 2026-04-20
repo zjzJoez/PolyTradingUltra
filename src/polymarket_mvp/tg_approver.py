@@ -48,818 +48,1003 @@ load_repo_env()
 
 
 OPS_DASHBOARD_TEMPLATE = """
+
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Polymarket Ops</title>
+  <title>Polymarket OS · Trading Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     :root {
-      --bg: #f3efe6;
-      --bg-accent: #e6dfd2;
-      --panel: rgba(255, 252, 247, 0.92);
-      --panel-2: #f7f1e8;
-      --border: #d7cbb8;
-      --border-strong: #bfae95;
-      --text: #1f1b16;
-      --muted: #6b6256;
-      --accent: #0b5fff;
-      --good: #0f8a5f;
-      --warn: #b57617;
-      --bad: #c53c4c;
-      --shadow: 0 18px 40px rgba(81, 57, 24, 0.08);
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface-2: #21262d;
+      --surface-3: #2d333b;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --green: #00ff88;
+      --green-dim: #0f8a5f;
+      --red: #ff4444;
+      --red-dim: #c53c4c;
+      --blue: #58a6ff;
+      --amber: #f0a832;
+      --purple: #bc8cff;
+      --text: #e6edf3;
+      --muted: #7d8590;
+      --muted-2: #545b64;
     }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background:
-        radial-gradient(circle at top left, rgba(255,255,255,0.8), transparent 28%),
-        radial-gradient(circle at top right, rgba(214,194,160,0.35), transparent 32%),
-        linear-gradient(180deg, var(--bg) 0%, var(--bg-accent) 100%);
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: var(--bg);
       color: var(--text);
-      font: 14px/1.5 "SF Mono", "IBM Plex Mono", Menlo, Monaco, Consolas, monospace;
+      font: 13px/1.5 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .page { max-width: 1580px; margin: 0 auto; padding: 24px; }
-    .header {
-      display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.8fr);
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-    .hero, .meta-card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      box-shadow: var(--shadow);
-    }
-    .hero {
-      padding: 22px;
+    body {
       background:
-        linear-gradient(135deg, rgba(255,255,255,0.88), rgba(246,239,228,0.92)),
-        var(--panel);
+        radial-gradient(ellipse at top left, rgba(88,166,255,0.04), transparent 45%),
+        radial-gradient(ellipse at top right, rgba(0,255,136,0.03), transparent 45%),
+        var(--bg);
+      min-height: 100vh;
     }
-    .meta-card {
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 14px;
-    }
-    .eyebrow {
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      font-size: 11px;
-      color: var(--muted);
-      margin-bottom: 10px;
-    }
-    .title h1 { margin: 0 0 8px; font-size: 34px; line-height: 1.1; }
-    .title p, .meta { margin: 0; color: var(--muted); }
-    .hero-metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 18px;
-    }
-    /* ── Portfolio banner ── */
-    .portfolio-banner {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-    .port-card {
-      background: linear-gradient(135deg, rgba(255,255,255,0.92), rgba(246,239,228,0.95));
+    .mono { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); }
+    .muted-2 { color: var(--muted-2); }
+    .green { color: var(--green); }
+    .red { color: var(--red); }
+    .blue { color: var(--blue); }
+    .amber { color: var(--amber); }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .page { max-width: 1800px; margin: 0 auto; padding: 14px 18px 28px; }
+
+    /* HEADER */
+    .header {
+      display: flex; align-items: center; gap: 14px;
+      padding: 10px 16px;
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 20px 22px;
-      box-shadow: var(--shadow);
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .port-card .port-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--muted);
-    }
-    .port-card .port-value {
-      font-size: 32px;
-      font-weight: 800;
-      line-height: 1.15;
-      letter-spacing: -0.02em;
-    }
-    .port-card .port-sub {
-      font-size: 12px;
-      color: var(--muted);
-      margin-top: 2px;
-    }
-    .port-card.highlight {
-      background: linear-gradient(135deg, #0b5fff0a, #0b5fff08), linear-gradient(135deg, rgba(255,255,255,0.92), rgba(246,239,228,0.95));
-      border-color: rgba(11,95,255,0.25);
-    }
-    .port-card .port-value.green { color: var(--good); }
-    .port-card .port-value.red { color: var(--bad); }
-    .port-card .port-value.yellow { color: var(--warn); }
-    .port-tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      border-radius: 6px;
-      padding: 2px 7px;
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .port-tag.green { background: rgba(15,138,95,0.1); color: var(--good); }
-    .port-tag.red { background: rgba(197,60,76,0.1); color: var(--bad); }
-    .port-tag.neutral { background: rgba(107,98,86,0.1); color: var(--muted); }
-    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
-    .panel {
-      background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.52)), var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 16px;
-      min-height: 120px;
-      box-shadow: var(--shadow);
-    }
-    .panel-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
+      border-radius: 10px;
       margin-bottom: 12px;
     }
-    .panel h2 { margin: 0; font-size: 15px; }
-    .panel-copy { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
-    .span-12 { grid-column: span 12; }
-    .span-8 { grid-column: span 8; }
-    .span-6 { grid-column: span 6; }
-    .span-4 { grid-column: span 4; }
-    .span-3 { grid-column: span 3; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
-    .card {
-      background: var(--panel-2);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px;
-      min-width: 0;
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: 0.04em; }
+    .brand .logo {
+      width: 26px; height: 26px; border-radius: 7px;
+      background: linear-gradient(135deg, var(--green), var(--blue));
+      display: grid; place-items: center; color: #000; font-weight: 800; font-size: 13px;
     }
-    .card .name {
-      color: var(--muted);
-      font-size: 11px;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+      animation: pulse 2s infinite;
+      box-shadow: 0 0 8px var(--green);
     }
+    .pulse-dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+    .pulse-dot.amber { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .header .sep { color: var(--muted-2); }
+    .header .clock { font-family: "JetBrains Mono", monospace; color: var(--muted); font-size: 12px; }
+    .header .grow { flex: 1; }
     .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      border-radius: 999px;
-      padding: 3px 9px;
-      font-size: 11px;
-      border: 1px solid currentColor;
-      background: rgba(255,255,255,0.55);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .green { color: var(--good); }
-    .yellow { color: var(--warn); }
-    .red { color: var(--bad); }
-    .metric { font-size: 24px; font-weight: 700; line-height: 1.1; }
-    .metric.small-metric { font-size: 18px; }
-    .metric-label { color: var(--muted); font-size: 12px; }
-    .table-shell {
-      overflow-x: auto;
+      padding: 4px 9px; border-radius: 6px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
       border: 1px solid var(--border);
-      border-radius: 14px;
-      background: rgba(255,255,255,0.42);
+      background: var(--surface-2);
+      text-transform: uppercase;
     }
-    table { width: 100%; border-collapse: collapse; min-width: 760px; }
-    th, td {
-      text-align: left;
-      padding: 10px 10px;
-      border-top: 1px solid var(--border);
-      vertical-align: top;
+    .badge.live { background: rgba(255,68,68,0.12); border-color: rgba(255,68,68,0.4); color: var(--red); }
+    .badge.mock { background: rgba(88,166,255,0.12); border-color: rgba(88,166,255,0.4); color: var(--blue); }
+    .badge.kill { background: rgba(240,168,50,0.14); border-color: rgba(240,168,50,0.5); color: var(--amber); }
+    .btn {
+      padding: 6px 12px; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--surface-2);
+      color: var(--text); font: 500 12px Inter, sans-serif;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .btn:hover { border-color: var(--border-strong); background: var(--surface-3); }
+    .btn.primary { background: var(--green); color: #000; border-color: var(--green); }
+    .btn.primary:hover { background: #4dffaa; }
+    .btn.danger { background: rgba(255,68,68,0.14); color: var(--red); border-color: rgba(255,68,68,0.4); }
+
+    /* ALERTS */
+    .alerts { display: none; margin-bottom: 12px; }
+    .alerts.has { display: block; }
+    .alert {
+      padding: 10px 14px; margin-bottom: 6px;
+      border-left: 3px solid var(--amber);
+      background: rgba(240,168,50,0.08);
+      border-radius: 0 8px 8px 0;
+      display: flex; gap: 10px; align-items: center;
+      font-size: 12px;
+    }
+    .alert.high { border-left-color: var(--red); background: rgba(255,68,68,0.08); }
+
+    /* KPI STRIP */
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 10px; margin-bottom: 12px;
+    }
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      position: relative; overflow: hidden;
+    }
+    .kpi::before {
+      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: var(--blue); opacity: 0.5;
+    }
+    .kpi.pnl-pos::before { background: var(--green); }
+    .kpi.pnl-neg::before { background: var(--red); }
+    .kpi .label {
+      font-size: 10px; color: var(--muted); letter-spacing: 0.1em;
+      text-transform: uppercase; font-weight: 600; margin-bottom: 6px;
+    }
+    .kpi .value {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 22px; font-weight: 700; letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+    .kpi .sub {
+      font-size: 11px; color: var(--muted); margin-top: 4px;
+    }
+    .kpi .bar {
+      height: 3px; border-radius: 2px; background: var(--surface-2);
+      margin-top: 6px; overflow: hidden;
+    }
+    .kpi .bar .fill {
+      height: 100%; background: var(--green); transition: width 0.5s ease;
+    }
+    @keyframes flashbg {
+      0% { background-color: rgba(88,166,255,0.25); }
+      100% { background-color: transparent; }
+    }
+    .flash { animation: flashbg 0.6s ease-out; }
+
+    /* CHARTS ROW */
+    .charts-row {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 10px; margin-bottom: 12px;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .panel-title {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 11px; color: var(--muted); letter-spacing: 0.08em;
+      text-transform: uppercase; font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .panel-title .count {
+      background: var(--surface-2); color: var(--text);
+      padding: 2px 8px; border-radius: 10px; font-size: 11px;
+      letter-spacing: 0; text-transform: none;
+    }
+    .chart-wrap { position: relative; height: 200px; }
+
+    /* HEALTH MATRIX */
+    .health-matrix {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 8px; margin-bottom: 12px;
+    }
+    .loop-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      position: relative;
+    }
+    .loop-card.green { border-color: rgba(0,255,136,0.3); }
+    .loop-card.amber { border-color: rgba(240,168,50,0.4); }
+    .loop-card.red { border-color: rgba(255,68,68,0.4); background: rgba(255,68,68,0.03); }
+    .loop-card .top {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .loop-card .name {
+      font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .loop-card .age { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--muted); }
+    .loop-card .items { font-family: "JetBrains Mono", monospace; font-size: 15px; font-weight: 700; }
+    .loop-card canvas { width: 100% !important; height: 24px !important; margin-top: 4px; }
+
+    /* LIVE PANELS */
+    .live-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px; margin-bottom: 12px;
+    }
+    .recent-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px; margin-bottom: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
     }
     th {
-      color: var(--muted);
-      font-weight: 600;
-      font-size: 11px;
+      text-align: left; padding: 6px 8px;
+      font-size: 10px; color: var(--muted); letter-spacing: 0.06em;
+      text-transform: uppercase; font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 8px; border-bottom: 1px solid var(--surface-2);
+      vertical-align: top;
+    }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    .market-cell { max-width: 260px; }
+    .market-cell .q {
+      display: block;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-weight: 500;
+    }
+    .market-cell .sub {
+      font-size: 10px; color: var(--muted); font-family: "JetBrains Mono", monospace;
+    }
+    .chip {
+      display: inline-block;
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+      background: var(--surface-2); border: 1px solid var(--border);
       text-transform: uppercase;
-      letter-spacing: 0.06em;
-      background: rgba(247,241,232,0.7);
-      position: sticky;
-      top: 0;
-      z-index: 1;
     }
-    tbody tr:hover { background: rgba(255,255,255,0.38); }
-    .empty { color: var(--muted); padding: 10px 0; }
-    .attention-item {
-      padding: 10px 0;
-      border-top: 1px solid var(--border);
+    .chip.green { color: var(--green); border-color: rgba(0,255,136,0.3); background: rgba(0,255,136,0.08); }
+    .chip.red { color: var(--red); border-color: rgba(255,68,68,0.3); background: rgba(255,68,68,0.08); }
+    .chip.amber { color: var(--amber); border-color: rgba(240,168,50,0.3); background: rgba(240,168,50,0.08); }
+    .chip.blue { color: var(--blue); border-color: rgba(88,166,255,0.3); background: rgba(88,166,255,0.08); }
+    .countdown { font-family: "JetBrains Mono", monospace; font-weight: 600; }
+    .countdown.warn { color: var(--amber); }
+    .countdown.urgent { color: var(--red); }
+    .empty {
+      padding: 24px; text-align: center; color: var(--muted-2);
+      font-size: 12px;
     }
-    .attention-item:first-child { border-top: 0; padding-top: 0; }
-    .attention-title { font-weight: 700; margin-bottom: 4px; }
-    .small { font-size: 12px; color: var(--muted); }
-    .tiny { font-size: 11px; color: var(--muted); }
-    .mono { font-variant-ligatures: none; }
-    .mono-wrap {
-      font-variant-ligatures: none;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .truncate-2 {
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-    }
-    .cell-stack { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-    .cell-main { font-weight: 600; overflow-wrap: anywhere; }
-    .cell-sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .table-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-    .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-    .pill {
+
+    /* CONTROLS DRAWER */
+    .drawer {
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 4px 8px;
-      color: var(--muted);
-      background: rgba(255,255,255,0.6);
-      min-width: 0;
-      overflow-wrap: anywhere;
+      border-radius: 10px;
+      padding: 14px; margin-bottom: 12px;
+      display: none;
     }
-    .status-chip {
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--border-strong);
-      border-radius: 999px;
-      padding: 4px 9px;
-      font-size: 11px;
-      background: rgba(255,255,255,0.58);
-      color: var(--text);
+    .drawer.open { display: block; }
+    .drawer .actions { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+
+    /* FOOTER */
+    footer {
+      padding: 12px 0; font-size: 11px; color: var(--muted);
+      display: flex; justify-content: space-between; align-items: center;
     }
-    .muted-block {
-      border: 1px dashed var(--border-strong);
-      border-radius: 14px;
-      padding: 12px;
-      background: rgba(255,255,255,0.45);
-    }
-    .control-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 12px;
-    }
-    .control-button {
-      appearance: none;
-      border: 1px solid var(--border-strong);
-      border-radius: 12px;
-      padding: 10px 14px;
-      background: rgba(255,255,255,0.72);
-      color: var(--text);
-      font: inherit;
-      cursor: pointer;
-    }
-    .control-button:hover { background: rgba(255,255,255,0.92); }
-    .control-button.red {
-      border-color: rgba(197, 60, 76, 0.45);
-      color: var(--bad);
-    }
-    .control-button.yellow {
-      border-color: rgba(181, 118, 23, 0.45);
-      color: var(--warn);
-    }
-    .control-log {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(255,255,255,0.48);
-      min-height: 42px;
-    }
-    .section-kpis {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
-    }
-    @media (max-width: 1100px) {
-      .span-8, .span-6, .span-4, .span-3 { grid-column: span 12; }
-      .header { grid-template-columns: 1fr; }
-      .hero-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .meta { margin-top: 10px; }
-    }
-    @media (max-width: 720px) {
-      .page { padding: 16px; }
-      .hero { padding: 18px; }
-      .hero-metrics { grid-template-columns: 1fr; }
-      table { min-width: 640px; }
+
+    /* SCROLLBAR */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+    @media (max-width: 1400px) {
+      .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+      .health-matrix { grid-template-columns: repeat(4, 1fr); }
+      .charts-row { grid-template-columns: 1fr; }
+      .live-row { grid-template-columns: 1fr; }
+      .recent-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <div id="portfolio-banner" class="portfolio-banner"></div>
-
+    <!-- HEADER -->
     <div class="header">
-      <div class="hero">
-        <div class="eyebrow">Ops Console</div>
-        <div class="title">
-        <h1>Polymarket Ops</h1>
-          <p id="header-meta">Loading...</p>
-        </div>
-        <div id="hero-metrics" class="hero-metrics"></div>
+      <div class="brand">
+        <div class="logo">P</div>
+        <span>POLYMARKET OS</span>
       </div>
-      <div class="meta-card">
-        <div>
-          <div class="eyebrow">System</div>
-          <div class="metric small-metric" id="snapshot-status">Loading...</div>
-        </div>
-        <div class="muted-block">
-          <div class="tiny">Dashboard</div>
-          <div class="small">Auto-refreshes every 5 s.</div>
-        </div>
+      <span class="pulse-dot" id="status-dot"></span>
+      <span class="muted mono" id="status-text">connecting</span>
+      <span class="sep">·</span>
+      <span class="clock mono" id="utc-clock">--:--:-- UTC</span>
+      <span class="grow"></span>
+      <span class="badge mock" id="mode-badge">MOCK</span>
+      <span class="badge kill" id="kill-badge" style="display:none">⛔ KILL SWITCH</span>
+      <button class="btn" onclick="toggleDrawer()" id="drawer-btn">⚙ Controls</button>
+    </div>
+
+    <!-- ALERTS -->
+    <div class="alerts" id="alerts"></div>
+
+    <!-- KPI STRIP -->
+    <div class="kpi-strip" id="kpi-strip">
+      <div class="kpi" id="kpi-pnl">
+        <div class="label">Net P&L</div>
+        <div class="value mono" id="kpi-pnl-val">$0.00</div>
+        <div class="sub"><span id="kpi-pnl-realized">+$0</span> realized · <span id="kpi-pnl-unrealized">+$0</span> unrealized</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Win Rate</div>
+        <div class="value mono" id="kpi-winrate">—</div>
+        <div class="sub"><span id="kpi-wins">0</span>W / <span id="kpi-losses">0</span>L · <span id="kpi-resolved">0</span> resolved</div>
+        <div class="bar"><div class="fill" id="kpi-winrate-bar" style="width: 0%"></div></div>
+      </div>
+      <div class="kpi">
+        <div class="label">Open Positions</div>
+        <div class="value mono" id="kpi-open">0</div>
+        <div class="sub"><span id="kpi-pending">0</span> pending · <span id="kpi-live">0</span> live orders</div>
+      </div>
+      <div class="kpi">
+        <div class="label">USDC Balance</div>
+        <div class="value mono" id="kpi-balance">—</div>
+        <div class="sub">NAV <span id="kpi-nav" class="mono">—</span></div>
+      </div>
+      <div class="kpi">
+        <div class="label">Exposure</div>
+        <div class="value mono" id="kpi-exposure">$0.00</div>
+        <div class="sub"><span id="kpi-unredeemed">$0</span> unredeemed</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Guardrails</div>
+        <div class="value mono" id="kpi-kill">0</div>
+        <div class="sub"><span id="kpi-failures">0</span> recent failures</div>
       </div>
     </div>
 
-    <div class="grid">
-      <section class="panel span-4">
-        <div class="panel-head">
-          <div>
-            <h2>Needs Attention</h2>
-            <p class="panel-copy">Most urgent operational items.</p>
-          </div>
+    <!-- CHARTS ROW -->
+    <div class="charts-row">
+      <div class="panel">
+        <div class="panel-title">
+          <span>📈 Cumulative PnL</span>
+          <span class="count mono" id="pnl-chart-hdr">$0.00</span>
         </div>
-        <div id="needs-attention"></div>
-      </section>
-
-      <section class="panel span-8">
-        <div class="panel-head">
-          <div>
-            <h2>Control State</h2>
-            <p class="panel-copy">Current agent binding, loop cadence, and kill switches.</p>
-          </div>
+        <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">
+          <span>🎯 Proposal Funnel</span>
+          <span class="count mono" id="funnel-total">0</span>
         </div>
-        <div id="control-state"></div>
-        <div class="control-actions">
-          <button class="control-button" data-action="start_system">Start System</button>
-          <button class="control-button yellow" data-action="restart_system">Restart System</button>
-          <button class="control-button red" data-action="stop_system">Stop System</button>
-        </div>
-        <div id="control-log" class="control-log small">Launchd control for `autopilot` and `tg-webhook`.</div>
-      </section>
-
-      <section class="panel span-12">
-        <div class="panel-head">
-          <div>
-            <h2>System Health</h2>
-            <p class="panel-copy">Heartbeat age, loop duration, and latest top-level errors.</p>
-          </div>
-        </div>
-        <div id="system-health" class="cards"></div>
-      </section>
-
-      <section class="panel span-12">
-        <div class="panel-head">
-          <div>
-            <h2>Pending Approvals</h2>
-            <p class="panel-copy">Human decisions waiting in Telegram, sorted by urgency.</p>
-          </div>
-        </div>
-        <div id="pending-approvals"></div>
-      </section>
-
-      <section class="panel span-6">
-        <div class="panel-head">
-          <div>
-            <h2>Live Orders</h2>
-            <p class="panel-copy">Submitted or working orders with age and remaining TTL.</p>
-          </div>
-        </div>
-        <div id="live-orders"></div>
-      </section>
-
-      <section class="panel span-6">
-        <div class="panel-head">
-          <div>
-            <h2>Recent Decisions</h2>
-            <p class="panel-copy">Latest proposal outcomes and why they landed there.</p>
-          </div>
-        </div>
-        <div id="recent-decisions"></div>
-      </section>
-
-      <section class="panel span-12">
-        <div class="panel-head">
-          <div>
-            <h2>Open Positions</h2>
-            <p class="panel-copy">Current inventory with entry, mark, and PnL.</p>
-          </div>
-        </div>
-        <div id="open-positions"></div>
-      </section>
-
-      <section class="panel span-12">
-        <div class="panel-head">
-          <div>
-            <h2>Resolved Positions</h2>
-            <p class="panel-copy">Completed trades with final P&L.</p>
-          </div>
-        </div>
-        <div id="resolved-positions"></div>
-      </section>
-
-      <section class="panel span-6">
-        <div class="panel-head">
-          <div>
-            <h2>Recent Failures</h2>
-            <p class="panel-copy">Recent execution, reconcile, risk, heartbeat, or Telegram failures.</p>
-          </div>
-        </div>
-        <div id="recent-failures"></div>
-      </section>
-
-      <section class="panel span-6">
-        <div class="panel-head">
-          <div>
-            <h2>Recent Events</h2>
-            <p class="panel-copy">Raw operational events for quick spot checks.</p>
-          </div>
-        </div>
-        <div id="recent-events"></div>
-      </section>
+        <div class="chart-wrap"><canvas id="funnel-chart"></canvas></div>
+      </div>
     </div>
+
+    <!-- HEALTH MATRIX -->
+    <div class="section-header"><span class="section-title">⚙ System Health</span></div>
+    <div class="health-matrix" id="health-matrix"></div>
+
+    <!-- LIVE PANELS -->
+    <div class="live-row">
+      <div class="panel">
+        <div class="panel-title"><span>⏳ Pending Approvals</span><span class="count" id="pending-count">0</span></div>
+        <div id="pending-body"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span>⚡ Live Orders</span><span class="count" id="live-count">0</span></div>
+        <div id="live-body"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span>📊 Open Positions</span><span class="count" id="open-count">0</span></div>
+        <div id="open-body"></div>
+      </div>
+    </div>
+
+    <!-- RECENT ROW -->
+    <div class="recent-row">
+      <div class="panel">
+        <div class="panel-title"><span>✅ Resolved Positions</span><span class="count" id="resolved-count">0</span></div>
+        <div id="resolved-body"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span>⚠ Recent Failures</span><span class="count" id="failures-count">0</span></div>
+        <div id="failures-body"></div>
+      </div>
+    </div>
+
+    <!-- CONTROLS DRAWER -->
+    <div class="drawer" id="drawer">
+      <div class="panel-title"><span>⚙ System Controls</span><span class="muted mono" id="drawer-mode">mode: mock</span></div>
+      <div class="actions">
+        <button class="btn primary" onclick="sysCtl('start')">▶ Start</button>
+        <button class="btn" onclick="sysCtl('restart')">↻ Restart</button>
+        <button class="btn danger" onclick="sysCtl('stop')">⏹ Stop</button>
+        <a class="btn" href="/api/ops/status" target="_blank">📄 Raw Snapshot</a>
+        <a class="btn" href="http://localhost:8788/" target="_blank">🎛 Control Plane</a>
+      </div>
+      <div class="mono muted-2" id="drawer-log" style="font-size:11px"></div>
+    </div>
+
+    <footer>
+      <span>Last refresh: <span class="mono" id="last-refresh">—</span> · 3s cadence</span>
+      <span class="muted-2">Polymarket OS v0.6 · <span id="uptime-label">uptime —</span></span>
+    </footer>
   </div>
 
   <script id="initial-ops-data" type="application/json">{{ initial_json|safe }}</script>
   <script>
-    const initial = JSON.parse(document.getElementById("initial-ops-data").textContent);
+    // ============================================================
+    // STATE
+    // ============================================================
+    let lastSnapshot = null;
+    let pnlChart = null, funnelChart = null;
+    let sparklineCharts = {};
+    let countdownState = {}; // key -> {expiresAt: ms-epoch, el: element, urgent: bool}
+    const LOOP_NAMES = ["scan","context","propose","expiry","execute","reconcile","exit","review"];
 
-    function fmtRelative(seconds) {
-      if (seconds === null || seconds === undefined) return "n/a";
-      const abs = Math.abs(seconds);
-      if (abs < 60) return `${seconds}s`;
-      if (abs < 3600) return `${Math.round(seconds / 60)}m`;
-      if (abs < 86400) return `${Math.round(seconds / 3600)}h`;
-      return `${Math.round(seconds / 86400)}d`;
+    // ============================================================
+    // FORMATTERS
+    // ============================================================
+    const fmtMoney = (v) => {
+      if (v == null || isNaN(v)) return "—";
+      const n = Number(v);
+      const sign = n < 0 ? "-" : "";
+      const abs = Math.abs(n);
+      return sign + "$" + abs.toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    };
+    const fmtSigned = (v) => {
+      if (v == null || isNaN(v)) return "—";
+      const n = Number(v);
+      const sign = n >= 0 ? "+" : "-";
+      const abs = Math.abs(n);
+      return sign + "$" + abs.toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    };
+    const fmtPct = (v, digits=1) => {
+      if (v == null || isNaN(v)) return "—";
+      return Number(v).toFixed(digits) + "%";
+    };
+    const fmtAge = (s) => {
+      if (s == null) return "—";
+      s = Math.max(0, Math.floor(s));
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s/60) + "m";
+      if (s < 86400) return Math.floor(s/3600) + "h";
+      return Math.floor(s/86400) + "d";
+    };
+    const fmtCountdown = (s) => {
+      if (s == null) return "—";
+      const neg = s < 0;
+      s = Math.abs(Math.floor(s));
+      const m = Math.floor(s/60);
+      const sec = s % 60;
+      return (neg?"-":"") + m + ":" + String(sec).padStart(2,"0");
+    };
+    const escHtml = (s) => {
+      if (s == null) return "";
+      return String(s)
+        .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+        .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+    };
+    const pnlClass = (v) => v == null ? "" : (v > 0.005 ? "green" : (v < -0.005 ? "red" : "muted"));
+
+    // ============================================================
+    // CLOCK
+    // ============================================================
+    function tickClock() {
+      const d = new Date();
+      const s = d.toISOString().substr(11,8);
+      document.getElementById("utc-clock").textContent = s + " UTC";
+    }
+    setInterval(tickClock, 1000); tickClock();
+
+    // ============================================================
+    // COUNTDOWN TIMERS (local tick)
+    // ============================================================
+    function tickCountdowns() {
+      const now = Date.now();
+      Object.values(countdownState).forEach(c => {
+        if (!c.el || !document.body.contains(c.el)) return;
+        const remaining = Math.floor((c.expiresAt - now) / 1000);
+        c.el.textContent = fmtCountdown(remaining);
+        c.el.classList.remove("warn","urgent");
+        if (remaining < 0) c.el.classList.add("urgent");
+        else if (remaining < 30) c.el.classList.add("warn");
+      });
+    }
+    setInterval(tickCountdowns, 1000);
+
+    // ============================================================
+    // CHART INIT
+    // ============================================================
+    function createGradient(ctx, color) {
+      const h = ctx.canvas.parentNode.clientHeight || 200;
+      const gr = ctx.createLinearGradient(0, 0, 0, h);
+      gr.addColorStop(0, color + "44");
+      gr.addColorStop(1, color + "00");
+      return gr;
     }
 
-    function fmtTimestamp(value) {
-      if (!value) return "n/a";
-      const parsed = new Date(value);
-      if (Number.isNaN(parsed.getTime())) return escapeHtml(String(value));
-      return escapeHtml(parsed.toLocaleString());
+    function initCharts() {
+      Chart.defaults.font.family = "'Inter', sans-serif";
+      Chart.defaults.color = "#7d8590";
+      Chart.defaults.borderColor = "#30363d";
+
+      // PnL
+      const pnlCtx = document.getElementById("pnl-chart").getContext("2d");
+      pnlChart = new Chart(pnlCtx, {
+        type: "line",
+        data: { labels: [], datasets: [{
+          label: "Cumulative PnL",
+          data: [],
+          borderColor: "#00ff88",
+          backgroundColor: createGradient(pnlCtx, "#00ff88"),
+          fill: true,
+          tension: 0.35,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHoverBackgroundColor: "#00ff88",
+          borderWidth: 2,
+        }]},
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: "index", intersect: false },
+          scales: {
+            x: { grid: { display: false }, ticks: { maxTicksLimit: 7, font: {size: 10}, color: "#7d8590" } },
+            y: {
+              grid: { color: "rgba(255,255,255,0.04)" },
+              ticks: {
+                font: {family: "JetBrains Mono", size: 10},
+                color: "#7d8590",
+                callback: (v) => "$" + Number(v).toFixed(0)
+              }
+            }
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "#21262d",
+              borderColor: "#30363d", borderWidth: 1,
+              titleColor: "#e6edf3", bodyColor: "#e6edf3",
+              titleFont: {family: "JetBrains Mono", size: 11},
+              bodyFont: {family: "JetBrains Mono", size: 12},
+              padding: 10,
+              callbacks: {
+                label: (ctx) => "  " + fmtSigned(ctx.parsed.y)
+              }
+            }
+          }
+        }
+      });
+
+      // Funnel
+      const funnelCtx = document.getElementById("funnel-chart").getContext("2d");
+      funnelChart = new Chart(funnelCtx, {
+        type: "bar",
+        data: {
+          labels: ["Proposed","Risk Blocked","Pending/Approved","Executed"],
+          datasets: [{
+            data: [0,0,0,0],
+            backgroundColor: ["#58a6ff","#ff4444","#f0a832","#00ff88"],
+            borderRadius: 4,
+            barThickness: 22,
+          }]
+        },
+        options: {
+          indexAxis: "y",
+          responsive: true, maintainAspectRatio: false,
+          animation: false,
+          scales: {
+            x: {
+              grid: { color: "rgba(255,255,255,0.04)" },
+              ticks: { font: {family: "JetBrains Mono", size: 10}, color: "#7d8590" }
+            },
+            y: {
+              grid: { display: false },
+              ticks: { font: {size: 11, weight: "600"}, color: "#e6edf3" }
+            }
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "#21262d",
+              borderColor: "#30363d", borderWidth: 1,
+              callbacks: {
+                label: (ctx) => {
+                  const total = ctx.chart.data.datasets[0].data[0] || 1;
+                  const v = ctx.parsed.x;
+                  return "  " + v + " (" + ((v/total)*100).toFixed(1) + "%)";
+                }
+              }
+            }
+          }
+        }
+      });
+
+      // Sparklines
+      LOOP_NAMES.forEach(name => {
+        const canvas = document.getElementById("spark-"+name);
+        if (!canvas) return;
+        sparklineCharts[name] = new Chart(canvas.getContext("2d"), {
+          type: "line",
+          data: { labels: Array(20).fill(""), datasets: [{
+            data: Array(20).fill(0),
+            borderColor: "#58a6ff",
+            borderWidth: 1.5,
+            fill: false,
+            pointRadius: 0,
+            tension: 0.3,
+          }]},
+          options: {
+            responsive: false, maintainAspectRatio: false,
+            animation: false,
+            scales: { x: { display: false }, y: { display: false } },
+            plugins: { legend: { display: false }, tooltip: { enabled: false } }
+          }
+        });
+      });
     }
 
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#39;");
+    // ============================================================
+    // RENDERERS
+    // ============================================================
+    function renderSnapshot(snap) {
+      if (!snap) return;
+      lastSnapshot = snap;
+      renderHeader(snap);
+      renderAlerts(snap);
+      renderKPIs(snap);
+      renderHealth(snap);
+      renderPending(snap);
+      renderLiveOrders(snap);
+      renderOpen(snap);
+      renderResolved(snap);
+      renderFailures(snap);
+      const ts = snap.timestamp || new Date().toISOString();
+      document.getElementById("last-refresh").textContent = ts.substr(11,8);
     }
 
-    function escapeAttr(value) {
-      return escapeHtml(value);
+    function renderHeader(snap) {
+      const health = snap.system_health || [];
+      const redCount = health.filter(h => h.health === "red").length;
+      const amberCount = health.filter(h => h.health === "yellow" || h.health === "amber").length;
+      const dot = document.getElementById("status-dot");
+      const txt = document.getElementById("status-text");
+      dot.classList.remove("red","amber");
+      if (redCount > 0) { dot.classList.add("red"); txt.textContent = redCount + " loops down"; }
+      else if (amberCount > 0) { dot.classList.add("amber"); txt.textContent = amberCount + " loops lagging"; }
+      else { txt.textContent = "all systems operational"; }
+
+      const mode = (snap.control_state && snap.control_state.tg_auto_execute_mode) || "mock";
+      const modeBadge = document.getElementById("mode-badge");
+      modeBadge.textContent = mode.toUpperCase();
+      modeBadge.classList.remove("live","mock");
+      modeBadge.classList.add(mode === "real" ? "live" : "mock");
+      document.getElementById("drawer-mode").textContent = "mode: " + mode;
+
+      const kills = (snap.control_state && snap.control_state.kill_switches) || [];
+      const killBadge = document.getElementById("kill-badge");
+      if (kills.length > 0) { killBadge.style.display = ""; killBadge.textContent = "⛔ " + kills.length + " KILL"; }
+      else killBadge.style.display = "none";
     }
 
-    function toNumberOrNull(value) {
-      if (value === null || value === undefined || value === "") return null;
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : null;
+    function renderAlerts(snap) {
+      const items = snap.needs_attention || [];
+      const box = document.getElementById("alerts");
+      if (items.length === 0) { box.classList.remove("has"); box.innerHTML = ""; return; }
+      box.classList.add("has");
+      box.innerHTML = items.slice(0, 4).map(a => `
+        <div class="alert ${a.severity === "high" ? "high" : ""}">
+          <span>${a.severity === "high" ? "🔴" : "⚠"}</span>
+          <strong>${escHtml(a.title || a.kind)}</strong>
+          <span class="muted">${escHtml(a.detail || "")}</span>
+        </div>
+      `).join("");
     }
 
-    function fmtMoney(value) {
-      const parsed = toNumberOrNull(value);
-      return parsed === null ? "n/a" : `$${parsed.toFixed(2)}`;
-    }
+    function renderKPIs(snap) {
+      const p = snap.portfolio || {};
+      const pnl = Number(p.total_pnl || 0);
+      const pnlEl = document.getElementById("kpi-pnl");
+      pnlEl.classList.remove("pnl-pos","pnl-neg");
+      pnlEl.classList.add(pnl >= 0 ? "pnl-pos" : "pnl-neg");
+      const pnlVal = document.getElementById("kpi-pnl-val");
+      pnlVal.textContent = fmtSigned(pnl);
+      pnlVal.className = "value mono " + pnlClass(pnl);
+      document.getElementById("kpi-pnl-realized").textContent = fmtSigned(p.total_realized_pnl);
+      document.getElementById("kpi-pnl-unrealized").textContent = fmtSigned(p.total_unrealized_pnl);
 
-    function fmtSignedMoney(value) {
-      const parsed = toNumberOrNull(value);
-      if (parsed === null) return "n/a";
-      const sign = parsed > 0 ? "+" : "";
-      return `${sign}${parsed.toFixed(2)}`;
-    }
-
-    function fmtDecimal(value, digits = 2) {
-      const parsed = toNumberOrNull(value);
-      return parsed === null ? "n/a" : parsed.toFixed(digits);
-    }
-
-    function fmtPrice(value) {
-      const parsed = toNumberOrNull(value);
-      return parsed === null ? "n/a" : parsed.toFixed(3);
-    }
-
-    function toneClass(value, positiveGood = false) {
-      const parsed = toNumberOrNull(value);
-      if (parsed === null || parsed === 0) return "";
-      if (positiveGood) return parsed > 0 ? "green" : "red";
-      return parsed < 0 ? "red" : "yellow";
-    }
-
-    function statusTone(value) {
-      const normalized = String(value || "").toLowerCase();
-      if (!normalized) return "";
-      if (["approved", "filled", "open", "live", "submitted", "healthy", "green"].includes(normalized)) return "green";
-      if (["pending_approval", "partial_fill", "yellow"].includes(normalized)) return "yellow";
-      if (["failed", "error", "rejected", "expired", "risk_blocked", "red"].includes(normalized)) return "red";
-      return "";
-    }
-
-    function safeLink(url, label) {
-      if (!url) return escapeHtml(label);
-      return `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
-    }
-
-    function emptyState(message) {
-      return `<div class="empty">${escapeHtml(message)}</div>`;
-    }
-
-    function renderTable(columns, rows, emptyMessage = "No rows.") {
-      if (!rows.length) return emptyState(emptyMessage);
-      const head = `<tr>${columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
-      const body = rows.map(row => `<tr>${columns.map(c => `<td>${c.render(row)}</td>`).join("")}</tr>`).join("");
-      return `<div class="table-shell"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
-    }
-
-    function renderPortfolioBanner(data) {
-      const p = data.portfolio || {};
-      const bal = p.usdc_balance;
-      const nav = p.net_asset_value;
-      const pnl = p.total_pnl;
-      const pnlClass = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
-      const pnlSign = pnl > 0 ? "+" : "";
       const wr = p.win_rate;
-      const wrClass = wr >= 50 ? "green" : wr != null ? "red" : "";
-      const negRisk = p.neg_risk_unredeemed_usdc || 0;
-      return `
-        <div class="port-card highlight">
-          <div class="port-label">Net Asset Value</div>
-          <div class="port-value">${nav != null ? "$" + nav.toFixed(2) : "..."}</div>
-          <div class="port-sub">
-            $${(bal || 0).toFixed(2)} cash
-            + $${(p.open_exposure_usdc || 0).toFixed(2)} in positions
-            ${negRisk > 0 ? `+ $${negRisk.toFixed(2)} pending claim` : ""}
+      document.getElementById("kpi-winrate").textContent = wr != null ? fmtPct(wr, 1) : "—";
+      document.getElementById("kpi-wins").textContent = p.wins || 0;
+      document.getElementById("kpi-losses").textContent = p.losses || 0;
+      document.getElementById("kpi-resolved").textContent = p.resolved_count || 0;
+      document.getElementById("kpi-winrate-bar").style.width = Math.max(0, Math.min(100, wr || 0)) + "%";
+
+      document.getElementById("kpi-open").textContent = p.open_count || 0;
+      document.getElementById("kpi-pending").textContent = snap.pending_count || 0;
+      document.getElementById("kpi-live").textContent = snap.live_order_count || 0;
+
+      document.getElementById("kpi-balance").textContent = p.usdc_balance != null ? fmtMoney(p.usdc_balance) : "—";
+      document.getElementById("kpi-nav").textContent = p.net_asset_value != null ? fmtMoney(p.net_asset_value) : "—";
+
+      document.getElementById("kpi-exposure").textContent = fmtMoney(p.open_exposure_usdc);
+      document.getElementById("kpi-unredeemed").textContent = fmtMoney(p.neg_risk_unredeemed_usdc || 0);
+
+      const kills = (snap.control_state && snap.control_state.kill_switches) || [];
+      document.getElementById("kpi-kill").textContent = kills.length;
+      document.getElementById("kpi-failures").textContent = (snap.recent_failures || []).length;
+    }
+
+    function renderHealth(snap) {
+      const container = document.getElementById("health-matrix");
+      const existing = new Set(LOOP_NAMES);
+      // Build once
+      if (container.children.length === 0) {
+        container.innerHTML = LOOP_NAMES.map(n => `
+          <div class="loop-card" id="loop-${n}">
+            <div class="top">
+              <span class="name">${n}</span>
+              <span class="pulse-dot" id="dot-${n}"></span>
+            </div>
+            <div class="items mono" id="items-${n}">—</div>
+            <div class="age mono" id="age-${n}">— ago</div>
+            <canvas id="spark-${n}" width="120" height="24"></canvas>
           </div>
-        </div>
-        <div class="port-card">
-          <div class="port-label">Total P&L</div>
-          <div class="port-value ${pnlClass}">${pnl != null ? pnlSign + "$" + Math.abs(pnl).toFixed(2) : "..."}</div>
-          <div class="port-sub">
-            <span class="port-tag green">R ${fmtSignedMoney(p.total_realized_pnl)}</span>
-            <span class="port-tag ${(p.total_unrealized_pnl||0) >= 0 ? 'green' : 'red'}">U ${fmtSignedMoney(p.total_unrealized_pnl)}</span>
-          </div>
-        </div>
-        <div class="port-card">
-          <div class="port-label">Win Rate</div>
-          <div class="port-value ${wrClass}">${wr != null ? wr.toFixed(0) + "%" : "n/a"}</div>
-          <div class="port-sub">${p.wins || 0}W ${p.losses || 0}L ${p.breakeven || 0}B of ${p.resolved_count || 0} resolved</div>
-        </div>
-        <div class="port-card">
-          <div class="port-label">Open Positions</div>
-          <div class="port-value">${p.open_count || 0}</div>
-          <div class="port-sub">
-            $${(p.open_exposure_usdc || 0).toFixed(2)} exposure
-            ${p.matic_balance != null ? "| " + p.matic_balance.toFixed(2) + " MATIC gas" : ""}
-          </div>
-        </div>
-      `;
-    }
-
-    function renderHeroMetrics(data) {
-      const metrics = [
-        { label: "Pending", value: data.pending_count || 0, tone: data.pending_count ? "yellow" : "green" },
-        { label: "Live Orders", value: data.live_order_count || 0, tone: data.live_order_count ? "yellow" : "green" },
-        { label: "Open Positions", value: data.open_position_count || 0, tone: data.open_position_count ? "yellow" : "green" },
-        { label: "Failures", value: (data.recent_failures || []).length, tone: (data.recent_failures || []).length ? "red" : "green" },
-      ];
-      return metrics.map(item => `
-        <div class="card">
-          <div class="name">${escapeHtml(item.label)}</div>
-          <div class="metric ${item.tone === "red" ? "red" : item.tone === "yellow" ? "yellow" : item.tone === "green" ? "green" : ""}">${escapeHtml(item.value)}</div>
-        </div>
-      `).join("");
-    }
-
-    function renderHealth(items) {
-      if (!items.length) return emptyState("No heartbeats yet.");
-      return items.map(item => `
-        <div class="card">
-          <div class="name">${escapeHtml(item.loop)}</div>
-          <div><span class="badge ${item.health}">${escapeHtml(item.health)}</span></div>
-          <div class="metric">${fmtRelative(item.age_seconds)}</div>
-          <div class="small">cadence ${fmtRelative(item.cadence_seconds)} | processed ${item.items_processed ?? 0}</div>
-          <div class="small">duration ${item.duration_seconds != null ? item.duration_seconds.toFixed(1) + "s" : "n/a"}</div>
-          ${item.last_error_text ? `<div class="small red truncate-2 mono-wrap">${escapeHtml(item.last_error_text.slice(0, 220))}</div>` : ""}
-        </div>
-      `).join("");
-    }
-
-    function renderAttention(items) {
-      if (!items.length) return emptyState("Nothing urgent.");
-      return items.slice(0, 10).map(item => `
-        <div class="attention-item">
-          <div class="attention-title ${item.severity === "high" ? "red" : "yellow"}">${escapeHtml(item.title || item.kind || "attention")}</div>
-          <div class="small">${escapeHtml(item.detail || item.message || "")}</div>
-          ${item.timestamp ? `<div class="small">${fmtTimestamp(item.timestamp)}</div>` : ""}
-        </div>
-      `).join("");
-    }
-
-    function renderControlState(control) {
-      const kill = (control.kill_switches || []).length
-        ? renderTable(
-            [
-              { label: "Scope", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(`${row.scope_type}:${row.scope_key}`)}</div></div>` },
-              { label: "Reason", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2">${escapeHtml(row.reason)}</div></div>` },
-              { label: "Created", render: row => `<div class="cell-stack"><div class="cell-sub">${fmtTimestamp(row.created_at)}</div></div>` },
-            ],
-            control.kill_switches,
-            "No active kill switches."
-          )
-        : emptyState("No active kill switches.");
-      const intervals = Object.entries(control.loop_intervals_seconds || {})
-        .map(([key, value]) => `<span class="pill">${escapeHtml(key)} ${fmtRelative(value)}</span>`)
-        .join("");
-      return `
-        <div class="table-meta">
-          <span class="status-chip">OpenClaw agent ${escapeHtml(control.openclaw_agent_id || "n/a")}</span>
-          <span class="status-chip">auto execute ${escapeHtml(control.tg_auto_execute_mode || "n/a")}</span>
-        </div>
-        <div class="pill-row">${intervals}</div>
-        <div style="margin-top: 12px">${kill}</div>
-      `;
-    }
-
-    function summarizeEvent(row) {
-      const parts = [];
-      if (row.status) parts.push(`status ${row.status}`);
-      if (row.market) parts.push(String(row.market));
-      if (row.outcome) parts.push(`outcome ${row.outcome}`);
-      if (row.error) parts.push(`error ${row.error}`);
-      if (row.approval_expires_at) parts.push(`expires ${row.approval_expires_at}`);
-      if (row.callback_query_id) parts.push(`callback ${row.callback_query_id}`);
-      if (row.chat_id) parts.push(`chat ${row.chat_id}`);
-      if (!parts.length && row.telegram && row.telegram.text) {
-        parts.push(String(row.telegram.text).replace(/\s+/g, " ").slice(0, 180));
+        `).join("");
       }
-      if (!parts.length) parts.push(JSON.stringify(row).slice(0, 180));
-      return escapeHtml(parts.join(" | "));
+      const health = snap.system_health || [];
+      health.forEach(h => {
+        const card = document.getElementById("loop-"+h.loop);
+        if (!card) return;
+        card.classList.remove("green","amber","red");
+        const hh = h.health === "yellow" ? "amber" : h.health;
+        card.classList.add(hh || "green");
+        const dot = document.getElementById("dot-"+h.loop);
+        dot.classList.remove("red","amber");
+        if (hh === "red") dot.classList.add("red");
+        else if (hh === "amber") dot.classList.add("amber");
+        document.getElementById("items-"+h.loop).textContent = (h.items_processed != null ? h.items_processed : "—");
+        document.getElementById("age-"+h.loop).textContent = fmtAge(h.age_seconds) + " ago";
+      });
     }
 
-    function renderRecentEvents(items) {
-      return renderTable(
-        [
-          { label: "Type", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.type || "event")}</div><div class="cell-sub">${escapeHtml(row.proposal_id || row.chat_id || "")}</div></div>` },
-          { label: "When", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.timestamp)}</div><div class="cell-sub">${row.approval_expires_at ? `expires ${escapeHtml(row.approval_expires_at)}` : ""}</div></div>` },
-          { label: "Summary", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2 mono-wrap">${summarizeEvent(row)}</div></div>` },
-        ],
-        items || [],
-        "No recent events."
-      );
+    function renderPending(snap) {
+      const items = snap.pending_approvals || [];
+      document.getElementById("pending-count").textContent = items.length;
+      const body = document.getElementById("pending-body");
+      if (items.length === 0) { body.innerHTML = '<div class="empty">No pending approvals</div>'; return; }
+      body.innerHTML = `<table><thead><tr>
+        <th>Market</th><th>Side</th><th>Size</th><th>Conf</th><th>Expires</th>
+      </tr></thead><tbody>${items.map(p => {
+        const cd = p.approval_expires_at ? `cd-pending-${escHtml(p.proposal_id)}` : "";
+        return `<tr>
+          <td class="market-cell">
+            <span class="q">${escHtml(p.market || p.market_id)}</span>
+            <span class="sub">${escHtml(p.proposal_id)}</span>
+          </td>
+          <td><span class="chip ${p.outcome && /yes|over|up/i.test(p.outcome) ? "green" : "red"}">${escHtml(p.outcome)}</span></td>
+          <td class="mono">${fmtMoney(p.size_usdc)}</td>
+          <td class="mono">${p.confidence_score != null ? (p.confidence_score*100).toFixed(0)+"%" : "—"}</td>
+          <td class="mono"><span class="countdown" id="${cd}">—</span></td>
+        </tr>`;
+      }).join("")}</tbody></table>`;
+      items.forEach(p => {
+        if (p.approval_expires_at) {
+          countdownState["pending-"+p.proposal_id] = {
+            expiresAt: new Date(p.approval_expires_at).getTime(),
+            el: document.getElementById(`cd-pending-${p.proposal_id}`),
+          };
+        }
+      });
     }
 
-    function renderResolvedPositions(items) {
-      return renderTable(
-        [
-          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
-          { label: "Entry", render: row => `<div class="cell-main">${fmtPrice(row.entry_price)}</div>` },
-          { label: "Size", render: row => `<div class="cell-main">${fmtMoney(row.size_usdc)}</div>` },
-          { label: "P&L", render: row => {
-            const pnl = toNumberOrNull(row.realized_pnl);
-            const cls = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
-            return `<div class="cell-main ${cls}">${fmtSignedMoney(row.realized_pnl)}</div>`;
-          }},
-          { label: "Resolved", render: row => `<div class="cell-sub">${fmtTimestamp(row.updated_at)}</div>` },
-        ],
-        items || [],
-        "No resolved positions yet."
-      );
+    function renderLiveOrders(snap) {
+      const items = snap.live_orders || [];
+      document.getElementById("live-count").textContent = items.length;
+      const body = document.getElementById("live-body");
+      if (items.length === 0) { body.innerHTML = '<div class="empty">No live orders</div>'; return; }
+      body.innerHTML = `<table><thead><tr>
+        <th>Market</th><th>Side</th><th>Size</th><th>Status</th><th>TTL</th>
+      </tr></thead><tbody>${items.map(o => {
+        const cd = `cd-live-${o.execution_id}`;
+        const expEpoch = o.order_posted_at && o.order_live_ttl_seconds
+          ? new Date(o.order_posted_at).getTime() + (o.order_live_ttl_seconds * 1000) : null;
+        return `<tr>
+          <td class="market-cell">
+            <span class="q">${escHtml(o.market || o.market_id)}</span>
+            <span class="sub">#${o.execution_id}</span>
+          </td>
+          <td><span class="chip blue">${escHtml(o.outcome)}</span></td>
+          <td class="mono">${fmtMoney(o.requested_size_usdc)}</td>
+          <td><span class="chip amber">${escHtml(o.status)}</span></td>
+          <td class="mono"><span class="countdown" id="${cd}">—</span></td>
+        </tr>`;
+      }).join("")}</tbody></table>`;
+      items.forEach(o => {
+        if (o.order_posted_at && o.order_live_ttl_seconds) {
+          const exp = new Date(o.order_posted_at).getTime() + (o.order_live_ttl_seconds * 1000);
+          countdownState["live-"+o.execution_id] = {
+            expiresAt: exp,
+            el: document.getElementById(`cd-live-${o.execution_id}`),
+          };
+        }
+      });
     }
 
-    function renderSnapshot(data) {
-      document.getElementById("portfolio-banner").innerHTML = renderPortfolioBanner(data);
-      document.getElementById("snapshot-status").textContent = "Live";
-      document.getElementById("header-meta").textContent =
-        `Updated ${new Date(data.timestamp).toLocaleString()} | pending ${data.pending_count || 0} | live ${data.live_order_count || 0} | open ${data.open_position_count || 0}`;
-      document.getElementById("hero-metrics").innerHTML = renderHeroMetrics(data);
-
-      document.getElementById("system-health").innerHTML = renderHealth(data.system_health || []);
-      document.getElementById("needs-attention").innerHTML = renderAttention(data.needs_attention || []);
-      document.getElementById("control-state").innerHTML = renderControlState(data.control_state || {});
-
-      document.getElementById("pending-approvals").innerHTML = renderTable(
-        [
-          { label: "Proposal", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.proposal_id)}</div><div class="cell-sub">${escapeHtml(row.proposal_kind || "entry")}</div></div>` },
-          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.topic || "")}</div></div>` },
-          { label: "Trade", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.outcome || "n/a")}</div><div class="cell-sub">${fmtMoney(row.size_usdc)} size | conf ${fmtDecimal(row.confidence_score)}</div></div>` },
-          { label: "Expires", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.approval_expires_at)}</div><div class="cell-sub ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${fmtRelative(row.seconds_remaining)}</div></div>` },
-        ],
-        data.pending_approvals || [],
-        "No proposals waiting for approval."
-      );
-
-      document.getElementById("live-orders").innerHTML = renderTable(
-        [
-          { label: "Order", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.order_id || row.proposal_id || "n/a")}</div><div class="cell-sub">${escapeHtml(row.status || "n/a")}</div></div>` },
-          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
-          { label: "Request", render: row => `<div class="cell-stack"><div class="cell-main">${fmtMoney(row.requested_size_usdc)}</div><div class="cell-sub">@ ${fmtPrice(row.requested_price)}</div></div>` },
-          { label: "Age / TTL", render: row => `<div class="cell-stack"><div class="cell-main">${fmtRelative(row.age_seconds)}</div><div class="cell-sub ${row.seconds_remaining != null && row.seconds_remaining <= 60 ? "red" : ""}">${row.seconds_remaining != null ? fmtRelative(row.seconds_remaining) + " left" : "n/a"}</div></div>` },
-        ],
-        data.live_orders || [],
-        "No live orders."
-      );
-
-      document.getElementById("open-positions").innerHTML = renderTable(
-        [
-          { label: "Position", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")}</div></div>` },
-          { label: "Status", render: row => `<span class="status-chip ${statusTone(row.status)}">${escapeHtml(row.status || "n/a")}</span>` },
-          { label: "Entry / Mark", render: row => `<div class="cell-stack"><div class="cell-main">${fmtPrice(row.entry_price)} / ${fmtPrice(row.last_mark_price)}</div><div class="cell-sub">mark age ${fmtRelative(row.mark_age_seconds)}</div></div>` },
-          { label: "Size", render: row => `<div class="cell-stack"><div class="cell-main">${fmtMoney(row.size_usdc)}</div></div>` },
-          { label: "PnL", render: row => `<div class="cell-stack"><div class="cell-main ${toneClass(row.unrealized_pnl, true)}">U ${fmtSignedMoney(row.unrealized_pnl)}</div><div class="cell-sub ${toneClass(row.realized_pnl, true)}">R ${fmtSignedMoney(row.realized_pnl)}</div></div>` },
-        ],
-        data.open_positions || [],
-        "No open positions."
-      );
-
-      document.getElementById("resolved-positions").innerHTML = renderResolvedPositions(data.resolved_positions);
-
-      document.getElementById("recent-decisions").innerHTML = renderTable(
-        [
-          { label: "Proposal", render: row => `<div class="cell-stack"><div class="cell-main mono-wrap">${escapeHtml(row.proposal_id)}</div><div class="cell-sub ${statusTone(row.status)}">${escapeHtml(row.status || "n/a")}</div></div>` },
-          { label: "Market", render: row => `<div class="cell-stack"><div class="cell-main">${safeLink(row.market_url, row.market || "n/a")}</div><div class="cell-sub">${escapeHtml(row.outcome || "")} | ${fmtMoney(row.size_usdc)} | conf ${fmtDecimal(row.confidence_score)}</div></div>` },
-          { label: "Reason", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2">${escapeHtml(row.reason || "")}</div><div class="cell-sub">${fmtTimestamp(row.updated_at)}</div></div>` },
-        ],
-        data.recent_decisions || [],
-        "No recent decisions."
-      );
-
-      document.getElementById("recent-failures").innerHTML = renderTable(
-        [
-          { label: "Kind", render: row => `<div class="cell-stack"><div class="cell-main">${escapeHtml(row.kind || "failure")}</div><div class="cell-sub">${escapeHtml(row.category || "")}</div></div>` },
-          { label: "Target", render: row => `<div class="cell-stack"><div class="cell-sub mono-wrap">${escapeHtml(row.market || row.loop || row.proposal_id || "")}</div></div>` },
-          { label: "When", render: row => `<div class="cell-stack"><div class="cell-main">${fmtTimestamp(row.timestamp)}</div><div class="cell-sub ${statusTone(row.status)}">${escapeHtml(row.status || "")}</div></div>` },
-          { label: "Message", render: row => `<div class="cell-stack"><div class="cell-sub truncate-2 mono-wrap">${escapeHtml((row.message || "").slice(0, 220))}</div></div>` },
-        ],
-        data.recent_failures || [],
-        "No recent failures."
-      );
-
-      document.getElementById("recent-events").innerHTML = renderRecentEvents(data.recent_events || []);
+    function renderOpen(snap) {
+      const items = snap.open_positions || [];
+      document.getElementById("open-count").textContent = items.length;
+      const body = document.getElementById("open-body");
+      if (items.length === 0) { body.innerHTML = '<div class="empty">No open positions</div>'; return; }
+      body.innerHTML = `<table><thead><tr>
+        <th>Market</th><th>Side</th><th>Entry</th><th>Mark</th><th>P&amp;L</th>
+      </tr></thead><tbody>${items.map(pos => `
+        <tr>
+          <td class="market-cell">
+            <span class="q">${escHtml(pos.market || pos.market_id)}</span>
+            <span class="sub">${fmtMoney(pos.size_usdc)}</span>
+          </td>
+          <td><span class="chip blue">${escHtml(pos.outcome)}</span></td>
+          <td class="mono muted">${pos.entry_price != null ? pos.entry_price.toFixed(3) : "—"}</td>
+          <td class="mono">${pos.last_mark_price != null ? pos.last_mark_price.toFixed(3) : "—"}</td>
+          <td class="mono ${pnlClass(pos.unrealized_pnl)}">${fmtSigned(pos.unrealized_pnl)}</td>
+        </tr>
+      `).join("")}</tbody></table>`;
     }
 
+    function renderResolved(snap) {
+      const items = (snap.resolved_positions || []).slice(0, 12);
+      document.getElementById("resolved-count").textContent = (snap.resolved_positions || []).length;
+      const body = document.getElementById("resolved-body");
+      if (items.length === 0) { body.innerHTML = '<div class="empty">No resolved positions</div>'; return; }
+      body.innerHTML = `<table><thead><tr>
+        <th>Market</th><th>Side</th><th>Size</th><th>Realized P&amp;L</th><th>When</th>
+      </tr></thead><tbody>${items.map(pos => `
+        <tr>
+          <td class="market-cell">
+            <span class="q">${escHtml(pos.market || pos.market_id)}</span>
+          </td>
+          <td><span class="chip ${Number(pos.realized_pnl||0) >= 0 ? "green" : "red"}">${escHtml(pos.outcome)}</span></td>
+          <td class="mono muted">${fmtMoney(pos.size_usdc)}</td>
+          <td class="mono ${pnlClass(pos.realized_pnl)}"><strong>${fmtSigned(pos.realized_pnl)}</strong></td>
+          <td class="mono muted-2">${(pos.updated_at || "").substr(5, 11).replace("T"," ")}</td>
+        </tr>
+      `).join("")}</tbody></table>`;
+    }
+
+    function renderFailures(snap) {
+      const items = (snap.recent_failures || []).slice(0, 12);
+      document.getElementById("failures-count").textContent = (snap.recent_failures || []).length;
+      const body = document.getElementById("failures-body");
+      if (items.length === 0) { body.innerHTML = '<div class="empty">No recent failures ✓</div>'; return; }
+      body.innerHTML = `<table><thead><tr>
+        <th>Kind</th><th>Category</th><th>Detail</th><th>When</th>
+      </tr></thead><tbody>${items.map(f => `
+        <tr>
+          <td><span class="chip red">${escHtml(f.kind)}</span></td>
+          <td class="mono amber">${escHtml(f.category || f.status || "")}</td>
+          <td class="market-cell"><span class="q muted">${escHtml(f.message || "")}</span></td>
+          <td class="mono muted-2">${(f.timestamp || "").substr(5, 11).replace("T"," ")}</td>
+        </tr>
+      `).join("")}</tbody></table>`;
+    }
+
+    // ============================================================
+    // CHART UPDATES (slower cadence)
+    // ============================================================
+    function updatePnlChart(data) {
+      if (!pnlChart || !data) return;
+      const points = data.points || [];
+      const finalVal = points.length ? points[points.length-1].cumulative_pnl : 0;
+      const color = finalVal >= 0 ? "#00ff88" : "#ff4444";
+      pnlChart.data.labels = points.map(p => (p.ts || "").substr(5, 5));
+      pnlChart.data.datasets[0].data = points.map(p => p.cumulative_pnl);
+      pnlChart.data.datasets[0].borderColor = color;
+      const ctx = pnlChart.ctx;
+      pnlChart.data.datasets[0].backgroundColor = createGradient(ctx, color);
+      pnlChart.update("none");
+      const hdr = document.getElementById("pnl-chart-hdr");
+      hdr.textContent = fmtSigned(finalVal);
+      hdr.className = "count mono " + pnlClass(finalVal);
+    }
+
+    function updateFunnelChart(stats) {
+      if (!funnelChart || !stats) return;
+      const p = stats.proposals_by_status || {};
+      const total = Object.values(p).reduce((a,b) => a + Number(b||0), 0);
+      const blocked = Number(p.risk_blocked || 0);
+      const pending = Number(p.pending_approval || 0) + Number(p.approved || 0) + Number(p.authorized_for_execution || 0);
+      const executed = Number(p.executed || 0);
+      funnelChart.data.datasets[0].data = [total, blocked, pending, executed];
+      funnelChart.update("none");
+      document.getElementById("funnel-total").textContent = total + " total";
+    }
+
+    function updateSparklines(data) {
+      if (!data || !data.loops) return;
+      LOOP_NAMES.forEach(name => {
+        const arr = data.loops[name] || [];
+        const chart = sparklineCharts[name];
+        if (!chart) return;
+        const values = arr.map(h => h.items || 0);
+        const anyErr = arr.some(h => h.error);
+        chart.data.labels = values.map((_, i) => i);
+        chart.data.datasets[0].data = values;
+        chart.data.datasets[0].borderColor = anyErr ? "#ff4444" : "#58a6ff";
+        chart.update("none");
+      });
+    }
+
+    // ============================================================
+    // POLLING
+    // ============================================================
     async function refresh() {
       try {
-        const response = await fetch("/api/ops/status", { headers: { "Accept": "application/json" } });
-        if (!response.ok) throw new Error(`status ${response.status}`);
-        const data = await response.json();
-        renderSnapshot(data);
-      } catch (error) {
-        document.getElementById("header-meta").textContent = `dashboard refresh failed: ${error}`;
-      }
-    }
-
-    async function controlSystem(action) {
-      const log = document.getElementById("control-log");
-      log.textContent = `sending ${action}...`;
-      try {
-        const response = await fetch("/api/ops/system-control", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Accept": "application/json" },
-          body: JSON.stringify({ action }),
-        });
-        const payload = await response.json();
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.error || `status ${response.status}`);
+        const [statusRes, hbRes] = await Promise.all([
+          fetch("/api/ops/status"),
+          fetch("/api/ops/heartbeat-history")
+        ]);
+        if (statusRes.ok) {
+          const snap = await statusRes.json();
+          renderSnapshot(snap);
         }
-        log.textContent = payload.message || `${action} accepted`;
-        window.setTimeout(refresh, 1500);
-      } catch (error) {
-        log.textContent = `control failed: ${error}`;
-      }
+        if (hbRes.ok) {
+          const hb = await hbRes.json();
+          updateSparklines(hb);
+        }
+      } catch(e) { console.error("refresh error", e); }
     }
 
-    document.querySelectorAll("[data-action]").forEach(button => {
-      button.addEventListener("click", () => {
-        const action = button.getAttribute("data-action");
-        if (!action) return;
-        controlSystem(action);
-      });
-    });
+    async function refreshCharts() {
+      try {
+        const [pnlRes, statsRes] = await Promise.all([
+          fetch("/api/ops/pnl-history"),
+          fetch("/api/ops/stats")
+        ]);
+        if (pnlRes.ok) updatePnlChart(await pnlRes.json());
+        if (statsRes.ok) updateFunnelChart(await statsRes.json());
+      } catch(e) { console.error("chart refresh error", e); }
+    }
 
-    renderSnapshot(initial);
-    window.setInterval(refresh, 5000);
+    // ============================================================
+    // CONTROLS
+    // ============================================================
+    function toggleDrawer() {
+      document.getElementById("drawer").classList.toggle("open");
+    }
+    async function sysCtl(action) {
+      const log = document.getElementById("drawer-log");
+      log.textContent = `⏳ sending ${action}...`;
+      try {
+        const r = await fetch("/api/ops/system-control", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action})
+        });
+        const data = await r.json();
+        log.textContent = (data.ok ? "✓ " : "✗ ") + (data.message || data.error || JSON.stringify(data));
+      } catch(e) { log.textContent = "✗ " + e.message; }
+    }
+
+    // ============================================================
+    // BOOT
+    // ============================================================
+    initCharts();
+    const initialNode = document.getElementById("initial-ops-data");
+    try {
+      const initial = JSON.parse(initialNode ? initialNode.textContent : "{}");
+      renderSnapshot(initial);
+    } catch(e) { console.error("initial parse", e); }
+
+    refresh();
+    refreshCharts();
+    setInterval(refresh, 3000);
+    setInterval(refreshCharts, 30000);
   </script>
 </body>
 </html>
@@ -1518,6 +1703,77 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 500
         return jsonify(result)
+
+    @app.get("/api/ops/pnl-history")
+    def ops_pnl_history():
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT updated_at AS ts, realized_pnl
+                FROM positions
+                WHERE status = 'resolved' AND mode = 'real' AND realized_pnl IS NOT NULL
+                ORDER BY updated_at ASC
+                """
+            ).fetchall()
+        points = []
+        cumulative = 0.0
+        for r in rows:
+            try:
+                pnl = float(r["realized_pnl"] or 0.0)
+            except Exception:
+                pnl = 0.0
+            cumulative += pnl
+            points.append({"ts": r["ts"], "realized_pnl": pnl, "cumulative_pnl": cumulative})
+        return jsonify({"points": points})
+
+    @app.get("/api/ops/heartbeat-history")
+    def ops_heartbeat_history():
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT loop_name, started_at, items_processed, error_message
+                FROM (
+                    SELECT loop_name, started_at, items_processed, error_message,
+                           ROW_NUMBER() OVER (PARTITION BY loop_name ORDER BY id DESC) AS rn
+                    FROM autopilot_heartbeats
+                ) ranked
+                WHERE rn <= 20
+                ORDER BY loop_name ASC, started_at ASC
+                """
+            ).fetchall()
+        loops: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            loops.setdefault(r["loop_name"], []).append({
+                "ts": r["started_at"],
+                "items": int(r["items_processed"] or 0),
+                "error": bool(r["error_message"]),
+            })
+        return jsonify({"loops": loops})
+
+    @app.get("/api/ops/stats")
+    def ops_stats():
+        with connect_db() as conn:
+            prop = {r["status"]: int(r["c"]) for r in conn.execute(
+                "SELECT status, COUNT(*) AS c FROM proposals GROUP BY status"
+            ).fetchall()}
+            execs = {r["status"]: int(r["c"]) for r in conn.execute(
+                "SELECT status, COUNT(*) AS c FROM executions GROUP BY status"
+            ).fetchall()}
+            pos = {r["status"]: int(r["c"]) for r in conn.execute(
+                "SELECT status, COUNT(*) AS c FROM positions GROUP BY status"
+            ).fetchall()}
+            try:
+                failures = {r["verdict"]: int(r["c"]) for r in conn.execute(
+                    "SELECT verdict, COUNT(*) AS c FROM agent_reviews GROUP BY verdict"
+                ).fetchall()}
+            except Exception:
+                failures = {}
+        return jsonify({
+            "proposals_by_status": prop,
+            "executions_by_status": execs,
+            "positions_by_status": pos,
+            "failure_buckets": failures,
+        })
 
     @app.get("/ops")
     def ops_dashboard():

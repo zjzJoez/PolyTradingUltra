@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS proposals (
   alpha_net_edge_bps REAL,
   alpha_model_version TEXT,
   alpha_mapping_confidence REAL,
+  risk_block_reasons_json TEXT,
   proposal_json TEXT NOT NULL,
   context_payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -187,6 +188,9 @@ CREATE TABLE IF NOT EXISTS executions (
   txhash_or_order_id TEXT,
   slippage_bps REAL,
   error_message TEXT,
+  error_category TEXT,
+  submitted_at TEXT,
+  filled_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id) ON DELETE CASCADE
@@ -351,6 +355,18 @@ CREATE TABLE IF NOT EXISTS autopilot_heartbeats (
 );
 
 CREATE INDEX IF NOT EXISTS idx_heartbeats_loop ON autopilot_heartbeats(loop_name, started_at);
+
+CREATE TABLE IF NOT EXISTS execution_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  execution_id INTEGER NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  trigger TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_execution ON execution_events(execution_id);
 
 CREATE TABLE IF NOT EXISTS market_resolutions (
   market_id TEXT PRIMARY KEY,

@@ -58,7 +58,7 @@ Both repos read/write the same SQLite file (`var/polymarket_mvp.sqlite3` or `POL
 
 **Table ownership:**
 - **MVP owns**: `market_snapshots`, `market_contexts`, `event_clusters`, `market_event_links`, `research_memos`, `proposals`, `approvals`, `executions`, `positions`, `order_reconciliations`, `kill_switches`, `strategy_authorizations`, `shadow_executions`, `position_events`, `exit_recommendations`, `agent_reviews`, `autopilot_heartbeats`, `market_resolutions`, `proposal_contexts`
-- **Alpha Lab owns**: `sports_teams`, `sports_fixtures`, `sports_market_mappings`, `bookmaker_quotes`, `feature_snapshots`, `fair_value_snapshots`, `alpha_signals`, `clv_observations`, `model_runs`, `strategy_versions`, `provider_ingest_runs`, `provider_event_links`, `market_state_history`, `training_examples`, `evaluation_runs`
+- **Alpha Lab owns**: `sports_teams`, `sports_fixtures`, `sports_market_mappings`, `bookmaker_quotes`, `feature_snapshots`, `fair_value_snapshots`, `alpha_signals`, `clv_observations`, `model_runs`, `strategy_versions`, `provider_ingest_runs`, `provider_event_links`, `market_state_history`, `training_examples`, `evaluation_runs`, `polymarket_orderbook_snapshots`
 - Each repo's `init_db()` only creates its own tables (`CREATE TABLE IF NOT EXISTS`). Never drop or alter the other repo's tables.
 
 ### Signal handoff (the only integration point)

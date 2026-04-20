@@ -52,7 +52,17 @@ def apply_pending_migrations(conn: sqlite3.Connection) -> list[str]:
     for path in migration_files():
         if path.name in applied:
             continue
-        conn.executescript(path.read_text(encoding="utf-8"))
+        try:
+            conn.executescript(path.read_text(encoding="utf-8"))
+        except sqlite3.OperationalError as exc:
+            # ALTER TABLE may fail if table doesn't exist yet (will be created by schema.sql)
+            # or if column already exists. Both are safe to skip.
+            err_msg = str(exc).lower()
+            if "no such table" in err_msg or "duplicate column" in err_msg:
+                import sys
+                print(f"[migrations] {path.name}: skipped ({exc})", file=sys.stderr)
+            else:
+                raise
         mark_migration_applied(conn, path.name)
         newly_applied.append(path.name)
     return newly_applied

@@ -12,6 +12,36 @@ def _is_active_window(valid_from: str, valid_until: str, now_iso: str) -> bool:
     return parse_iso8601(valid_from) <= now <= parse_iso8601(valid_until)
 
 
+def _daily_realized_loss(conn, strategy_name: str | None) -> float:
+    """Sum of negative realized PnL for today's resolved positions (returns positive number)."""
+    if not strategy_name:
+        return 0.0
+    today = parse_iso8601(utc_now_iso()).date().isoformat()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(CASE WHEN p.realized_pnl < 0 THEN p.realized_pnl ELSE 0 END), 0)
+        FROM positions p
+        WHERE p.strategy_name = ? AND substr(p.updated_at, 1, 10) = ? AND p.status = 'resolved'
+        """,
+        (strategy_name, today),
+    ).fetchone()
+    return abs(float(row[0]))
+
+
+def _strategy_open_positions(conn, strategy_name: str | None) -> int:
+    """Count open positions for a strategy."""
+    if not strategy_name:
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*) FROM positions
+        WHERE strategy_name = ? AND status IN ('open', 'open_requested', 'partially_filled')
+        """,
+        (strategy_name,),
+    ).fetchone()
+    return int(row[0])
+
+
 def evaluate_authorization(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
     now_iso = utc_now_iso()
     market = record.get("market") or {}
@@ -40,6 +70,24 @@ def evaluate_authorization(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
             continue
         if int(proposal["max_slippage_bps"]) > int(auth["max_slippage_bps"]):
             continue
+        # Enforce max_daily_loss_usdc (schema field, previously unchecked)
+        max_daily_loss = float(auth.get("max_daily_loss_usdc") or 0)
+        if max_daily_loss > 0:
+            daily_loss = _daily_realized_loss(conn, auth.get("strategy_name") or strategy_name)
+            if daily_loss >= max_daily_loss:
+                result["authorization_status"] = "daily_loss_limit_reached"
+                result["matched_authorization"] = auth
+                result["reason"] = f"daily_loss={daily_loss:.2f} >= max={max_daily_loss:.2f}"
+                return result
+        # Enforce max_open_positions (schema field, previously unchecked)
+        max_open = int(auth.get("max_open_positions") or 0)
+        if max_open > 0:
+            open_count = _strategy_open_positions(conn, auth.get("strategy_name") or strategy_name)
+            if open_count >= max_open:
+                result["authorization_status"] = "position_limit_reached"
+                result["matched_authorization"] = auth
+                result["reason"] = f"open_positions={open_count} >= max={max_open}"
+                return result
         manual_cutoff = auth.get("requires_human_if_above_usdc")
         if auth.get("allow_auto_execute"):
             if manual_cutoff is not None and float(proposal["recommended_size_usdc"]) > float(manual_cutoff):

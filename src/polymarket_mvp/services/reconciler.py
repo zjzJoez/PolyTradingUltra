@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time as _time
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -74,12 +76,16 @@ def cancel_stale_orders(conn) -> List[Dict[str, Any]]:
             continue
         order_id = execution.get("txhash_or_order_id")
         if order_id:
-            try:
-                if client is None:
-                    client = _build_clob_client()
-                client.cancel(order_id)
-            except Exception:
-                pass
+            for _cancel_attempt in range(2):
+                try:
+                    if client is None:
+                        client = _build_clob_client()
+                    client.cancel(order_id)
+                    break
+                except Exception:
+                    if _cancel_attempt == 0:
+                        _time.sleep(1)
+                    # second attempt failed — proceed anyway, reconciler will catch it
         update_execution(conn, int(execution["id"]), {
             "status": "failed",
             "error_message": f"auto_cancelled_ttl_{ttl}s",
@@ -223,3 +229,61 @@ def reconcile_live_orders(conn) -> List[Dict[str, Any]]:
             )
             conn.commit()
     return results
+
+
+def assert_position_consistency(conn) -> List[Dict[str, Any]]:
+    """Find and auto-repair positions that violate state invariants.
+
+    Catches:
+    - open/open_requested positions whose execution is failed
+    - open/open_requested positions on resolved markets
+    """
+    now = utc_now_iso()
+    repaired: List[Dict[str, Any]] = []
+
+    # 1. Positions whose execution already failed
+    rows = conn.execute(
+        """
+        SELECT p.id AS position_id, p.status AS pos_status, p.execution_id, e.status AS exec_status
+        FROM positions p
+        JOIN executions e ON e.id = p.execution_id
+        WHERE p.status IN ('open', 'open_requested')
+          AND e.status = 'failed'
+        """
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE positions SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            (now, row["position_id"]),
+        )
+        record_position_event(conn, {
+            "position_id": row["position_id"],
+            "event_type": "reconcile",
+            "payload_json": {"reason": "execution_failed_position_stale", "exec_status": row["exec_status"]},
+        })
+        repaired.append({"position_id": row["position_id"], "reason": "execution_failed"})
+
+    # 2. Positions on resolved markets
+    rows2 = conn.execute(
+        """
+        SELECT p.id AS position_id, p.status AS pos_status, p.market_id, mr.resolved_outcome
+        FROM positions p
+        JOIN market_resolutions mr ON mr.market_id = p.market_id
+        WHERE p.status IN ('open', 'open_requested')
+        """
+    ).fetchall()
+    for row in rows2:
+        conn.execute(
+            "UPDATE positions SET status = 'resolved', updated_at = ? WHERE id = ?",
+            (now, row["position_id"]),
+        )
+        record_position_event(conn, {
+            "position_id": row["position_id"],
+            "event_type": "resolve",
+            "payload_json": {"reason": "market_resolved_position_stale", "resolved_outcome": row["resolved_outcome"]},
+        })
+        repaired.append({"position_id": row["position_id"], "reason": "market_resolved"})
+
+    if repaired:
+        print(f"[reconciler] assert_position_consistency: repaired {len(repaired)} positions", file=sys.stderr)
+    return repaired

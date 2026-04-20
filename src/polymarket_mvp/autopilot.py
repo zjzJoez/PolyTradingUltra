@@ -8,10 +8,19 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Dict, List
+
+
+# Process-wide write coordination: serializes DB write transactions across all
+# autopilot loop threads to avoid SQLite "database is locked" under contention.
+# Held only for quick-write loops; slow loops (propose/context/review) do their
+# LLM work outside the lock and acquire it opportunistically via retry.
+_DB_WRITE_LOCK = threading.Lock()
 
 from .common import (
     blocked_market_reason,
@@ -64,23 +73,25 @@ class Autopilot:
         last = self.last_run.get(loop_name, 0)
         return (time.time() - last) >= self.cadences[loop_name]
 
+    LOOP_NAMES = ["scan", "context", "propose", "expiry", "execute", "reconcile", "exit", "review"]
+
     def run_forever(self) -> None:
         init_db()
-        _log("autopilot started")
+        if self.max_iterations is not None:
+            self._run_sequential()
+        else:
+            self._run_threaded()
+
+    def _run_sequential(self) -> None:
+        """Single-threaded pass used by tests with max_iterations set."""
+        _log("autopilot started (sequential)")
         iteration = 0
         while True:
             if self.max_iterations is not None and iteration >= self.max_iterations:
                 _log(f"max_iterations={self.max_iterations} reached, stopping")
                 break
             try:
-                with connect_db() as conn:
-                    if _global_kill_switch_active(conn):
-                        _log("global kill switch active, sleeping")
-                        time.sleep(10)
-                        iteration += 1
-                        continue
-
-                for name in ["scan", "context", "propose", "expiry", "execute", "reconcile", "exit", "review"]:
+                for name in self.LOOP_NAMES:
                     if self.should_run(name):
                         try:
                             with connect_db() as conn:
@@ -93,7 +104,61 @@ class Autopilot:
             iteration += 1
             time.sleep(1)
 
+    def _run_threaded(self) -> None:
+        """Production path: one daemon thread per loop so slow loops cannot starve fast ones."""
+        _log("autopilot started (threaded, one worker per loop)")
+        stop = threading.Event()
+        threads: List[threading.Thread] = []
+        for name in self.LOOP_NAMES:
+            t = threading.Thread(
+                target=self._loop_worker,
+                args=(name, stop),
+                name=f"autopilot-{name}",
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        try:
+            while not stop.is_set():
+                stop.wait(1.0)
+        except KeyboardInterrupt:
+            _log("received SIGINT, stopping")
+            stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+    def _loop_worker(self, name: str, stop: threading.Event) -> None:
+        cadence = max(1, int(self.cadences.get(name, 30)))
+        # Stagger initial starts so we don't hammer the DB with 8 simultaneous writes.
+        stop.wait(0.25 * self.LOOP_NAMES.index(name))
+        while not stop.is_set():
+            started = time.time()
+            try:
+                with connect_db() as conn:
+                    self._tick(conn, name)
+                    conn.commit()
+            except Exception:
+                _log(f"{name} top-level error: {traceback.format_exc()}")
+            elapsed = time.time() - started
+            # Sleep the remainder of the cadence; never sleep less than 1s.
+            stop.wait(max(1.0, cadence - elapsed))
+
     def _tick(self, conn, name: str) -> None:
+        # Kill switch check inside _tick using the SAME connection (fixes race condition)
+        if _global_kill_switch_active(conn):
+            _log(f"{name} skipped: global kill switch active")
+            return
+
+        # Loop lag alert: warn if loop is overdue by 3x its cadence
+        lag = time.time() - self.last_run.get(name, 0)
+        if self.last_run.get(name) and lag > 3 * self.cadences[name]:
+            _log(f"CRITICAL: {name} loop lagging {lag:.0f}s (cadence={self.cadences[name]}s)")
+
+        # No Python-level write lock: each loop owns its own connection and
+        # SQLite (WAL + busy_timeout) serializes writes at the DB layer. The
+        # propose/context/review loops make multi-second LLM subprocess calls,
+        # and a global lock across those calls starves fast loops (expiry 5s,
+        # execute 10s) and caused a 10+ min stall in practice.
         started = utc_now_iso()
         count = 0
         error_msg = None
@@ -266,11 +331,12 @@ class Autopilot:
         return count
 
     def _loop_reconcile(self, conn) -> int:
-        from .services.reconciler import cancel_orphaned_positions, cancel_stale_orders, check_and_backfill_resolutions, reconcile_live_orders
+        from .services.reconciler import assert_position_consistency, cancel_orphaned_positions, cancel_stale_orders, check_and_backfill_resolutions, reconcile_live_orders
         from .services.position_manager import sync_all_positions, update_position_marks
         from .services.redeemer import redeem_resolved_positions
 
         cancel_orphaned_positions(conn)
+        assert_position_consistency(conn)
         conn.commit()
         cancelled = cancel_stale_orders(conn)
         reconciled = reconcile_live_orders(conn)

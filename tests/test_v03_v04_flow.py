@@ -163,6 +163,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
         os.environ["POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC"] = "50"
         os.environ["POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC"] = "50"
         os.environ["POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS"] = "false"
+        os.environ["POLY_RISK_MARKET_CLASS_ENABLED"] = "false"
         os.environ["SIGNATURE_TYPE"] = ""
 
     def tearDown(self) -> None:
@@ -170,6 +171,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
         os.environ.pop("POLYMARKET_MVP_DB_PATH", None)
         os.environ.pop("POLYMARKET_MVP_STATE_DIR", None)
         os.environ.pop("POLY_BLOCK_CRYPTO_DIRECTIONAL_MARKETS", None)
+        os.environ.pop("POLY_RISK_MARKET_CLASS_ENABLED", None)
         os.environ.pop("SIGNATURE_TYPE", None)
         os.environ.pop("TG_CHAT_ID", None)
         os.environ.pop("POLY_AUTOPILOT_MAX_PENDING_APPROVALS", None)

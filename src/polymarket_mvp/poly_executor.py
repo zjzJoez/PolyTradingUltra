@@ -4,11 +4,12 @@ import argparse
 import json
 import os
 import sys
+import uuid
 from typing import Any, Dict, List
 
 import requests
 
-from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
+from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, parse_iso8601, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
 from .db import connect_db, has_active_execution, has_active_market_outcome_exposure, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
@@ -29,6 +30,14 @@ KNOWN_NEG_RISK_SPENDERS = [
 
 
 def _looks_retryable_request_error(exc: Exception) -> bool:
+    # 4xx HTTP errors are permanent — don't retry
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        if status is not None and 400 <= status < 500:
+            return False
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
     if isinstance(exc, requests.RequestException):
         return True
     text = str(exc).lower()
@@ -353,6 +362,26 @@ def _real_preflight_check(client: Any, proposal: Dict[str, Any], *, token_id: st
     }
 
 
+def _classify_error(reason: str) -> str:
+    """Classify error reason into a structured category."""
+    r = reason.lower()
+    if "service_not_ready" in r or "sdk_unavailable" in r or "client_missing" in r:
+        return "service_not_ready"
+    if "insufficient_balance" in r or "balance" in r:
+        return "insufficient_balance"
+    if "slippage" in r:
+        return "slippage_exceeded"
+    if "order_submit_failed" in r or "allowance" in r or "spender" in r:
+        return "order_submit_failed"
+    if "preflight_failed" in r or "price_fetch_failed" in r:
+        return "request_exception"
+    if "duplicate" in r or "already_has_active" in r:
+        return "duplicate_blocked"
+    if "kill_switch" in r or "not_authorized" in r or "expired" in r or "market_class" in r:
+        return "policy_blocked"
+    return "unknown"
+
+
 def _failed_execution(record: Dict[str, Any], mode: str, reason: str, *, preflight: Dict[str, Any] | None = None) -> Dict[str, Any]:
     proposal = record["proposal_json"]
     order_intent = {"proposal_id": record["proposal_id"], "reason": reason}
@@ -374,6 +403,7 @@ def _failed_execution(record: Dict[str, Any], mode: str, reason: str, *, preflig
         "txhash_or_order_id": None,
         "slippage_bps": None,
         "error_message": reason,
+        "error_category": _classify_error(reason),
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
@@ -386,6 +416,14 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     is_approved = approval.get("decision") == "approved" or record.get("status") in {"approved", "authorized_for_execution"}
     if not is_approved:
         return _failed_execution(record, mode, "proposal_not_authorized")
+    # Check approval expiry — a stale approval should not execute
+    approval_expires_at = record.get("approval_expires_at")
+    if approval_expires_at:
+        try:
+            if parse_iso8601(approval_expires_at) < parse_iso8601(utc_now_iso()):
+                return _failed_execution(record, mode, "approval_expired")
+        except Exception:
+            pass
     blocked_reason = blocked_market_reason(record.get("market") or {})
     if blocked_reason:
         return _failed_execution(record, mode, blocked_reason)
@@ -508,6 +546,7 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     share_size = requested_size_usdc / requested_price if requested_price else 0.0
     token_id = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
     order_live_ttl = clamp_order_live_ttl(record.get("order_live_ttl_seconds"))
+    idempotency_key = f"{record['proposal_id']}-{mode}-{uuid.uuid4().hex[:8]}"
     order_intent = {
         "proposal_id": record["proposal_id"],
         "market_id": proposal["market_id"],
@@ -522,7 +561,7 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     execution = {
         "proposal_id": record["proposal_id"],
         "mode": mode,
-        "client_order_id": f"{record['proposal_id']}-{mode}",
+        "client_order_id": idempotency_key,
         "order_intent_json": order_intent,
         "requested_price": requested_price,
         "requested_size_usdc": requested_size_usdc,
@@ -561,16 +600,40 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
         except Exception as exc:
             return _failed_execution(record, mode, f"order_sdk_unavailable: {exc}", preflight=preflight)
         try:
+            import concurrent.futures
             side = SELL if record.get("proposal_kind") == "exit" else BUY
             order = OrderArgs(token_id=token_id, price=requested_price, size=share_size, side=side)
             signed = real_client.create_order(order)
-            response = real_client.post_order(signed, OrderType.GTC)
+            order_timeout = get_env_int("POLY_ORDER_SUBMIT_TIMEOUT_SECONDS", 30)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(real_client.post_order, signed, OrderType.GTC)
+                response = future.result(timeout=order_timeout)
             execution["txhash_or_order_id"] = str(response.get("orderID") or response.get("id") or "")
             execution["status"] = _normalize_order_status(response.get("status"))
             execution["order_intent_json"] = {"request": order_intent, "response": response, "preflight": preflight}
             execution["updated_at"] = utc_now_iso()
             execution = _reconcile_execution_with_order_snapshot(real_client, execution)
         except Exception as exc:
+            # Before declaring failure, check if the order actually went through
+            # (handles lost responses, timeouts where the order was accepted)
+            try:
+                recovered_order = real_client.get_order(idempotency_key)
+                if recovered_order:
+                    recovered_status = _normalize_order_status(recovered_order.get("status"))
+                    if recovered_status in {"submitted", "live", "filled"}:
+                        execution["txhash_or_order_id"] = str(recovered_order.get("id") or "")
+                        execution["status"] = recovered_status
+                        execution["order_intent_json"] = {
+                            "request": order_intent,
+                            "response": recovered_order,
+                            "preflight": preflight,
+                            "recovered_after_exception": str(exc),
+                        }
+                        execution["updated_at"] = utc_now_iso()
+                        session_state["cumulative_spend_usdc"] = float(session_state.get("cumulative_spend_usdc", 0.0)) + requested_size_usdc
+                        return execution
+            except Exception:
+                pass  # truly unknown — record as failed, reconciler will catch it
             error_msg = str(exc)
             if "allowance" in error_msg.lower() or "spender" in error_msg.lower():
                 from .common import polygon_rpc_url

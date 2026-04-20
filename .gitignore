@@ -8,3 +8,6 @@ var/
 dist/
 *.egg-info/
 .tmp-npm-cache/
+.venv*/
+.DS_Store
+.claude/

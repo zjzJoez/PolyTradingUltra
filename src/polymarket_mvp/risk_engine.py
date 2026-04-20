@@ -9,6 +9,7 @@ import requests
 from .common import blocked_market_reason, dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, price_is_tradable, read_proposals, resolve_token_id, tradable_price_bounds, utc_now_iso
 from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_workflow_fields
 from .services.authorization_service import evaluate_authorization
+from .services.event_cluster_service import MARKET_CLASS_CONFIG, classify_market_class
 from .services.portfolio_risk_service import evaluate_portfolio_risk
 
 
@@ -105,6 +106,15 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
         blocked_reason = blocked_market_reason(market)
         if blocked_reason:
             reasons.append(blocked_reason)
+        # Market-class segmentation: apply per-class limits if class is configured
+        if get_env_bool("POLY_RISK_MARKET_CLASS_ENABLED", True):
+            market_class = classify_market_class(market)
+            class_config = MARKET_CLASS_CONFIG.get(market_class, MARKET_CLASS_CONFIG.get("other"))
+            if class_config:
+                if not class_config["live_enabled"]:
+                    reasons.append(f"market_class_disabled[{market_class}]")
+                elif float(proposal["recommended_size_usdc"]) > float(class_config["max_order_usdc"]):
+                    reasons.append(f"market_class_size_exceeded[{market_class}:max={class_config['max_order_usdc']}]")
         if not market.get("active") or market.get("closed") or not market.get("accepting_orders"):
             reasons.append("market_not_tradeable")
     if proposal["recommended_size_usdc"] > max_order_usdc:
@@ -153,9 +163,24 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _persist_risk_decision(conn, proposal_id: str, reasons: List[str]) -> None:
+    """Save risk block reasons to proposals table for post-hoc attribution."""
+    if not reasons:
+        return
+    try:
+        import json as _json
+        conn.execute(
+            "UPDATE proposals SET risk_block_reasons_json = ?, updated_at = ? WHERE proposal_id = ?",
+            (_json.dumps(reasons), utc_now_iso(), proposal_id),
+        )
+    except Exception:
+        pass  # Column may not exist yet (pre-migration)
+
+
 def evaluate_full_record(conn, record: Dict[str, Any]) -> Dict[str, Any]:
     single_risk = evaluate_proposal(record)
     if not single_risk["approved_for_approval_gate"]:
+        _persist_risk_decision(conn, record["proposal_id"], single_risk["risk_summary"]["reasons"])
         return {
             "proposal_id": record["proposal_id"],
             "approved_for_approval_gate": False,
@@ -166,6 +191,7 @@ def evaluate_full_record(conn, record: Dict[str, Any]) -> Dict[str, Any]:
         }
     portfolio_risk = evaluate_portfolio_risk(conn, record)
     if not portfolio_risk["approved"]:
+        _persist_risk_decision(conn, record["proposal_id"], portfolio_risk["reasons"])
         return {
             "proposal_id": record["proposal_id"],
             "approved_for_approval_gate": False,

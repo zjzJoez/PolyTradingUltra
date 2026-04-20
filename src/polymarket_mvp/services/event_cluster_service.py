@@ -13,6 +13,60 @@ def market_type_for(market: Mapping[str, Any]) -> str:
     return "multi_outcome"
 
 
+# --- Market class classification for risk segmentation ---
+
+_CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "TRUMP"}
+_SPORTS_KEYWORDS = (
+    "nba", "nfl", "mlb", "nhl", "epl", "la liga", "serie a", "bundesliga",
+    "champions league", "premier league", "mls", "tennis", "atp", "wta",
+    "ufc", "boxing", "f1", "formula", "golf", "pga", "cricket", "rugby",
+)
+_ESPORTS_KEYWORDS = ("esports", "e-sports", "league of legends", "dota", "csgo", "cs2", "valorant", "overwatch")
+_TOTALS_KEYWORDS = ("over", "under", "total", "combined", "o/u")
+
+
+def classify_market_class(market: Mapping[str, Any]) -> str:
+    """Classify a market into one of: crypto_up_down, sports_winner, sports_totals, esports, other."""
+    base = market.get("market_json") if isinstance(market.get("market_json"), Mapping) else market
+    question = str(base.get("question") or "").lower()
+    slug = str(base.get("slug") or "").lower()
+    haystack = f"{question} {slug}"
+    outcome_names = set()
+    for item in base.get("outcomes", []):
+        if isinstance(item, Mapping):
+            outcome_names.add(str(item.get("name") or "").lower())
+
+    # Crypto directional markets
+    from ..common import infer_market_symbol
+    symbol = infer_market_symbol(base)
+    if symbol and symbol in _CRYPTO_SYMBOLS:
+        if "up" in haystack or "down" in haystack or outcome_names == {"up", "down"}:
+            return "crypto_up_down"
+
+    # Esports
+    if any(kw in haystack for kw in _ESPORTS_KEYWORDS):
+        return "esports"
+
+    # Sports totals (over/under)
+    is_sports = any(kw in haystack for kw in _SPORTS_KEYWORDS)
+    if is_sports:
+        if any(kw in haystack for kw in _TOTALS_KEYWORDS):
+            return "sports_totals"
+        return "sports_winner"
+
+    return "other"
+
+
+# Per-class risk configuration
+MARKET_CLASS_CONFIG: Dict[str, Dict[str, Any]] = {
+    "sports_winner":  {"live_enabled": True,  "max_order_usdc": 10, "max_daily_gross": 50, "max_open_positions": 5},
+    "sports_totals":  {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
+    "esports":        {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
+    "crypto_up_down": {"live_enabled": False, "max_order_usdc": 0,  "max_daily_gross": 0,  "max_open_positions": 0},
+    "other":          {"live_enabled": False, "max_order_usdc": 0,  "max_daily_gross": 0,  "max_open_positions": 0},
+}
+
+
 def _time_bucket(end_date: str | None) -> str:
     if not end_date:
         return "undated"
