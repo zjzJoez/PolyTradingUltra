@@ -181,9 +181,15 @@ def import_signals(
     for signal in signals:
         signal_id = signal["signal_id"]
 
-        # Skip duplicates
+        # Proposal already exists for this signal. Sync signal status to
+        # 'imported' so it stops re-appearing in the ready_for_import queue
+        # every cycle — otherwise a partial prior run that created the
+        # proposal but failed to update the signal status leaves the row
+        # zombied in ready_for_import forever.
         if signal_id in existing_ids:
-            results.append({"signal_id": signal_id, "action": "skipped_duplicate"})
+            if not dry_run:
+                mark_signal_imported(conn, signal_id)
+            results.append({"signal_id": signal_id, "action": "synced_existing_proposal"})
             continue
 
         # Skip expired

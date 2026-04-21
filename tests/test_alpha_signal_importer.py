@@ -243,16 +243,23 @@ class TestImportSignals(unittest.TestCase):
         import_signals(self.conn)
         self.conn.commit()
 
-        # Reset signal status to simulate re-run edge case
+        # Reset signal status to simulate a partial prior run that created the
+        # proposal but failed to sync the signal status.
         self.conn.execute(
             "UPDATE alpha_signals SET status='ready_for_import' WHERE signal_id='sig-001'"
         )
         self.conn.commit()
 
-        # Import again
+        # Import again — should detect the existing proposal and sync the
+        # signal status back to 'imported' instead of leaving it zombied.
         results = import_signals(self.conn)
-        duplicates = [r for r in results if r["action"] == "skipped_duplicate"]
-        self.assertEqual(len(duplicates), 1)
+        self.conn.commit()
+        synced = [r for r in results if r["action"] == "synced_existing_proposal"]
+        self.assertEqual(len(synced), 1)
+        status_row = self.conn.execute(
+            "SELECT status FROM alpha_signals WHERE signal_id='sig-001'"
+        ).fetchone()
+        self.assertEqual(status_row[0], "imported")
 
     def test_skip_expired_signal(self):
         self._insert_market()
