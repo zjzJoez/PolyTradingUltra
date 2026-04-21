@@ -1,779 +1,338 @@
-# Polymarket Trading OS v0.5
+<div align="center">
 
-Local-first Polymarket trading system with SQLite as the single business source of truth.
+# ⚡ PolyTradingUltra
 
-这个仓库现在已经不是一个单次脚本串起来的 MVP，而是一个本地常驻运行的 Polymarket 交易操作系统。它把市场扫描、上下文抓取、候选单生成、风险检查、人工审批、自动执行、订单对账、持仓管理、退出建议、复盘和运维控制，放进了一套统一的 Python + SQLite 控制面里。
+### An autonomous, 24/7 trading operating system for [Polymarket](https://polymarket.com)
 
-当前系统主要由 4 层组成：
+**Scan → Research → Propose → Risk-Check → Authorize → Execute → Reconcile → Review.** <br/>
+All of it, on loop. All of it, on a single laptop or a tiny EC2 box. All of it, with SQLite as the one source of truth.
 
-- 决策层
-  - OpenClaw / LLM 负责 proposal、memo、supervisor、exit、review 这类“需要判断”的节点
-  - 没有 LLM 时，deterministic / heuristic 路径依然能跑
-- 执行层
-  - Python pipeline 负责扫描、抓 context、跑风控、发 Telegram、执行订单、同步订单和持仓
-- 状态层
-  - SQLite 是唯一业务状态源，proposal / approval / execution / position / review 都落库
-- 运维层
-  - `8787` 是主业务 dashboard
-  - `8788` 是独立 control plane，用来在主系统停掉后仍能做 `start / stop / restart`
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![SQLite](https://img.shields.io/badge/state-SQLite-003B57.svg)](https://sqlite.org/)
+[![Polymarket CLOB](https://img.shields.io/badge/exchange-Polymarket%20CLOB-2c5ce8.svg)](https://docs.polymarket.com/)
+[![Telegram Approvals](https://img.shields.io/badge/HITL-Telegram-26A5E4.svg)](https://core.telegram.org/bots)
+[![Live Trading](https://img.shields.io/badge/mode-mock%20%2F%20real-green.svg)](#)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](#license)
 
-当前仓库支持：
+</div>
 
-- 市场扫描与上下文抓取
-- event clustering 与 research memo
-- proposal 元数据增强
-- 单 proposal 风控 + 组合风险 + 策略授权
-- Telegram 人工审批路径
-- `authorized_for_execution` 自动执行队列
-- `mock` / `real` 执行
-- positions / reconciliations / kill-switch / exit-review 基础设施
+---
 
-## What It Is
+> **Heads-up on the name.** This project was originally called `polymarket-mvp`. The GitHub repo and top-level directory were rebranded to **PolyTradingUltra**, but the Python package name (`polymarket_mvp`), CLI entry points (`polymarket-autopilot`, `poly-scanner`, …), env vars (`POLYMARKET_MVP_DB_PATH`), launchd/systemd units (`com.polymarket.*`, `mvp-autopilot.service`), and the SQLite filename (`polymarket_mvp.sqlite3`) were intentionally left untouched so a live deployment could be renamed without a redeploy. If you see `polymarket_mvp` anywhere inside — that's on purpose, that's us.
 
-一句话概括：
+## 🎯 What this is
 
-`scan -> context -> propose -> risk -> approve/authorize -> execute -> reconcile -> manage positions -> review`
+PolyTradingUltra is a **local-first, self-hosted prediction-market trading OS**. It isn't a notebook, it isn't a bot script, and it isn't a black-box "AI trader." It's a long-running supervisor that owns the whole path from *"this market just appeared"* to *"we have a filled position, and here's the post-mortem."*
 
-如果你把它当成产品来理解，现在它更像一个：
+Every piece of state lives in a single SQLite file. Every decision leaves an audit trail. Every step is independently restartable. You can kill the whole stack mid-cycle, come back an hour later, and the system will pick up exactly where it left off.
 
-- 本地运行的 Polymarket research + execution engine
-- 有人审路径和自动授权路径并存
-- 带运维控制面的单机交易系统
+It was designed for the kind of operator who wants:
 
-它不是“一个一直在自由思考的大脑”，而是一个 24/7 调度器：
+- 🧠 **LLM-augmented judgment** (via OpenClaw / an LLM adapter) for *memo*, *supervisor*, *exit*, and *review* nodes — with a deterministic fallback so nothing is load-bearing on AI
+- 🛡️ **Explicit risk, authorization, and kill-switch layers** between "the model thinks this is a trade" and "we sent real USDC to the CLOB"
+- 📱 **Human-in-the-loop approvals over Telegram** for anything outside a pre-authorized strategy
+- 🖥️ **Two web dashboards** (business state + an independent control plane that survives even if the main stack is down)
+- 📊 **Full replay capability** from the DB — positions, fills, reconciliations, research memos, exit decisions, post-trade reviews
 
-- 固定 cadence 轮询各个 loop
-- 在关键节点调用 LLM
-- 风控和授权决定 proposal 能不能继续往下走
-- Telegram/控制面负责人工干预
+## 🏗️ Architecture
 
-## Architecture
-
-系统职责分层：
-
-- OpenClaw / LLM
-  - 作为可选的薄包装 adapter
-  - 可以生成 memo、supervisor 决策、review
-  - deterministic 路径始终可跑
-- Python pipeline
-  - 扫描市场、抓事件、聚类、生成 memo、产出 proposal
-  - 执行风险检查、授权检查、审批、下单、对账、建仓
-- SQLite
-  - proposal、approval、execution、position、review 的唯一状态源
-- Risk + control plane
-  - slippage gate
-  - session spend guard
-  - strategy authorization
-  - kill-switch
-
-## Recommended Operating Model
-
-目前推荐的使用方式是：
-
-1. `autopilot` 常驻运行，负责 24/7 链路
-2. `tg-webhook` 常驻运行，负责 Telegram 审批和主 dashboard
-3. `control-plane` 常驻运行，负责独立的系统启停和状态查看
-4. `SQLite` 作为唯一状态源，不绕库做旁路状态管理
-
-推荐你平时只记住这两个页面：
-
-- 主业务 dashboard: `http://127.0.0.1:8787/ops`
-- 独立控制页: `http://127.0.0.1:8788/`
-
-它们的职责不同：
-
-- `8787`
-  - 看 proposals、failures、positions、heartbeats、recent events
-  - 这是业务侧观察页
-  - 如果你停掉主系统，这个页面自己也会消失
-- `8788`
-  - 做 `Start System / Stop System / Restart System`
-  - 查看主系统是否真的活着
-  - 这是系统外部的 control plane
-  - 就算 `8787` 已经挂了，`8788` 仍然可以把它重新拉起
-
-## System Flow
-
-主链路是：
-
-1. `scan`
-   - 扫描可交易市场，落库 `market_snapshots`
-2. `context`
-   - 为候选市场抓取新闻、事件和外部 context
-3. `propose`
-   - heuristic 或 OpenClaw/LLM 生成 proposal
-   - proposal 会补充 topic / cluster / memo / supervisor metadata
-4. `risk`
-   - 检查价格可交易性、slippage、topic/cluster exposure、session spend、strategy authorization
-5. `approve / authorize`
-   - 命中策略授权: `authorized_for_execution`
-   - 未命中自动授权: `pending_approval`，进入 Telegram
-6. `execute`
-   - 对 `authorized_for_execution` 或人工批准后的 proposal 下单
-7. `reconcile`
-   - 同步 live order、取消 stale order、刷新 position / mark / fill
-8. `exit / review`
-   - 为 open positions 生成 exit 建议
-   - 为 resolved positions 生成 review
-
-## Current Runtime Pieces
-
-你可以把系统运行时分成 3 个长驻组件：
-
-- `polymarket-autopilot`
-  - 主监督循环
-  - 负责 scan / context / propose / expiry / execute / reconcile / exit / review
-- `tg-approver serve --port 8787`
-  - Telegram webhook server
-  - 同时承载 `/ops` dashboard 和 `/api/ops/*`
-- `python -m polymarket_mvp.control_plane --port 8788`
-  - 独立系统控制页
-  - 承载 `/api/system/status` 和 `/api/system/control`
-
-## Current Operating Modes
-
-### 1. Authorization-first queue
-
-这是当前 v0.3/v0.4 的主工作流：
-
-1. `poly-scanner`
-2. `event-fetcher`
-3. `cluster-events`
-4. `build-memos`
-5. `proposal-generator`
-6. `risk-engine`
-7. `poly-executor --source authorized_queue`
-8. `update-positions`
-9. `position-report`
-
-当 proposal 命中有效的 `strategy_authorization` 时，`risk-engine` 会把 proposal 状态推进到 `authorized_for_execution`，然后由 executor 扫描队列执行。
-
-### 2. Human approval fallback
-
-当 proposal 没有命中自动授权时，`risk-engine` 会把它推进到 `pending_approval`，然后进入 Telegram 审批路径：
-
-1. `tg-approver send`
-2. `tg-approver serve`
-3. Telegram `Approve / Reject`
-4. `poly-executor --proposal-file ...`
-
-注意：
-
-- 当前仓库的 workflow YAML 重点覆盖 authorization-first 路径
-- Telegram 路径仍然可用，但更适合 operator 手动选择 pending proposals 后执行
-
-## Day-To-Day Usage
-
-如果你平时只是开系统、看状态、停系统，推荐最短路径如下。
-
-启动系统：
-
-```bash
-./.venv311/bin/python scripts/system_control.py start
+```mermaid
+flowchart LR
+    A[poly-scanner<br/>live markets] --> B[event-fetcher<br/>news + social]
+    B --> C[cluster-events<br/>+ memos]
+    C --> D[proposer<br/>heuristic / LLM]
+    D --> E[risk-engine<br/>slippage · exposure · auth]
+    E -->|authorized| G[poly-executor<br/>CLOB]
+    E -->|pending| F[Telegram approval]
+    F -->|approved| G
+    G --> H[sync-orders<br/>+ reconciliations]
+    H --> I[update-positions]
+    I --> J[exit-agent<br/>open positions]
+    I --> K[review-agent<br/>resolved positions]
+    J -.-> D
+    style G fill:#2c5ce8,stroke:#2c5ce8,color:#fff
+    style E fill:#e8a42c,stroke:#e8a42c,color:#000
+    style F fill:#26A5E4,stroke:#26A5E4,color:#fff
 ```
 
-或者直接打开：
+### Four-layer separation
 
-- `scripts/start_system.command`
+| Layer | What lives there | Why |
+|---|---|---|
+| **Decision** | OpenClaw / LLM adapters for memo, supervisor, exit, review | Judgment calls — with deterministic fallback so the pipeline never stops when the LLM is down |
+| **Execution** | Python pipeline: scan, fetch context, risk, place orders, sync fills | Pure code, fully testable, no prompts in the hot path |
+| **State** | SQLite — `proposals`, `approvals`, `executions`, `positions`, `reconciliations`, `reviews`, … | One file, one source of truth, cheap to back up |
+| **Ops** | `:8787` business dashboard · `:8788` independent control plane | You can start / stop / restart the whole system from `:8788` even if `:8787` is dead |
 
-看系统：
+### The two web surfaces
 
-- `http://127.0.0.1:8788/` 看控制面
-- `http://127.0.0.1:8787/ops` 看主业务状态
+- **`http://127.0.0.1:8787/ops`** — the business dashboard. Proposals, failures, positions, heartbeats, recent events. Lives inside the main system; if autopilot dies, this page dies with it.
+- **`http://127.0.0.1:8788/`** — the control plane. Start / Stop / Restart the main system. Check whether autopilot is actually alive. Runs *outside* the main system on purpose, so it can still resuscitate a down stack.
 
-停止系统：
+## ✨ Features
 
-```bash
-./.venv311/bin/python scripts/system_control.py stop
-```
+<table>
+<tr>
+<td width="50%" valign="top">
 
-重启系统：
+### Decision & research
+- Per-market **research memos** backed by optional LLM
+- **Event clustering** so correlated markets share risk
+- **Heuristic proposer** (zero-LLM path) for pure mechanical edge
+- **OpenClaw / LLM proposer** for narrative-driven calls
+- **Supervisor + exit agents** for position management
+- **Post-mortem review agent** runs on every resolved market
 
-```bash
-./.venv311/bin/python scripts/system_control.py restart
-```
+</td>
+<td width="50%" valign="top">
 
-启动独立 control plane：
+### Risk & controls
+- **Slippage gate** using live CLOB orderbook
+- **Per-topic / per-cluster / per-strategy exposure caps**
+- **Session spend guard** — hard cap per run
+- **Strategy authorization tokens** — pre-approve a strategy, skip Telegram
+- **Kill-switch** scoped to market / strategy / global
+- **Real-executor preflight** stricter than risk-engine
 
-```bash
-./.venv311/bin/python -m polymarket_mvp.control_plane --port 8788
-```
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
-或者直接打开：
+### Execution
+- Polymarket CLOB via `py-clob-client`
+- Mock executor for dry runs
+- Stale order auto-cancellation
+- Live order sync + reconciliation loop
+- Redemption of resolved positions
+- USDC + Polygon RPC integration
 
-- `scripts/start_control_plane.command`
+</td>
+<td width="50%" valign="top">
 
-## Repository Layout
+### Operations
+- **Telegram webhook approval flow** with TTLs
+- **Heartbeat table** for external observability
+- **launchd (macOS) + systemd (Linux) deploy templates**
+- Independent **`control_plane`** for lifecycle management
+- JSON APIs at `/api/ops/*` and `/api/system/*`
 
-```text
-src/polymarket_mvp/
-  agents/
-    exit_agent.py
-    research_agent.py
-    review_agent.py
-    supervisor_agent.py
-  migrations/
-    20260322_v03_v04.sql
-  services/
-    authorization_service.py
-    event_cluster_service.py
-    kill_switch_service.py
-    memo_service.py
-    openclaw_adapter.py
-    portfolio_risk_service.py
-    position_manager.py
-    reconciler.py
-    shadow_service.py
-  autopilot.py
-  autopilot_status.py
-  authorize_strategy.py
-  build_memos.py
-  cluster_events.py
-  common.py
-  db.py
-  db_init.py
-  event_fetcher.py
-  kill_switch.py
-  list_authorizations.py
-  mock_executor.py
-  poly_executor.py
-  poly_scanner.py
-  position_report.py
-  proposer.py
-  resolution_backfill.py
-  risk_engine.py
-  control_plane.py
-  run_exit_agent.py
-  run_review_agent.py
-  shadow_execute.py
-  sync_orders.py
-  tg_approver.py
-  update_positions.py
+</td>
+</tr>
+</table>
 
-schema.sql
-workflows/openclaw-polymarket-mvp.yaml
-deploy/
-  com.polymarket.autopilot.plist
-  com.polymarket.control-plane.plist
-  com.polymarket.tg-webhook.plist
-```
-
-## Installation
-
-Python 3.11+ is recommended. Real execution requires Python 3.10+ and `py-clob-client`.
+## 🚀 Quickstart
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e .
-```
-
-For real trading:
-
-```bash
+# 1. Clone & install
+gh repo clone zjzJoez/PolyTradingUltra
+cd PolyTradingUltra
+python3.11 -m venv .venv311
+source .venv311/bin/activate
 pip install -e .[real-exec]
-```
 
-## Environment
-
-Copy `.env.example`:
-
-```bash
+# 2. Configure
 cp .env.example .env
-```
+# edit .env — fill in Telegram, OpenClaw, Polymarket CLOB, risk caps
 
-Important variable groups:
-
-- Core
-  - `POLYMARKET_MVP_STATE_DIR`
-  - `POLYMARKET_MVP_DB_PATH`
-- Telegram
-  - `TG_BOT_TOKEN`
-  - `TG_CHAT_ID`
-  - `TG_WEBHOOK_SECRET`
-  - `TG_AUTO_EXECUTE_ON_APPROVE`
-  - `TG_AUTO_EXECUTE_MODE`
-- Context adapters
-  - `CRYPTOPANIC_AUTH_TOKEN`
-  - `APIFY_TOKEN` or `APIFY_API_KEY`
-  - `PERPLEXITY_API_KEY`
-  - `PERPLEXITY_MODEL`
-- OpenClaw
-  - `OPENCLAW_TRANSPORT`
-  - `OPENCLAW_CLI_PATH`
-  - `OPENCLAW_AGENT_ID`
-  - `OPENCLAW_THINKING`
-  - `OPENCLAW_TIMEOUT_SECONDS`
-  - `OPENCLAW_API_URL`
-  - `OPENCLAW_API_KEY`
-  - `OPENCLAW_MODEL`
-- Risk
-  - `POLY_RISK_MAX_ORDER_USDC`
-  - `POLY_RISK_MIN_CONFIDENCE`
-  - `POLY_RISK_MAX_SLIPPAGE_BPS`
-  - `POLY_RISK_REQUIRE_EXECUTABLE_MARKET`
-  - `POLY_MIN_TRADABLE_PRICE`
-  - `POLY_MAX_TRADABLE_PRICE`
-  - `POLY_RISK_MAX_TOPIC_EXPOSURE_USDC`
-  - `POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC`
-  - `POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC`
-  - `POLYMARKET_AVAILABLE_BALANCE_U`
-- Real execution / CLOB
-  - `POLY_CLOB_HOST`
-  - `CHAIN_ID` or `POLY_CLOB_CHAIN_ID`
-  - `SIGNATURE_TYPE` or `POLY_CLOB_SIGNATURE_TYPE`
-  - `FUNDER` or `POLY_CLOB_FUNDER`
-  - `POLY_API_KEY`
-  - `POLY_API_SECRET`
-  - `POLY_API_PASSPHRASE`
-  - `POLY_CLOB_SIGNER_KEY`
-  - `SESSION_MAX_BALANCE_USDC`
-  - `SESSION_MAX_SPEND_USDC`
-  - `POLYGON_RPC_URL` — Polygon RPC endpoint for on-chain approve txns (default: `https://polygon-bor-rpc.publicnode.com`)
-
-## CLI Entry Points
-
-Current console scripts:
-
-```bash
-db-init
-poly-scanner
-event-fetcher
-cluster-events
-build-memos
-proposal-generator
-risk-engine
-authorize-strategy
-list-authorizations
-shadow-execute
-tg-approver
-poly-executor
-poly-mock-executor
-update-positions
-sync-orders
-kill-switch
-run-exit-agent
-run-review-agent
-position-report
-backfill-resolutions
-polymarket-autopilot
-autopilot-status
-system-control-plane
-```
-
-Equivalent module form:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.<module>
-```
-
-Control plane helper script:
-
-```bash
-./.venv311/bin/python scripts/system_control.py start
-./.venv311/bin/python scripts/system_control.py stop
-./.venv311/bin/python scripts/system_control.py restart
-```
-
-## Data Model
-
-Main tables:
-
-- `market_snapshots`
-- `market_contexts`
-- `event_clusters`
-- `market_event_links`
-- `research_memos`
-- `proposals`
-- `proposal_contexts`
-- `strategy_authorizations`
-- `approvals`
-- `executions`
-- `shadow_executions`
-- `positions`
-- `position_events`
-- `order_reconciliations`
-- `kill_switches`
-- `exit_recommendations`
-- `agent_reviews`
-- `market_resolutions`
-
-Main proposal statuses:
-
-- `proposed`
-- `risk_blocked`
-- `pending_approval`
-- `approved`
-- `rejected`
-- `authorized_for_execution`
-- `executed`
-- `failed`
-- `expired`
-- `cancelled`
-
-Important semantics:
-
-- `approved` means explicit human approval
-- `authorized_for_execution` means code-level strategy authorization matched
-- `executed` means an execution record was successfully persisted
-- `real` executor still performs stricter preflight than `risk-engine`
-
-## Quick Start: Authorization-first v0.4 Flow
-
-### 1. Initialize or migrate database
-
-```bash
+# 3. Initialize the DB
 PYTHONPATH=src python3 -m polymarket_mvp.db_init
-```
 
-### 2. Scan live markets
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.poly_scanner \
-  --min-liquidity 10000 \
-  --max-expiry-days 7 \
-  --output artifacts/markets.json
-```
-
-### 3. Fetch event context
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.event_fetcher \
-  --market-file artifacts/markets.json \
-  --output artifacts/contexts.json
-```
-
-### 4. Cluster markets
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.cluster_events \
-  --market-file artifacts/markets.json \
-  --output artifacts/clusters.json
-```
-
-### 5. Build research memos
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.build_memos \
-  --market-file artifacts/markets.json \
-  --output artifacts/memos.json
-```
-
-### 6. Seed strategy authorizations
-
-Create a JSON file like:
-
-```json
-{
-  "strategy_name": "near_expiry_conviction",
-  "scope_topic": "BTC",
-  "scope_market_type": "binary",
-  "scope_event_cluster_id": null,
-  "max_order_usdc": 5.0,
-  "max_daily_gross_usdc": 25.0,
-  "max_open_positions": 5,
-  "max_daily_loss_usdc": 25.0,
-  "max_slippage_bps": 500,
-  "allow_auto_execute": true,
-  "requires_human_if_above_usdc": 5.0,
-  "valid_from": "2026-03-31T00:00:00Z",
-  "valid_until": "2026-12-31T00:00:00Z",
-  "status": "active",
-  "created_by": "operator"
-}
-```
-
-Then load it:
-
-```bash
+# 4. Pre-authorize a strategy (optional, skips human approval for matching trades)
 PYTHONPATH=src python3 -m polymarket_mvp.authorize_strategy create \
-  --json-file artifacts/strategy-authorization.json \
-  --output artifacts/authorization.json
+  --json-file artifacts/strategy-authorization.json
+
+# 5. Fire up the whole OS (three long-running processes)
+./scripts/start_control_plane.command   # :8788, the lifecycle UI
+./scripts/start_system.command           # starts autopilot + :8787 dashboard
 ```
 
-### 7. Generate proposals
+Now visit **http://127.0.0.1:8788/** and watch the system go.
 
-Heuristic:
+## 📈 Operating modes
+
+<details>
+<summary><b>Mode 1 — Authorization-first (recommended, the 24/7 path)</b></summary>
+
+Any proposal that matches an active `strategy_authorization` row skips Telegram and goes straight to the executor queue. This is the path `polymarket-autopilot` drives on a loop:
+
+```
+poly-scanner → event-fetcher → cluster-events → build-memos →
+proposal-generator → risk-engine → poly-executor[authorized_queue] →
+update-positions → position-report
+```
+</details>
+
+<details>
+<summary><b>Mode 2 — Human approval fallback (HITL via Telegram)</b></summary>
+
+Proposals outside any active authorization get pushed to Telegram with deep-linked Approve/Reject buttons and a TTL. After `Approve`, the executor picks them up:
+
+```
+tg-approver send → Telegram ↔ operator → risk-engine[approved] → poly-executor
+```
+</details>
+
+<details>
+<summary><b>Mode 3 — Shadow mode</b></summary>
+
+Same pipeline, but `poly-executor --mode mock` writes to `shadow_executions` instead of placing real orders. Use this to paper-trade a new strategy for a week before authorizing it for real execution.
+</details>
+
+## 📂 Repository layout
+
+```
+src/polymarket_mvp/
+├── agents/               # LLM-backed: research · supervisor · exit · review
+├── services/             # risk · reconciliation · event clustering · redeemer · …
+├── migrations/           # versioned SQL migrations
+├── autopilot.py          # 24/7 supervisor loop
+├── control_plane.py      # independent :8788 lifecycle UI
+├── tg_approver.py        # Telegram webhook + /ops dashboard at :8787
+├── poly_scanner.py       # Polymarket gamma API scanner
+├── proposer.py           # heuristic + LLM proposal generation
+├── risk_engine.py        # the gate
+├── poly_executor.py      # mock + real CLOB executor
+├── sync_orders.py        # live order reconciler
+├── update_positions.py   # position + mark-to-market refresh
+├── run_exit_agent.py     # LLM exit recommendations
+├── run_review_agent.py   # post-trade review
+└── kill_switch.py        # emergency halt
+
+deploy/
+├── com.polymarket.autopilot.plist         # launchd (macOS)
+└── cloud/systemd/                         # systemd units (Linux / EC2)
+
+schema.sql                 # full DB schema (21 tables)
+workflows/                 # OpenClaw workflow YAMLs
+```
+
+## 🗄️ Data model
+
+Twenty-one tables. The hot path:
+
+| Table | Role |
+|---|---|
+| `market_snapshots` | Every market the scanner ever saw, tick-by-tick |
+| `market_contexts` | News, social, event context attached to a market |
+| `event_clusters` + `market_event_links` | Which markets share a real-world event |
+| `research_memos` | Per-market LLM memo (or heuristic stub) |
+| `proposals` + `proposal_contexts` | What we want to trade and why |
+| `strategy_authorizations` | Pre-approved strategies (auto-execute without Telegram) |
+| `approvals` | Telegram HITL approvals |
+| `executions` + `shadow_executions` | Real and mock fills |
+| `positions` + `position_events` | Current book + event log |
+| `order_reconciliations` | Live order → DB truth-up |
+| `exit_recommendations` | Exit-agent output for open positions |
+| `agent_reviews` | Post-mortem on resolved positions |
+| `market_resolutions` | Oracle-resolved outcomes |
+| `kill_switches` | Scoped halts: market / strategy / global |
+| `autopilot_heartbeats` | Liveness telemetry |
+
+Proposal state machine:
+
+```
+proposed → risk_blocked
+        → pending_approval → approved / rejected → executed
+        → authorized_for_execution → executed
+        → failed / expired / cancelled
+```
+
+## 🔐 Risk & safety
+
+- **No secrets in git.** `.env.example` is a template. Real keys live in `.env` (gitignored) or a secrets manager.
+- **Real-executor preflight is stricter than risk-engine.** Signature check, USDC balance sanity, session spend, max slippage — all re-verified at the CLOB boundary before any order goes out.
+- **Kill-switch is first-class.** `kill-switch set --scope-type global --reason "..."` halts the whole system; scoped halts cover single strategies or markets.
+- **Approval TTLs prevent stale clicks.** Telegram approvals expire if you don't act in time, so an old notification can't accidentally fire trades hours later.
+- **Session spend guards.** Hard cap per autopilot run — even if every other check failed, the system can't bleed more than the configured ceiling per session.
+
+## 🧭 Environment variables
+
+Grouped by concern — full list in `.env.example`:
+
+- **Core** — `POLYMARKET_MVP_STATE_DIR`, `POLYMARKET_MVP_DB_PATH`
+- **Telegram** — `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_WEBHOOK_SECRET`, `TG_AUTO_EXECUTE_ON_APPROVE`
+- **Context adapters** — `CRYPTOPANIC_AUTH_TOKEN`, `APIFY_TOKEN`, `PERPLEXITY_API_KEY`
+- **OpenClaw / LLM** — `OPENCLAW_TRANSPORT`, `OPENCLAW_API_URL`, `OPENCLAW_MODEL`, `OPENCLAW_TIMEOUT_SECONDS`
+- **Risk** — `POLY_RISK_MAX_ORDER_USDC`, `POLY_RISK_MAX_SLIPPAGE_BPS`, `POLY_RISK_MAX_TOPIC_EXPOSURE_USDC`, `POLY_RISK_MAX_CLUSTER_EXPOSURE_USDC`, `POLY_RISK_MAX_STRATEGY_DAILY_GROSS_USDC`
+- **CLOB** — `POLY_CLOB_HOST`, `CHAIN_ID`, `FUNDER`, `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE`, `POLY_CLOB_SIGNER_KEY`, `POLYGON_RPC_URL`
+- **Autopilot cadence** — `POLY_SCAN_INTERVAL_SECONDS`, `POLY_DECISION_INTERVAL_SECONDS`, `POLY_RECONCILE_INTERVAL_SECONDS`, `POLY_EXIT_INTERVAL_SECONDS`
+- **Session caps** — `SESSION_MAX_BALANCE_USDC`, `SESSION_MAX_SPEND_USDC`
+
+## 🧪 CLI entry points
+
+```
+db-init                    backfill-resolutions
+poly-scanner               authorize-strategy
+event-fetcher              list-authorizations
+cluster-events             shadow-execute
+build-memos                tg-approver
+proposal-generator         poly-executor / poly-mock-executor
+risk-engine                update-positions
+polymarket-autopilot       sync-orders
+autopilot-status           kill-switch
+system-control-plane       run-exit-agent / run-review-agent
+position-report
+```
+
+Every command also works as `PYTHONPATH=src python3 -m polymarket_mvp.<module>`.
+
+## 🔌 Alpha Lab integration
+
+PolyTradingUltra is the **execution system**. A sibling research project, [**polymarket-alpha-lab**](https://github.com/zjzJoez/polymarket-alpha-lab), is the **signal engine** for soccer markets — Dixon-Coles priors, isotonic calibration, CLV observation, the lot.
+
+The integration is deliberately narrow. One table, one direction:
+
+```
+alpha_signals (status='ready_for_import')
+    │
+    ▼
+polymarket_mvp.alpha_signal_importer  →  proposals (decision_engine='alpha_lab')
+```
+
+Alpha Lab publishes a fair-value signal. The importer turns it into a proposal. The proposal flows through the normal risk → authorize → execute pipeline. No Python imports cross the boundary. No repo depends on the other at the code level. They share a single SQLite file and one table-level contract.
+
+## 🚢 Deployment
+
+### macOS (launchd)
 
 ```bash
-PYTHONPATH=src python3 -m polymarket_mvp.proposer \
-  --market-file artifacts/markets.json \
-  --context-file artifacts/contexts.json \
-  --engine heuristic \
-  --size-usdc 5 \
-  --top 3 \
-  --max-slippage-bps 500 \
-  --output artifacts/proposals.json
-```
-
-External OpenClaw / LLM JSON:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.proposer \
-  --market-file artifacts/markets.json \
-  --context-file artifacts/contexts.json \
-  --engine openclaw_llm \
-  --proposal-file artifacts/openclaw-proposals.json \
-  --output artifacts/proposals.json
-```
-
-Direct OpenClaw generation:
-
-```bash
-OPENCLAW_TRANSPORT=cli \
-PYTHONPATH=src python3 -m polymarket_mvp.proposer \
-  --market-file artifacts/markets.json \
-  --context-file artifacts/contexts.json \
-  --engine openclaw_llm \
-  --size-usdc 5 \
-  --top 3 \
-  --max-slippage-bps 500 \
-  --output artifacts/proposals.json
-```
-
-Notes:
-
-- `OPENCLAW_TRANSPORT=cli` uses your local `openclaw agent --local --json`.
-- If `OPENCLAW_TRANSPORT` is omitted, the adapter tries `OPENCLAW_API_URL` first, then local CLI, then OpenAI chat completion fallback.
-- `--proposal-file` remains supported when you want OpenClaw to run outside the repo and only import the final JSON.
-
-### 8. Apply risk and authorization
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.risk_engine \
-  --proposal-file artifacts/proposals.json \
-  --output artifacts/risk.json
-```
-
-Expected outcomes:
-
-- `risk_blocked`
-- `pending_approval`
-- `authorized_for_execution`
-
-### 9. Execute authorized queue
-
-Mock:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.poly_executor \
-  --source authorized_queue \
-  --mode mock \
-  --output artifacts/authorized-execution.json
-```
-
-Real:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.poly_executor \
-  --source authorized_queue \
-  --mode real \
-  --output artifacts/authorized-execution.json
-```
-
-### 10. Refresh positions and report
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.update_positions \
-  --output artifacts/positions.json
-```
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.position_report \
-  --output artifacts/position-report.json
-```
-
-## Human Approval Path
-
-### 1. Run Telegram webhook server
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.tg_approver serve --port 8787
-```
-
-### 2. Expose it publicly
-
-```bash
-ngrok http 8787
-```
-
-### 3. Register webhook
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.tg_approver set-webhook \
-  --webhook-url https://<your-ngrok-domain>
-```
-
-### 4. Send pending approvals
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.tg_approver send \
-  --proposal-file artifacts/proposals.json \
-  --output artifacts/approval-request.json
-```
-
-### 5. Wait or poll status
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.tg_approver status \
-  --proposal-file artifacts/proposals.json \
-  --output artifacts/approval-status.json
-```
-
-Operator note:
-
-- `tg-approver send` is intended for proposals currently in `pending_approval`
-- If your proposal file mixes `authorized_for_execution` and `pending_approval`, run the auto-exec queue separately first or export a pending-only proposal subset
-
-## Reconciliation, Control, And Review
-
-Sync live orders:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.sync_orders \
-  --output artifacts/reconciliations.json
-```
-
-Set kill-switch:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.kill_switch set \
-  --scope-type strategy \
-  --scope-key near_expiry_conviction \
-  --reason "manual halt"
-```
-
-Generate exit suggestions:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.run_exit_agent \
-  --output artifacts/exit-recommendations.json
-```
-
-Backfill resolutions:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.resolution_backfill \
-  --input artifacts/resolutions.json \
-  --output artifacts/resolution-backfill.json
-```
-
-Generate reviews:
-
-```bash
-PYTHONPATH=src python3 -m polymarket_mvp.run_review_agent \
-  --output artifacts/reviews.json
-```
-
-## 24/7 Autopilot Mode (v0.5)
-
-The autopilot replaces the manual CLI chain with a single long-running supervisor:
-
-```bash
-polymarket-autopilot
-```
-
-It continuously runs: scan -> context -> propose -> risk -> approve(TG) -> execute -> reconcile -> exit -> review.
-
-Key features:
-- Approval deadlines: each Telegram approval has a TTL; proposals auto-expire if not acted on
-- Stale order cancellation: live orders exceeding their TTL are auto-cancelled
-- OpenClaw exit proposals: LLM-powered exit decisions for open positions
-- Heartbeat logging to `autopilot_heartbeats` table for observability
-
-Check status:
-
-```bash
-autopilot-status
-```
-
-Local dashboard:
-
-```text
-http://127.0.0.1:8787/ops
-```
-
-Standalone control plane:
-
-```text
-http://127.0.0.1:8788/
-```
-
-JSON observability endpoints:
-
-- `/api/ops/status`
-- `/api/ops/proposals`
-- `/api/ops/failures`
-- `/api/ops/events`
-- `http://127.0.0.1:8788/api/system/status`
-- `http://127.0.0.1:8788/api/system/control`
-
-### launchd Deployment (macOS)
-
-```bash
-# Copy plist templates
+# Edit the plist paths to point at your install, then:
 cp deploy/com.polymarket.autopilot.plist ~/Library/LaunchAgents/
-cp deploy/com.polymarket.tg-webhook.plist ~/Library/LaunchAgents/
-cp deploy/com.polymarket.control-plane.plist ~/Library/LaunchAgents/
-
-# Edit paths in plists to match your setup, then load
 launchctl load ~/Library/LaunchAgents/com.polymarket.autopilot.plist
-launchctl load ~/Library/LaunchAgents/com.polymarket.tg-webhook.plist
-launchctl load ~/Library/LaunchAgents/com.polymarket.control-plane.plist
-
-# Set Telegram webhook (one-time)
-tg-approver set-webhook --webhook-url https://your-ngrok-domain
-
-# Verify
-autopilot-status
 ```
 
-Control plane:
+### Linux (systemd, what we run on EC2)
 
-- `http://127.0.0.1:8788/`
-- Stays outside the main trading system so it can start `autopilot` and `tg-webhook` even when port `8787` is down
+```bash
+# Run the idempotent installer:
+sudo bash deploy/cloud/scripts/install.sh
+sudo systemctl enable --now mvp-autopilot.service
+sudo systemctl enable --now db-backup.timer
+```
 
-Current recommendation on macOS:
+All systemd units + timers live under `deploy/cloud/systemd/`.
 
-- Let `control-plane` auto-start on login via `launchd`
-- Keep `autopilot` and `tg-webhook` under the control plane unless you fully migrate them to `launchd`
-- Use `8788` for lifecycle control, not `8787`
+## 🛣️ Roadmap
 
-Autopilot environment variables:
-- `POLY_SCAN_INTERVAL_SECONDS` (default 30)
-- `POLY_CONTEXT_INTERVAL_SECONDS` (default 60)
-- `POLY_DECISION_INTERVAL_SECONDS` (default 30)
-- `POLY_RECONCILE_INTERVAL_SECONDS` (default 10)
-- `POLY_EXIT_INTERVAL_SECONDS` (default 30)
-- `POLY_APPROVAL_MAX_TTL_SECONDS` (default 300)
-- `POLY_APPROVAL_EXPIRY_BUFFER_SECONDS` (default 120)
-- `POLY_ORDER_MAX_LIVE_TTL_SECONDS` (default 300)
-- `POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP` (default 25)
-- `POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP` (default 3)
-- `POLY_AUTOPILOT_MAX_PENDING_APPROVALS` (default 5)
-- `POLY_AUTOPILOT_MAX_TG_SEND_PER_LOOP` (default 3)
-- `POLY_AUTOPILOT_MAX_EXIT_PROPOSALS_PER_LOOP` (default 5)
+- [x] v0.3/v0.4 — authorization-first queue, Telegram HITL fallback
+- [x] v0.5 — 24/7 autopilot, control plane, launchd + systemd deploy
+- [x] v0.6 — Alpha Lab signal importer, trade-review agent
+- [x] v0.7 — first real fills on Polymarket (Apr 2026)
+- [ ] v0.8 — multi-account / multi-wallet
+- [ ] v0.9 — web-native operator UI (retire the dual-port dashboard pair)
+- [ ] v1.0 — strategy performance attribution + P&L-aware auth limits
 
-## Notes
+## 🙏 Credits
 
-- `event_fetcher` Twitter adapter soft-fails when Apify blocks the actor; the pipeline continues with a fallback context.
-- `risk-engine` now falls back to snapshot outcome price when CLOB `/price` returns `404 No orderbook exists`, which avoids false negatives for markets still usable in higher-level workflows.
-- `real` execution is still stricter than `risk-engine`; no change was made to preflight signing, balance sanity, session spend, or slippage enforcement.
-- Existing long-running `tg_approver serve` processes should be restarted after code changes.
-- The current workflow YAML is authorization-first. Telegram approval remains a supported operator path, but not the only path.
+Built solo as a full-stack autonomous trading research project — product, architecture, code, deploy, and ops.
 
-## Verification
+Powered by:
+- [Polymarket CLOB](https://docs.polymarket.com/) via [`py-clob-client`](https://github.com/Polymarket/py-clob-client)
+- [Telegram Bot API](https://core.telegram.org/bots)
+- [Anthropic Claude](https://www.anthropic.com/) / OpenClaw for LLM judgment nodes
+- [CryptoPanic](https://cryptopanic.com/), [Perplexity](https://www.perplexity.ai/), [Apify](https://apify.com/) for context
 
-The current repo has a verified smoke-tested path for:
+## License
 
-- `risk-engine -> authorized_for_execution`
-- `poly-executor --source authorized_queue`
-- `update-positions`
-- `position-report`
-
-Representative outputs:
-
-- [artifacts/smoke-risk-3.json](/private/tmp/polymarket-mvp/artifacts/smoke-risk-3.json)
-- [artifacts/smoke-authorized-execution-3.json](/private/tmp/polymarket-mvp/artifacts/smoke-authorized-execution-3.json)
-- [artifacts/smoke-position-report-postfix.json](/private/tmp/polymarket-mvp/artifacts/smoke-position-report-postfix.json)
+MIT.

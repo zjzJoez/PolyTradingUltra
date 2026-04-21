@@ -7,13 +7,13 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/joez/Desktop/polymarket-mvp/.venv311/bin/python</string>
+    <string>/ABSOLUTE/PATH/TO/PolyTradingUltra/.venv311/bin/python</string>
     <string>-m</string>
     <string>polymarket_mvp.autopilot</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/joez/Desktop/polymarket-mvp</string>
+  <string>/ABSOLUTE/PATH/TO/PolyTradingUltra</string>
 
   <key>EnvironmentVariables</key>
   <dict>
@@ -28,9 +28,9 @@
   <integer>10</integer>
 
   <key>StandardOutPath</key>
-  <string>/Users/joez/Desktop/polymarket-mvp/var/log/autopilot.log</string>
+  <string>/ABSOLUTE/PATH/TO/PolyTradingUltra/var/log/autopilot.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/joez/Desktop/polymarket-mvp/var/log/autopilot.err</string>
+  <string>/ABSOLUTE/PATH/TO/PolyTradingUltra/var/log/autopilot.err</string>
 </dict>
 </plist>
