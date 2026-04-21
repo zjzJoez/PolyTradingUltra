@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket MVP autopilot (scan+propose+risk+approve+execute, shadow mode)
+Description=Polymarket MVP autopilot (scan+propose+risk+auto-execute, REAL mode)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,8 +8,8 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/polymarket-mvp
 EnvironmentFile=/home/ubuntu/polymarket-mvp/.env
-Environment=MVP_SHADOW_MODE=1
-Environment=POLY_AUTOPILOT_EXECUTE_MODE=mock
+Environment=MVP_SHADOW_MODE=0
+Environment=POLY_AUTOPILOT_EXECUTE_MODE=real
 ExecStart=/home/ubuntu/polymarket-mvp/.venv/bin/polymarket-autopilot --max-iterations=5
 StandardOutput=journal
 StandardError=journal

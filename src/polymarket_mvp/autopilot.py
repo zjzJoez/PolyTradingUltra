@@ -254,7 +254,7 @@ class Autopilot:
         if not markets:
             return 0
 
-        proposals = run_proposal_pipeline(conn, markets, engine="openclaw_llm",
+        proposals = run_proposal_pipeline(conn, markets, engine="heuristic",
                                           size_usdc=get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0),
                                           top=get_env_int("POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP", 3))
         # Run risk engine on each
