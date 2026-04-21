@@ -197,7 +197,7 @@ class Autopilot:
         # Fetch contexts for markets scanned recently (from DB)
         rows = conn.execute(
             "SELECT * FROM market_snapshots WHERE active = 1 AND accepting_orders = 1 ORDER BY last_scanned_at DESC LIMIT ?",
-            (get_env_int("POLY_AUTOPILOT_MAX_CANDIDATES_PER_LOOP", 25),),
+            (get_env_int("POLY_AUTOPILOT_CONTEXT_MAX_CANDIDATES", 25),),
         ).fetchall()
         if not rows:
             return 0
