@@ -29,7 +29,11 @@ from .db import (
     proposal_record,
 )
 from .agents.supervisor_agent import supervise_record
-from .services.event_cluster_service import cluster_market
+from .services.event_cluster_service import (
+    MARKET_CLASS_CONFIG,
+    classify_market_class,
+    cluster_market,
+)
 from .services.memo_service import build_and_store_memo
 from .services.openclaw_adapter import maybe_generate_trade_proposals
 
@@ -64,6 +68,12 @@ def build_heuristic_proposals(
     candidates: List[Dict[str, Any]] = []
     for market in markets:
         if blocked_market_reason(market):
+            continue
+        # Skip markets whose class is disabled in risk config, otherwise the
+        # top-N slots get consumed by candidates that will be blocked downstream.
+        market_class = classify_market_class(market)
+        class_config = MARKET_CLASS_CONFIG.get(market_class) or MARKET_CLASS_CONFIG.get("other", {})
+        if not class_config.get("live_enabled", False):
             continue
         prices = _extract_yes_no_prices(market)
         if set(prices.keys()) != {"Yes", "No"}:

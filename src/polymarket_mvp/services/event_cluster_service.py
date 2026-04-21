@@ -15,7 +15,7 @@ def market_type_for(market: Mapping[str, Any]) -> str:
 
 # --- Market class classification for risk segmentation ---
 
-_CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "TRUMP"}
+_CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "TRUMP", "BNB"}
 _SPORTS_KEYWORDS = (
     "nba", "nfl", "mlb", "nhl", "epl", "la liga", "serie a", "bundesliga",
     "champions league", "premier league", "mls", "tennis", "atp", "wta",
@@ -63,7 +63,7 @@ MARKET_CLASS_CONFIG: Dict[str, Dict[str, Any]] = {
     "sports_totals":  {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
     "esports":        {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
     "crypto_up_down": {"live_enabled": False, "max_order_usdc": 0,  "max_daily_gross": 0,  "max_open_positions": 0},
-    "other":          {"live_enabled": False, "max_order_usdc": 0,  "max_daily_gross": 0,  "max_open_positions": 0},
+    "other":          {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
 }
 
 

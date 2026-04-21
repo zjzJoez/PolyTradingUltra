@@ -327,9 +327,10 @@ KNOWN_SYMBOLS = {
     "DOGE": ("DOGE", "DOGECOIN"),
     "XRP": ("XRP", "RIPPLE"),
     "ADA": ("ADA", "CARDANO"),
+    "BNB": ("BNB", "BINANCE COIN"),
     "TRUMP": ("TRUMP",),
 }
-BLOCKED_CRYPTO_DIRECTIONAL_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA"}
+BLOCKED_CRYPTO_DIRECTIONAL_SYMBOLS = {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "BNB"}
 _SHORT_TERM_MARKET_RE = re.compile(
     r"\b(next\s+\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|week|weeks)"
     r"|next\s+(?:hour|day|week)"
