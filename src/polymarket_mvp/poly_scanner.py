@@ -180,6 +180,10 @@ def scan_and_persist(conn, *, min_liquidity: float = 10000, max_expiry_days: flo
     )
     for market in markets:
         upsert_market_snapshot(conn, market)
+        # Release write lock between upserts; with isolation_level='IMMEDIATE'
+        # the surrounding `with connect_db()` otherwise holds one write txn
+        # across all ~250 markets, starving alpha-lab and other loops.
+        conn.commit()
     return markets
 
 
