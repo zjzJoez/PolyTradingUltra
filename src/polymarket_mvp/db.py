@@ -347,10 +347,17 @@ def upsert_proposal(
     alpha_net_edge_bps: float | None = None,
     alpha_model_version: str | None = None,
     alpha_mapping_confidence: float | None = None,
+    llm_meta: Mapping[str, Any] | None = None,
+    conviction_tier: str | None = None,
+    catalyst_clarity: str | None = None,
+    downside_risk: str | None = None,
+    asymmetric_target_multiplier: float | None = None,
+    thesis_catalyst_deadline: str | None = None,
 ) -> Dict[str, Any]:
     normalized = normalize_proposal(proposal)
     proposal_id = proposal_id_for(normalized)
     now = utc_now_iso()
+    llm_meta_json = json.dumps(dict(llm_meta), sort_keys=False) if llm_meta else None
     record = {
         "proposal_id": proposal_id,
         "market_id": normalized["market_id"],
@@ -379,6 +386,12 @@ def upsert_proposal(
         "alpha_net_edge_bps": alpha_net_edge_bps,
         "alpha_model_version": alpha_model_version,
         "alpha_mapping_confidence": alpha_mapping_confidence,
+        "llm_meta_json": llm_meta_json,
+        "conviction_tier": conviction_tier,
+        "catalyst_clarity": catalyst_clarity,
+        "downside_risk": downside_risk,
+        "asymmetric_target_multiplier": asymmetric_target_multiplier,
+        "thesis_catalyst_deadline": thesis_catalyst_deadline,
         "proposal_json": json.dumps(normalized, sort_keys=False),
         "context_payload_json": json.dumps(context_payload, sort_keys=False),
         "created_at": now,
@@ -393,8 +406,10 @@ def upsert_proposal(
           proposal_kind, target_position_id, approval_ttl_seconds, order_live_ttl_seconds,
           alpha_signal_id, alpha_fair_probability, alpha_market_probability,
           alpha_gross_edge_bps, alpha_net_edge_bps, alpha_model_version, alpha_mapping_confidence,
+          llm_meta_json, conviction_tier, catalyst_clarity, downside_risk,
+          asymmetric_target_multiplier, thesis_catalyst_deadline,
           proposal_json, context_payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id) DO UPDATE SET
           market_id=excluded.market_id,
           outcome=excluded.outcome,
@@ -422,6 +437,12 @@ def upsert_proposal(
           alpha_net_edge_bps=excluded.alpha_net_edge_bps,
           alpha_model_version=excluded.alpha_model_version,
           alpha_mapping_confidence=excluded.alpha_mapping_confidence,
+          llm_meta_json=COALESCE(excluded.llm_meta_json, proposals.llm_meta_json),
+          conviction_tier=COALESCE(excluded.conviction_tier, proposals.conviction_tier),
+          catalyst_clarity=COALESCE(excluded.catalyst_clarity, proposals.catalyst_clarity),
+          downside_risk=COALESCE(excluded.downside_risk, proposals.downside_risk),
+          asymmetric_target_multiplier=COALESCE(excluded.asymmetric_target_multiplier, proposals.asymmetric_target_multiplier),
+          thesis_catalyst_deadline=COALESCE(excluded.thesis_catalyst_deadline, proposals.thesis_catalyst_deadline),
           proposal_json=excluded.proposal_json,
           context_payload_json=excluded.context_payload_json,
           updated_at=excluded.updated_at
@@ -480,6 +501,38 @@ def proposal_contexts(conn: sqlite3.Connection, proposal_id: str) -> List[Dict[s
     for item in items:
         item["normalized_payload_json"] = _json_loads_if_present(item.get("normalized_payload_json"))
     return items
+
+
+def recent_proposals_for_market(
+    conn: sqlite3.Connection,
+    market_id: str,
+    *,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Recent proposals for a market with fill data (for LLM self-calibration).
+
+    Joins the most recent execution per proposal so PolyProposer can see
+    whether prior calls filled and at what price.
+    """
+    rows = conn.execute(
+        """
+        SELECT p.proposal_id, p.outcome, p.confidence_score, p.status,
+               p.recommended_size_usdc, p.decision_engine, p.created_at,
+               e.avg_fill_price AS fill_price, e.filled_size_usdc AS fill_size_usdc,
+               e.status AS execution_status
+        FROM proposals p
+        LEFT JOIN (
+            SELECT proposal_id, avg_fill_price, filled_size_usdc, status,
+                   ROW_NUMBER() OVER (PARTITION BY proposal_id ORDER BY id DESC) AS rn
+            FROM executions
+        ) e ON e.proposal_id = p.proposal_id AND e.rn = 1
+        WHERE p.market_id = ?
+        ORDER BY p.created_at DESC
+        LIMIT ?
+        """,
+        (market_id, int(limit)),
+    ).fetchall()
+    return rows_to_dicts(rows)
 
 
 def proposal_record(conn: sqlite3.Connection, proposal_id: str) -> Dict[str, Any] | None:

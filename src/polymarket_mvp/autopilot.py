@@ -22,6 +22,13 @@ from typing import Any, Dict, List
 # LLM work outside the lock and acquire it opportunistically via retry.
 _DB_WRITE_LOCK = threading.Lock()
 
+
+# Wall-clock timestamp of the most recent LLM-backed propose cycle. Used by
+# _loop_propose() to throttle LLM invocations independently of the loop
+# cadence (so the autopilot thread can keep waking up fast to service expiry
+# and execute, without hammering Claude Max).
+_LAST_LLM_PROPOSE_AT: float = 0.0
+
 from .common import (
     blocked_market_reason,
     get_env_float,
@@ -227,10 +234,34 @@ class Autopilot:
     def _loop_propose(self, conn) -> int:
         from .proposer import run_proposal_pipeline
         from .risk_engine import evaluate_full_record
+        from .services.openclaw_adapter import (
+            LLMRateLimitError,
+            llm_cooldown_remaining_sec,
+        )
 
         current_pending = list_proposals_by_status(conn, ["pending_approval"])
         if len(current_pending) >= self._max_pending_approvals():
             return 0
+
+        engine = (os.getenv("POLY_PROPOSER_ENGINE") or "openclaw_llm").strip() or "openclaw_llm"
+        if engine not in {"heuristic", "openclaw_llm"}:
+            engine = "openclaw_llm"
+
+        # LLM rate-limit gate (claude-backed engines only). Two interlocks:
+        #  (1) Adapter cooldown after a rate-limit hit — honor it.
+        #  (2) Minimum wall-clock interval between LLM-backed propose cycles.
+        #      Autopilot may wake up every 30s, but we don't actually want to
+        #      invoke the LLM that often when the Max subscription is shared
+        #      with interactive sessions.
+        global _LAST_LLM_PROPOSE_AT
+        if engine == "openclaw_llm":
+            remaining = llm_cooldown_remaining_sec()
+            if remaining > 0:
+                _log(f"propose skipped: LLM cooldown {int(remaining)}s remaining")
+                return 0
+            min_interval = get_env_int("POLY_LLM_MIN_INTERVAL_SECONDS", 600)
+            if time.time() - _LAST_LLM_PROPOSE_AT < min_interval:
+                return 0
 
         rows = conn.execute(
             "SELECT * FROM market_snapshots WHERE active = 1 AND accepting_orders = 1 ORDER BY last_scanned_at DESC LIMIT ?",
@@ -254,9 +285,32 @@ class Autopilot:
         if not markets:
             return 0
 
-        proposals = run_proposal_pipeline(conn, markets, engine="heuristic",
-                                          size_usdc=get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0),
-                                          top=get_env_int("POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP", 3))
+        try:
+            proposals = run_proposal_pipeline(
+                conn, markets, engine=engine,
+                size_usdc=get_env_float("POLY_RISK_MAX_ORDER_USDC", 10.0),
+                top=get_env_int("POLY_AUTOPILOT_MAX_PROPOSALS_PER_LOOP", 3),
+            )
+        except LLMRateLimitError as exc:
+            _log(
+                f"propose rate-limited: consecutive={exc.consecutive_count} "
+                f"cooldown={exc.cooldown_sec}s — skipping cycle"
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO llm_rate_limit_events
+                      (hit_at, stderr_snippet, cooldown_applied_sec, consecutive_count)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (utc_now_iso(), exc.stderr_snippet, int(exc.cooldown_sec), int(exc.consecutive_count)),
+                )
+                conn.commit()
+            except Exception:
+                _log(f"llm_rate_limit_events insert failed: {traceback.format_exc()}")
+            return 0
+        if engine == "openclaw_llm":
+            _LAST_LLM_PROPOSE_AT = time.time()
         # Run risk engine on each
         for p in proposals:
             record = proposal_record(conn, p["proposal_id"])

@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 
 from ..common import get_env_float, get_env_int, parse_iso8601, utc_now_iso
+from ..strategy.conviction import (
+    CONCURRENT_CAPS,
+    portfolio_exposure_cap,
+    tier_rank,
+)
 
 
 def _active_exposure(conn, *, topic: str | None, event_cluster_id: int | None, strategy_name: str | None) -> Dict[str, float]:
@@ -117,6 +122,39 @@ def _total_open_positions(conn) -> int:
     return int(row[0] if row else 0)
 
 
+def _total_open_exposure_usdc(conn) -> float:
+    """Sum in-flight gross exposure across submitted/live/filled executions for
+    positions that have not yet been resolved. Used for the balance-fraction cap.
+    """
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(e.requested_size_usdc), 0)
+        FROM executions e
+        JOIN proposals p ON p.proposal_id = e.proposal_id
+        LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
+        WHERE e.status IN ('submitted', 'live', 'filled')
+          AND mr.market_id IS NULL
+        """
+    ).fetchone()
+    return float(row[0] if row else 0.0)
+
+
+def _tier_concurrent_count(conn, tier: str) -> int:
+    if not tier:
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM positions pos
+        JOIN proposals p ON p.proposal_id = pos.proposal_id
+        WHERE pos.status IN ('open', 'open_requested', 'partially_filled')
+          AND p.conviction_tier = ?
+        """,
+        (tier,),
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
 def check_drawdown_breaker(conn) -> Dict[str, Any]:
     """Check portfolio drawdown from peak. Returns breaker status."""
     max_drawdown = get_env_float("POLY_MAX_DRAWDOWN_USDC", 30.0)
@@ -195,6 +233,26 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
     # Portfolio-level open position cap
     if record.get("proposal_kind") != "exit" and current_open_positions >= max_open_positions:
         reasons.append("max_open_positions_reached")
+
+    # Conviction-strategy limits: total open exposure as fraction of balance + per-tier caps.
+    balance_cap = portfolio_exposure_cap()
+    current_open_exposure = _total_open_exposure_usdc(conn)
+    projected_open_exposure = current_open_exposure + float(proposal["recommended_size_usdc"])
+    if record.get("proposal_kind") != "exit" and projected_open_exposure > balance_cap:
+        reasons.append(
+            f"portfolio_open_exposure_limit_exceeded[projected={projected_open_exposure:.2f}>cap={balance_cap:.2f}]"
+        )
+    tier = record.get("conviction_tier")
+    tier_cap_val = CONCURRENT_CAPS.get(tier) if tier else None
+    tier_open_count = _tier_concurrent_count(conn, tier) if tier else 0
+    if (
+        record.get("proposal_kind") != "exit"
+        and tier is not None
+        and tier_cap_val is not None
+        and tier_open_count >= tier_cap_val
+    ):
+        reasons.append(f"tier_concurrent_cap_reached[tier={tier},cap={tier_cap_val}]")
+
     return {
         "approved": not reasons,
         "reasons": reasons,
@@ -204,6 +262,8 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
             "strategy_daily_gross_limit_usdc": strategy_daily_limit,
             "portfolio_daily_gross_limit_usdc": portfolio_daily_limit,
             "max_open_positions": max_open_positions,
+            "portfolio_open_exposure_cap_usdc": balance_cap,
+            "tier_concurrent_cap": tier_cap_val,
         },
         "current_exposures": exposures,
         "market_outcome": {
@@ -215,7 +275,10 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
             "cluster_exposure_usdc": projected_cluster,
             "strategy_daily_gross_usdc": projected_strategy_daily,
             "portfolio_daily_gross_usdc": projected_portfolio_daily,
+            "open_exposure_usdc": projected_open_exposure,
         },
         "drawdown": drawdown,
         "open_positions": current_open_positions,
+        "conviction_tier": tier,
+        "tier_open_count": tier_open_count,
     }

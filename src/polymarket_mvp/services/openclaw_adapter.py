@@ -11,11 +11,100 @@ from typing import Any, Dict, Mapping
 
 import requests
 
-from ..common import sanitize_text
+from ..common import sanitize_text, utc_now_iso
 
 
 # Transient-error throttled logging + cooldown for rate-limited upstream calls.
 _TRANSIENT_STATE: dict[str, float] = {"last_log": 0.0, "cooldown_until": 0.0}
+
+# Metadata from the most recent successful claude CLI invocation. Callers that
+# want to persist {model, latency_ms, tokens, cost, session_id} per proposal
+# pull from here right after chat_list() / chat_json() returns, rather than
+# threading an extra return value through every helper.
+_LAST_META: dict[str, Any] = {}
+
+
+class LLMRateLimitError(RuntimeError):
+    """Raised when the claude CLI hits a Max/Pro usage limit.
+
+    Carries stderr_snippet + cooldown_applied_sec + consecutive_count so
+    callers can persist the event and honor the cooldown.
+    """
+
+    def __init__(self, stderr_snippet: str, cooldown_sec: int, consecutive_count: int):
+        self.stderr_snippet = stderr_snippet
+        self.cooldown_sec = cooldown_sec
+        self.consecutive_count = consecutive_count
+        super().__init__(
+            f"Claude CLI usage limit (consecutive={consecutive_count}, cooldown={cooldown_sec}s)"
+        )
+
+
+# Exponential-backoff cooldown state for claude CLI rate-limit events.
+# Cadence: 1st hit = 30 min, 2nd within 2hr = 1hr, 3rd within 6hr = 6hr, reset after clean window.
+_LLM_COOLDOWN_STATE: dict[str, float] = {
+    "cooldown_until": 0.0,       # epoch seconds; proposer skips LLM while now < this
+    "last_hit_at": 0.0,           # epoch seconds of most recent hit
+    "consecutive_count": 0,        # cleared after a cooldown window elapses without a hit
+}
+
+_COOLDOWN_SCHEDULE_SEC: tuple[int, ...] = (30 * 60, 60 * 60, 6 * 60 * 60)
+_RESET_WINDOW_SEC = 6 * 60 * 60
+
+_RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "usage limit reached",
+    "rate limit",
+    "rate_limit",
+    "5-hour limit",
+    "5 hour limit",
+    "weekly limit",
+    "weekly_limit",
+    "429",
+)
+
+
+def _looks_like_rate_limit(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _record_llm_rate_limit_hit(stderr_snippet: str) -> LLMRateLimitError:
+    now = time.time()
+    # If the previous hit was long enough ago, reset the escalation counter.
+    if now - _LLM_COOLDOWN_STATE["last_hit_at"] > _RESET_WINDOW_SEC:
+        _LLM_COOLDOWN_STATE["consecutive_count"] = 0
+    _LLM_COOLDOWN_STATE["consecutive_count"] = int(_LLM_COOLDOWN_STATE["consecutive_count"]) + 1
+    idx = min(int(_LLM_COOLDOWN_STATE["consecutive_count"]) - 1, len(_COOLDOWN_SCHEDULE_SEC) - 1)
+    cooldown = _COOLDOWN_SCHEDULE_SEC[idx]
+    _LLM_COOLDOWN_STATE["cooldown_until"] = now + cooldown
+    _LLM_COOLDOWN_STATE["last_hit_at"] = now
+    return LLMRateLimitError(
+        stderr_snippet=sanitize_text(stderr_snippet)[:400],
+        cooldown_sec=cooldown,
+        consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+    )
+
+
+def llm_cooldown_remaining_sec() -> float:
+    """Seconds remaining in the active claude CLI cooldown. 0 if none."""
+    remaining = _LLM_COOLDOWN_STATE["cooldown_until"] - time.time()
+    return max(0.0, remaining)
+
+
+def reset_llm_cooldown_state() -> None:
+    """Test-only: clear cooldown state between unit tests."""
+    _LLM_COOLDOWN_STATE["cooldown_until"] = 0.0
+    _LLM_COOLDOWN_STATE["last_hit_at"] = 0.0
+    _LLM_COOLDOWN_STATE["consecutive_count"] = 0
+
+
+def get_last_meta() -> dict[str, Any] | None:
+    """Return a copy of the metadata from the most recent claude CLI call."""
+    return dict(_LAST_META) if _LAST_META else None
+
+
+def clear_last_meta() -> None:
+    _LAST_META.clear()
 
 
 def _log_transient(status: int, retry_after: str | None) -> None:
@@ -63,6 +152,98 @@ def _cli_path() -> str | None:
         if candidate and Path(candidate).exists():
             return candidate
     return None
+
+
+def _claude_cli_path() -> str | None:
+    configured = (os.getenv("CLAUDE_CLI_PATH") or "").strip()
+    candidates = []
+    if configured:
+        candidates.append(configured)
+    discovered = shutil.which("claude")
+    if discovered:
+        candidates.append(discovered)
+    candidates.extend(
+        [
+            str(Path.home() / ".local" / "bin" / "claude"),
+            "/usr/local/bin/claude",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _claude_payload(system_prompt: str, user_prompt: str) -> Any:
+    cli_path = _claude_cli_path()
+    if cli_path is None:
+        return None
+    model = (os.getenv("CLAUDE_MODEL") or "claude-sonnet-4-6").strip()
+    timeout_seconds = (os.getenv("CLAUDE_TIMEOUT_SECONDS") or "").strip()
+    timeout = int(timeout_seconds) if timeout_seconds else 180
+    command = [
+        cli_path,
+        "-p",
+        user_prompt,
+        "--system-prompt",
+        system_prompt,
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--setting-sources",
+        "",
+    ]
+    # Skip work if a prior hit put us in cooldown — don't hammer the CLI and
+    # don't burn wall time on a call that will fail.
+    if llm_cooldown_remaining_sec() > 0:
+        raise _record_llm_rate_limit_hit("still in cooldown; skipping CLI invocation")
+    start = time.monotonic()
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    latency_ms = int((time.monotonic() - start) * 1000)
+    if result.returncode != 0:
+        stderr = sanitize_text(result.stderr or result.stdout)
+        if _looks_like_rate_limit(result.stderr or result.stdout or ""):
+            raise _record_llm_rate_limit_hit(stderr)
+        raise RuntimeError(f"Claude CLI failed: {stderr or result.returncode}")
+    envelope = _decode_json_candidate(result.stdout or "")
+    if isinstance(envelope, dict):
+        if envelope.get("is_error"):
+            err_blob = f"{envelope.get('subtype')} {envelope.get('result')}"
+            if _looks_like_rate_limit(err_blob):
+                raise _record_llm_rate_limit_hit(err_blob[:400])
+            raise RuntimeError(
+                f"Claude CLI returned error: {envelope.get('result') or envelope.get('subtype')}"
+            )
+        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+        _LAST_META.clear()
+        _LAST_META.update({
+            "model": envelope.get("model") or model,
+            "session_id": envelope.get("session_id"),
+            "latency_ms": latency_ms,
+            "duration_ms": envelope.get("duration_ms"),
+            "num_turns": envelope.get("num_turns"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "total_cost_usd": envelope.get("total_cost_usd"),
+            "stop_reason": envelope.get("stop_reason"),
+            "called_at": utc_now_iso(),
+        })
+        inner = envelope.get("result")
+        if isinstance(inner, str):
+            parsed = _decode_json_candidate(inner)
+            if parsed is not None:
+                return parsed
+            return inner
+        if inner is not None:
+            return inner
+    return envelope
 
 
 def _http_chat_endpoint() -> tuple[str | None, dict[str, str]]:
@@ -127,11 +308,12 @@ def _decode_json_candidate(raw: str) -> Any | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    decoder = json.JSONDecoder()
     starts = [idx for idx, char in enumerate(text) if char in "[{"]
-    for idx in reversed(starts):
-        candidate = text[idx:]
+    for idx in starts:
         try:
-            return json.loads(candidate)
+            value, _ = decoder.raw_decode(text[idx:])
+            return value
         except json.JSONDecodeError:
             continue
     return None
@@ -177,6 +359,8 @@ def _cli_payload(system_prompt: str, user_prompt: str) -> Any:
 
 def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any | None:
     mode = _transport_mode()
+    if mode in {"claude", "claude_cli"}:
+        return _claude_payload(system_prompt, user_prompt)
     if mode in {"cli", "local"}:
         return _cli_payload(system_prompt, user_prompt)
     endpoint, headers = _http_chat_endpoint()
@@ -218,7 +402,11 @@ def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0
 
 
 def is_enabled() -> bool:
-    return _http_chat_endpoint()[0] is not None or _cli_path() is not None
+    return (
+        _http_chat_endpoint()[0] is not None
+        or _cli_path() is not None
+        or _claude_cli_path() is not None
+    )
 
 
 def chat_json(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Dict[str, Any] | None:
@@ -238,14 +426,27 @@ def chat_json(system_prompt: str, user_prompt: str, *, temperature: float = 0.2)
         return None
 
 
+_LIST_ENVELOPE_KEYS = ("proposals", "recommendations", "items")
+
+
+def _unwrap_list(payload: Any) -> list[Dict[str, Any]] | None:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in _LIST_ENVELOPE_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return None
+
+
 def chat_list(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> list[Dict[str, Any]] | None:
     body = chat_payload(system_prompt, user_prompt, temperature=temperature)
     if body is None:
         return None
-    if isinstance(body, list):
-        return [item for item in body if isinstance(item, dict)]
-    if isinstance(body, dict) and isinstance(body.get("proposals"), list):
-        return [item for item in body["proposals"] if isinstance(item, dict)]
+    unwrapped = _unwrap_list(body)
+    if unwrapped is not None:
+        return unwrapped
     text = _extract_text(body)
     if not text:
         return None
@@ -253,11 +454,7 @@ def chat_list(system_prompt: str, user_prompt: str, *, temperature: float = 0.2)
         payload = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict) and isinstance(payload.get("proposals"), list):
-        return [item for item in payload["proposals"] if isinstance(item, dict)]
-    return None
+    return _unwrap_list(payload)
 
 
 def maybe_generate_research_memo(prompt_payload: Mapping[str, Any]) -> Dict[str, Any] | None:

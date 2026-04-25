@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Any, Dict, List, Mapping
 
 from .common import (
     blocked_market_reason,
     dump_json,
     get_env_float,
+    get_env_int,
     load_json,
     market_reference_price,
     normalize_proposal,
@@ -22,6 +24,7 @@ from .db import (
     latest_research_memo,
     market_contexts,
     market_snapshot,
+    recent_proposals_for_market,
     replace_proposal_contexts,
     update_proposal_workflow_fields,
     upsert_market_snapshot,
@@ -34,8 +37,16 @@ from .services.event_cluster_service import (
     classify_market_class,
     cluster_market,
 )
+from .agents.poly_proposer import generate_trade_proposals as poly_proposer_generate
+from .services.openclaw_adapter import get_last_meta
 from .services.memo_service import build_and_store_memo
-from .services.openclaw_adapter import maybe_generate_trade_proposals
+from .strategy.conviction import (
+    BASE_TIER_SIZES,
+    compute_tier,
+    compute_tier_size,
+    downgrade_tier,
+    tier_rank,
+)
 
 
 def _extract_yes_no_prices(market: Mapping[str, Any]) -> Dict[str, float]:
@@ -123,6 +134,225 @@ def resolve_context_payload(context_file: Dict[str, Any] | None, market_id: str)
     return {"market_id": market_id, "context_budget_chars": 0, "assembled_text": "", "sources": []}
 
 
+def _market_llm_score(market: Mapping[str, Any]) -> float:
+    """Cheap score for ranking markets before sending to the LLM.
+
+    Long-tail bias: favor markets with at least one outcome in the lottery
+    zones (0.08-0.30 for YES tails, 0.70-0.92 for NO tails). Near-50/50 and
+    extreme-price markets score lower.
+    """
+    min_tradable, max_tradable = tradable_price_bounds()
+    prices: List[float] = []
+    for outcome in market.get("outcomes", []) or []:
+        price = outcome.get("price")
+        if isinstance(price, (int, float)):
+            prices.append(float(price))
+    if not prices:
+        return 0.0
+
+    has_yes_tail = any(0.08 <= p <= 0.30 for p in prices)
+    has_no_tail = any(0.70 <= p <= 0.92 for p in prices)
+    all_extreme = all(p < min_tradable or p > max_tradable for p in prices)
+    near_50_50 = all(0.45 <= p <= 0.55 for p in prices) and len(prices) <= 2
+
+    liquidity = float(market.get("liquidity_usdc") or 0.0)
+    volume = float(market.get("volume_24h_usdc") or 0.0)
+    base = (liquidity + 0.5 * volume) ** 0.5
+
+    if all_extreme:
+        return 0.0
+    multiplier = 1.0
+    if has_yes_tail or has_no_tail:
+        multiplier *= 1.6
+    if near_50_50:
+        multiplier *= 0.5
+    days = market.get("days_to_expiry")
+    if isinstance(days, (int, float)) and float(days) < 0.5:
+        multiplier *= 0.5
+    return base * multiplier
+
+
+def select_llm_candidates(
+    markets: List[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> List[Mapping[str, Any]]:
+    """Heuristic pre-filter: pick the top-N markets worth sending to the LLM."""
+    if limit <= 0 or not markets:
+        return []
+    scored = [(_market_llm_score(m), idx, m) for idx, m in enumerate(markets)]
+    scored = [item for item in scored if item[0] > 0]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [market for _score, _idx, market in scored[:limit]]
+
+
+def _legacy_kelly_size(
+    *,
+    base_size_usdc: float,
+    confidence: float,
+    market_price: float | None,
+    min_floor_usdc: float,
+) -> float:
+    """Legacy linear-Kelly sizer. Retained for POLY_SIZING_MODE=kelly rollback.
+
+    Do not use as the primary sizer on small accounts — the 5-share-per-order
+    floor forces this to zero out almost every proposal when base_size_usdc
+    is under ~$10. The conviction-tier sizer in strategy/conviction.py is the
+    current default.
+    """
+    if market_price is None:
+        return base_size_usdc
+    try:
+        p = float(market_price)
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return base_size_usdc
+    if p <= 0 or p >= 1 or c <= p:
+        return 0.0
+    edge = (c - p) / (1.0 - p)
+    scaled = base_size_usdc * max(0.0, min(1.0, edge))
+    min_viable = max(min_floor_usdc, 5.0 * p * 1.02)
+    if scaled < min_viable:
+        return 0.0
+    return min(base_size_usdc, scaled)
+
+
+def _five_share_floor(market_price: float) -> float:
+    """Polymarket exchange minimum: 5 shares × price × 2% safety buffer."""
+    return 5.0 * float(market_price) * 1.02
+
+
+def _size_from_conviction(
+    *,
+    llm_item: Mapping[str, Any],
+    market_price: float,
+    balance_usdc: float | None = None,
+) -> tuple[float, str | None]:
+    """Compute (size_usdc, tier) from the LLM's objective conviction fields.
+
+    Returns (0.0, None) when:
+    - LLM did not provide the required fields
+    - edge is below skip threshold
+    - even the lowest tier ($2 × scale) falls below the 5-share floor at
+      market_price (order would be rejected by the exchange)
+    """
+    confidence = llm_item.get("confidence_score")
+    clarity = llm_item.get("catalyst_clarity") or ""
+    downside = llm_item.get("downside_risk") or ""
+    if confidence is None:
+        return 0.0, None
+    tier = compute_tier(
+        confidence=float(confidence),
+        market_price=market_price,
+        catalyst_clarity=str(clarity),
+        downside_risk=str(downside),
+    )
+    if tier is None:
+        return 0.0, None
+    # Auto-downgrade until size clears the 5-share floor.
+    floor = _five_share_floor(market_price)
+    while tier is not None:
+        size = compute_tier_size(tier, balance_usdc)
+        if size >= floor:
+            return size, tier
+        tier = downgrade_tier(tier)
+    return 0.0, None
+
+
+def _clob_top5_liquidity_usdc(token_id: str) -> float | None:
+    """Read top-5 ask-side depth for the target YES/NO token.
+
+    Returns None on any failure; callers should treat None as "unknown, don't
+    block". This is a best-effort pre-trade check, not a hard dependency.
+    """
+    if not token_id:
+        return None
+    try:
+        import requests as _rq
+        resp = _rq.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": str(token_id)},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        book = resp.json() or {}
+    except Exception:
+        return None
+    asks = book.get("asks") or []
+    if not isinstance(asks, list):
+        return None
+    total = 0.0
+    taken = 0
+    # CLOB returns asks sorted worst-to-best; we want the 5 best (highest bid
+    # side) — but for asks the "best" is the lowest price. The book API
+    # returns a standard L2 book; take the first 5 levels from the side.
+    for level in asks[:5]:
+        try:
+            price = float(level.get("price"))
+            size = float(level.get("size"))
+        except (TypeError, ValueError):
+            continue
+        total += price * size
+        taken += 1
+    if taken == 0:
+        return None
+    return total
+
+
+def _enforce_clob_slippage_cap(
+    *,
+    proposed_size_usdc: float,
+    tier: str,
+    token_id: str,
+    market_price: float,
+    balance_usdc: float | None,
+) -> tuple[float, str | None]:
+    """Downgrade tier until proposed size stays ≤25% of top-5 CLOB depth.
+
+    Returns (size, tier) or (0.0, None) if even the smallest tier can't fit
+    (or is below the 5-share floor).
+    """
+    top5 = _clob_top5_liquidity_usdc(token_id)
+    if top5 is None or top5 <= 0:
+        return proposed_size_usdc, tier
+    cap = 0.25 * top5
+    floor = _five_share_floor(market_price)
+    current_tier: str | None = tier
+    current_size = proposed_size_usdc
+    while current_tier is not None and current_size > cap:
+        current_tier = downgrade_tier(current_tier)
+        if current_tier is None:
+            return 0.0, None
+        current_size = compute_tier_size(current_tier, balance_usdc)
+        if current_size < floor:
+            return 0.0, None
+    return current_size, current_tier
+
+
+def _prior_proposals_snippet(conn, market_id: str, limit: int) -> List[Dict[str, Any]]:
+    if conn is None or limit <= 0:
+        return []
+    try:
+        records = recent_proposals_for_market(conn, market_id, limit=limit)
+    except Exception:
+        return []
+    snippet: List[Dict[str, Any]] = []
+    for rec in records:
+        fill_price = rec.get("fill_price")
+        snippet.append({
+            "created_at": rec.get("created_at"),
+            "outcome": rec.get("outcome"),
+            "confidence_score": rec.get("confidence_score"),
+            "status": rec.get("status"),
+            "decision_engine": rec.get("decision_engine"),
+            "fill_price": float(fill_price) if isinstance(fill_price, (int, float)) else None,
+            "fill_size_usdc": rec.get("fill_size_usdc"),
+            "execution_status": rec.get("execution_status"),
+        })
+    return snippet
+
+
 def build_openclaw_proposals(
     markets: List[Mapping[str, Any]],
     *,
@@ -130,11 +360,19 @@ def build_openclaw_proposals(
     size_usdc: float,
     top: int,
     max_slippage_bps: int,
-) -> List[Dict[str, Any]]:
+    conn=None,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, Dict[str, Dict[str, Any]]]:
     eligible_markets = [market for market in markets if not blocked_market_reason(market)]
     if not eligible_markets:
-        return []
-    market_outcomes = {str(market["market_id"]): _market_outcome_names(market) for market in eligible_markets[:25]}
+        return [], None, {}
+    llm_candidate_limit = max(1, get_env_int("POLY_PROPOSER_LLM_CANDIDATES", 8))
+    candidate_markets = select_llm_candidates(eligible_markets, limit=llm_candidate_limit)
+    if not candidate_markets:
+        return [], None, {}
+    prior_proposal_depth = max(0, get_env_int("POLY_PROPOSER_PRIOR_DEPTH", 3))
+    market_outcomes = {
+        str(market["market_id"]): _market_outcome_names(market) for market in candidate_markets
+    }
     min_tradable_price, max_tradable_price = tradable_price_bounds()
     prompt_payload = {
         "constraints": {
@@ -165,6 +403,10 @@ def build_openclaw_proposals(
                 "market_id",
                 "outcome",
                 "confidence_score",
+                "catalyst_clarity",
+                "downside_risk",
+                "asymmetric_target_multiplier",
+                "thesis_catalyst_deadline",
                 "recommended_size_usdc",
                 "reasoning",
                 "max_slippage_bps",
@@ -172,8 +414,12 @@ def build_openclaw_proposals(
             "proposal_field_rules": {
                 "market_id": "must exactly match a provided market_id",
                 "outcome": "must exactly match one provided allowed_outcomes entry for that market",
-                "confidence_score": "number in [0, 1] — your independent probability estimate, NOT the current market price. Only propose when your estimate exceeds market price (you see alpha).",
-                "recommended_size_usdc": "positive number",
+                "confidence_score": "number in [0, 1] — your independent probability estimate, NOT the current market price. Only propose when your estimate meaningfully diverges from market price.",
+                "catalyst_clarity": 'one of "none" | "weak" | "moderate" | "strong"',
+                "downside_risk": 'one of "limited" | "moderate" | "substantial"',
+                "asymmetric_target_multiplier": "positive number — realistic payoff ratio (e.g. 2.5, 5, 10). null allowed only if truly unestimable.",
+                "thesis_catalyst_deadline": 'ISO date string like "2026-05-10" or null',
+                "recommended_size_usdc": "positive number (hint only; system resizes by conviction tier)",
                 "reasoning": "concise factual plain text grounded only in the provided payload",
                 "max_slippage_bps": f"positive integer <= {max_slippage_bps}",
             },
@@ -182,42 +428,47 @@ def build_openclaw_proposals(
         },
         "markets": [],
     }
-    for market in eligible_markets[:25]:
-        context_blob = resolve_context_payload(context_file, str(market["market_id"]))
-        prompt_payload["markets"].append(
-            {
-                "market_id": market["market_id"],
-                "question": market.get("question"),
-                "liquidity_usdc": market.get("liquidity_usdc"),
-                "volume_24h_usdc": market.get("volume_24h_usdc"),
-                "days_to_expiry": market.get("days_to_expiry"),
-                "end_date": market.get("end_date"),
-                "allowed_outcomes": market_outcomes[str(market["market_id"])],
-                "outcomes": [
-                    {
-                        "name": item.get("name"),
-                        "price": item.get("price"),
-                        "token_id": item.get("token_id"),
-                    }
-                    for item in market.get("outcomes", [])
-                ],
-                "context": {
-                    "topic": context_blob.get("topic"),
-                    "assembled_text": context_blob.get("assembled_text"),
-                    "sources": context_blob.get("sources", [])[:5],
-                },
-            }
-        )
-    generated = maybe_generate_trade_proposals(prompt_payload)
+    for market in candidate_markets:
+        market_id_str = str(market["market_id"])
+        context_blob = resolve_context_payload(context_file, market_id_str)
+        market_block: Dict[str, Any] = {
+            "market_id": market["market_id"],
+            "question": market.get("question"),
+            "liquidity_usdc": market.get("liquidity_usdc"),
+            "volume_24h_usdc": market.get("volume_24h_usdc"),
+            "days_to_expiry": market.get("days_to_expiry"),
+            "end_date": market.get("end_date"),
+            "allowed_outcomes": market_outcomes[market_id_str],
+            "outcomes": [
+                {
+                    "name": item.get("name"),
+                    "price": item.get("price"),
+                    "token_id": item.get("token_id"),
+                }
+                for item in market.get("outcomes", [])
+            ],
+            "context": {
+                "topic": context_blob.get("topic"),
+                "assembled_text": context_blob.get("assembled_text"),
+                "sources": context_blob.get("sources", [])[:5],
+            },
+        }
+        prior = _prior_proposals_snippet(conn, market_id_str, prior_proposal_depth)
+        if prior:
+            market_block["prior_proposals"] = prior
+        prompt_payload["markets"].append(market_block)
+    generated = poly_proposer_generate(prompt_payload)
+    llm_meta = get_last_meta()
     if not generated:
         import sys as _sys
         print(
-            "[proposer] OpenClaw returned no proposals this cycle (LLM may have found no edge). "
+            "[proposer] PolyProposer returned no proposals this cycle (LLM may have found no edge). "
             "Will retry next cycle.",
             file=_sys.stderr,
         )
-        return []
+        return [], llm_meta, {}
     proposals: List[Dict[str, Any]] = []
+    raw_items_by_id: Dict[str, Mapping[str, Any]] = {}
     invalid_items: List[str] = []
     seen_ids = set()
     for item in generated:
@@ -244,6 +495,7 @@ def build_openclaw_proposals(
             continue
         seen_ids.add(proposal_id)
         proposals.append(normalized)
+        raw_items_by_id[proposal_id] = item
         if len(proposals) >= top:
             break
     if not proposals and invalid_items:
@@ -251,14 +503,81 @@ def build_openclaw_proposals(
             "OpenClaw proposal generation returned only invalid outcomes: "
             + "; ".join(invalid_items[:5])
         )
+    sizing_mode = (os.getenv("POLY_SIZING_MODE") or "conviction").strip().lower()
+    min_order_floor = get_env_float("POLY_ORDER_MIN_USDC", 1.0)
+    try:
+        balance_override: float | None = float(os.getenv("POLY_ACCOUNT_BALANCE_USDC") or "") if os.getenv("POLY_ACCOUNT_BALANCE_USDC") else None
+    except ValueError:
+        balance_override = None
     tradable: List[Dict[str, Any]] = []
+    conviction_by_id: Dict[str, Dict[str, Any]] = {}
     for proposal in proposals:
+        pid = proposal_id_for(proposal)
         market = next((item for item in markets if str(item["market_id"]) == str(proposal["market_id"])), None)
         reference_price = market_reference_price(market or {}, proposal["outcome"]) if market is not None else None
         if not price_is_tradable(reference_price):
             continue
+        # Resolve token_id for CLOB slippage check.
+        token_id = ""
+        if market is not None:
+            for out in market.get("outcomes", []) or []:
+                if str(out.get("name") or "").strip() == proposal["outcome"]:
+                    token_id = str(out.get("token_id") or "")
+                    break
+
+        raw = raw_items_by_id.get(pid, {})
+        conviction_payload = {
+            "catalyst_clarity": raw.get("catalyst_clarity"),
+            "downside_risk": raw.get("downside_risk"),
+            "asymmetric_target_multiplier": raw.get("asymmetric_target_multiplier"),
+            "thesis_catalyst_deadline": raw.get("thesis_catalyst_deadline"),
+            "conviction_tier": None,
+        }
+
+        if sizing_mode in {"off", "flat"}:
+            tradable.append(proposal)
+            conviction_by_id[pid] = conviction_payload
+            continue
+
+        if sizing_mode == "kelly":
+            sized = _legacy_kelly_size(
+                base_size_usdc=float(proposal["recommended_size_usdc"]),
+                confidence=float(proposal["confidence_score"]),
+                market_price=reference_price,
+                min_floor_usdc=min_order_floor,
+            )
+            if sized <= 0:
+                continue
+            proposal = dict(proposal)
+            proposal["recommended_size_usdc"] = round(sized, 4)
+            tradable.append(proposal)
+            conviction_by_id[pid] = conviction_payload
+            continue
+
+        # Default path: conviction-tier sizing.
+        size_usdc_new, tier = _size_from_conviction(
+            llm_item=proposal | conviction_payload | {"confidence_score": proposal["confidence_score"]},
+            market_price=reference_price,
+            balance_usdc=balance_override,
+        )
+        if size_usdc_new <= 0 or tier is None:
+            continue
+        # CLOB liquidity downgrade (best-effort; returns input unchanged if API unreachable).
+        size_usdc_new, tier = _enforce_clob_slippage_cap(
+            proposed_size_usdc=size_usdc_new,
+            tier=tier,
+            token_id=token_id,
+            market_price=reference_price,
+            balance_usdc=balance_override,
+        )
+        if size_usdc_new <= 0 or tier is None:
+            continue
+        proposal = dict(proposal)
+        proposal["recommended_size_usdc"] = round(size_usdc_new, 4)
+        conviction_payload["conviction_tier"] = tier
         tradable.append(proposal)
-    return tradable
+        conviction_by_id[pid] = conviction_payload
+    return tradable, llm_meta, conviction_by_id
 
 
 def run_proposal_pipeline(
@@ -276,13 +595,16 @@ def run_proposal_pipeline(
     markets = [dict(item) for item in markets if not blocked_market_reason(item)]
     if not markets:
         return []
+    llm_meta: Dict[str, Any] | None = None
+    conviction_by_id: Dict[str, Dict[str, Any]] = {}
     if engine == "openclaw_llm":
-        proposals = build_openclaw_proposals(
+        proposals, llm_meta, conviction_by_id = build_openclaw_proposals(
             markets,
             context_file=context_payload,
             size_usdc=size_usdc,
             top=top,
             max_slippage_bps=max_slippage_bps,
+            conn=conn,
         )
     else:
         proposals = build_heuristic_proposals(
@@ -322,6 +644,13 @@ def run_proposal_pipeline(
             or market_id
         )
         strategy_name = "near_expiry_conviction"
+        proposal_id_guess = proposal_id_for(proposal)
+        conv = conviction_by_id.get(proposal_id_guess, {})
+        target_mult = conv.get("asymmetric_target_multiplier")
+        try:
+            target_mult_float = float(target_mult) if target_mult is not None else None
+        except (TypeError, ValueError):
+            target_mult_float = None
         record = upsert_proposal(
             conn,
             proposal,
@@ -332,6 +661,12 @@ def run_proposal_pipeline(
             topic=default_topic,
             event_cluster_id=cluster_result["cluster"]["id"],
             source_memo_id=(memo or {}).get("id"),
+            llm_meta=llm_meta if engine == "openclaw_llm" else None,
+            conviction_tier=conv.get("conviction_tier"),
+            catalyst_clarity=conv.get("catalyst_clarity"),
+            downside_risk=conv.get("downside_risk"),
+            asymmetric_target_multiplier=target_mult_float,
+            thesis_catalyst_deadline=conv.get("thesis_catalyst_deadline"),
         )
         replace_proposal_contexts(conn, record["proposal_id"], contexts)
         conn.commit()
@@ -388,11 +723,12 @@ def main() -> int:
     markets_payload = load_json(market_file)
     markets = [dict(item) for item in markets_payload.get("markets", []) if not blocked_market_reason(item)]
     context_payload = load_json(args.context_file) if args.context_file else None
+    cli_llm_meta: Dict[str, Any] | None = None
     if args.engine == "openclaw_llm":
         if args.proposal_file:
             proposals = read_proposals(args.proposal_file)
         else:
-            proposals = build_openclaw_proposals(
+            proposals, cli_llm_meta, _cli_conv = build_openclaw_proposals(
                 markets,
                 context_file=context_payload,
                 size_usdc=size_usdc,
@@ -440,6 +776,7 @@ def main() -> int:
                 topic=default_topic,
                 event_cluster_id=cluster_result["cluster"]["id"],
                 source_memo_id=(memo or {}).get("id"),
+                llm_meta=cli_llm_meta if args.engine == "openclaw_llm" else None,
             )
             replace_proposal_contexts(conn, record["proposal_id"], market_contexts(conn, market_id))
             enriched = proposal_record(conn, record["proposal_id"])

@@ -724,7 +724,8 @@ class TradingOSUpgradeTests(unittest.TestCase):
                 }
             ]
         }
-        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+        with patch("polymarket_mvp.proposer.poly_proposer_generate") as mocked, \
+             patch.dict(os.environ, {"POLY_SIZING_MODE": "flat"}, clear=False):
             mocked.return_value = [
                 {
                     "market_id": "m1",
@@ -735,7 +736,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
                     "max_slippage_bps": 400,
                 }
             ]
-            proposals = build_openclaw_proposals(
+            proposals, _meta, _conv = build_openclaw_proposals(
                 markets,
                 context_file=context_file,
                 size_usdc=5.0,
@@ -750,7 +751,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
 
     def test_build_openclaw_proposals_rejects_invalid_market_outcome(self) -> None:
         markets = [sample_updown_market()]
-        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+        with patch("polymarket_mvp.proposer.poly_proposer_generate") as mocked:
             mocked.return_value = [
                 {
                     "market_id": "m2",
@@ -780,7 +781,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
 
     def test_build_openclaw_proposals_filters_extreme_price_candidates(self) -> None:
         markets = [sample_extreme_market()]
-        with patch("polymarket_mvp.proposer.maybe_generate_trade_proposals") as mocked:
+        with patch("polymarket_mvp.proposer.poly_proposer_generate") as mocked:
             mocked.return_value = [
                 {
                     "market_id": "m-extreme",
@@ -791,7 +792,7 @@ class TradingOSUpgradeTests(unittest.TestCase):
                     "max_slippage_bps": 500,
                 }
             ]
-            proposals = build_openclaw_proposals(
+            proposals, _meta, _conv = build_openclaw_proposals(
                 markets,
                 context_file=None,
                 size_usdc=5.0,

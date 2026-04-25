@@ -125,6 +125,12 @@ CREATE TABLE IF NOT EXISTS proposals (
   alpha_model_version TEXT,
   alpha_mapping_confidence REAL,
   risk_block_reasons_json TEXT,
+  llm_meta_json TEXT,
+  conviction_tier TEXT,
+  catalyst_clarity TEXT,
+  downside_risk TEXT,
+  asymmetric_target_multiplier REAL,
+  thesis_catalyst_deadline TEXT,
   proposal_json TEXT NOT NULL,
   context_payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -134,6 +140,16 @@ CREATE TABLE IF NOT EXISTS proposals (
   FOREIGN KEY (source_memo_id) REFERENCES research_memos(id) ON DELETE SET NULL,
   FOREIGN KEY (target_position_id) REFERENCES positions(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS llm_rate_limit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hit_at TEXT NOT NULL,
+  stderr_snippet TEXT,
+  cooldown_applied_sec INTEGER NOT NULL,
+  consecutive_count INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_rate_limit_events_hit ON llm_rate_limit_events(hit_at);
 
 CREATE INDEX IF NOT EXISTS idx_proposals_market ON proposals(market_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
