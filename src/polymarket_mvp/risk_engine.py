@@ -100,26 +100,44 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     reasons: List[str] = []
     market = record.get("market")
     proposal = record["proposal_json"]
+    has_conviction_tier = bool(record.get("conviction_tier"))
     if market is None:
         reasons.append("market_missing_from_db")
     else:
         blocked_reason = blocked_market_reason(market)
         if blocked_reason:
             reasons.append(blocked_reason)
-        # Market-class segmentation: apply per-class limits if class is configured
+        # Market-class segmentation: live_enabled gate always applies. The
+        # per-class max_order_usdc cap is bypassed when a conviction tier
+        # has been assigned — strategy/conviction.compute_tier_size() and
+        # portfolio_risk_service already enforce the relevant absolute and
+        # portfolio-relative size bounds.
         if get_env_bool("POLY_RISK_MARKET_CLASS_ENABLED", True):
             market_class = classify_market_class(market)
             class_config = MARKET_CLASS_CONFIG.get(market_class, MARKET_CLASS_CONFIG.get("other"))
             if class_config:
                 if not class_config["live_enabled"]:
                     reasons.append(f"market_class_disabled[{market_class}]")
-                elif float(proposal["recommended_size_usdc"]) > float(class_config["max_order_usdc"]):
+                elif (
+                    not has_conviction_tier
+                    and float(proposal["recommended_size_usdc"]) > float(class_config["max_order_usdc"])
+                ):
                     reasons.append(f"market_class_size_exceeded[{market_class}:max={class_config['max_order_usdc']}]")
         if not market.get("active") or market.get("closed") or not market.get("accepting_orders"):
             reasons.append("market_not_tradeable")
-    if proposal["recommended_size_usdc"] > max_order_usdc:
+    # Same logic for the global max_order_usdc gate: when conviction tier
+    # is set, trust the sizer (extreme tier is $15 at $50 balance, $30 at
+    # $100, etc.; the legacy POLY_RISK_MAX_ORDER_USDC=5 default would
+    # block every extreme entry).
+    if not has_conviction_tier and proposal["recommended_size_usdc"] > max_order_usdc:
         reasons.append("size_above_risk_limit")
-    if proposal["confidence_score"] < min_confidence:
+    # When the conviction-tier sizer has already qualified this proposal,
+    # absolute confidence is irrelevant — long-tail bets intentionally use
+    # confidence values like 0.20 (a 0.07 edge over a 0.13 market price is
+    # still a real edge). The conviction sizer enforces edge thresholds via
+    # strategy/conviction.compute_tier(); double-gating on raw confidence
+    # would block every long-tail entry.
+    if not record.get("conviction_tier") and proposal["confidence_score"] < min_confidence:
         reasons.append("confidence_below_threshold")
     if proposal["max_slippage_bps"] > max_slippage_bps:
         reasons.append("slippage_above_risk_limit")
