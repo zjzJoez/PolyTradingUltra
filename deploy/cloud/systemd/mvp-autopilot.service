@@ -10,10 +10,13 @@ WorkingDirectory=/home/ubuntu/polymarket-mvp
 EnvironmentFile=/home/ubuntu/polymarket-mvp/.env
 Environment=MVP_SHADOW_MODE=0
 Environment=POLY_AUTOPILOT_EXECUTE_MODE=real
-ExecStart=/home/ubuntu/polymarket-mvp/.venv/bin/polymarket-autopilot --max-iterations=5
+ExecStart=/home/ubuntu/polymarket-mvp/.venv/bin/polymarket-autopilot --max-iterations=2
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=600
+TimeoutStartSec=1800
+MemoryHigh=1.5G
+MemoryMax=2G
+TasksMax=50
 
 [Install]
 WantedBy=multi-user.target

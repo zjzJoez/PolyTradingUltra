@@ -311,7 +311,7 @@ class AutopilotTests(unittest.TestCase):
             mock_exit = [{"position_id": position["id"], "recommendation": "close",
                           "confidence_score": 0.85, "reasoning": "Market sentiment shifted"}]
             with patch("polymarket_mvp.services.openclaw_adapter.is_enabled", return_value=True), \
-                 patch("polymarket_mvp.services.openclaw_adapter.maybe_generate_exit_proposals", return_value=mock_exit):
+                 patch("polymarket_mvp.agents.poly_exiter.generate_exit_decisions", return_value=mock_exit):
                 from polymarket_mvp.agents.exit_agent import run_exit_agent
                 rec = run_exit_agent(conn, position, use_llm=True)
 
