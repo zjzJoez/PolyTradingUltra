@@ -550,8 +550,11 @@ def build_openclaw_proposals(
                 continue
             proposal = dict(proposal)
             proposal["recommended_size_usdc"] = round(sized, 4)
+            # proposal_id is derived from the *final* proposal contents
+            # (including the post-resize recommended_size_usdc), so
+            # conviction_by_id MUST be keyed off the recomputed pid.
             tradable.append(proposal)
-            conviction_by_id[pid] = conviction_payload
+            conviction_by_id[proposal_id_for(proposal)] = conviction_payload
             continue
 
         # Default path: conviction-tier sizing.
@@ -576,7 +579,11 @@ def build_openclaw_proposals(
         proposal["recommended_size_usdc"] = round(size_usdc_new, 4)
         conviction_payload["conviction_tier"] = tier
         tradable.append(proposal)
-        conviction_by_id[pid] = conviction_payload
+        # Recompute pid after the size mutation — the original `pid`
+        # was hashed against the pre-resize proposal and would no
+        # longer match the persisted record's proposal_id, causing
+        # conviction fields to drop to NULL on upsert lookup.
+        conviction_by_id[proposal_id_for(proposal)] = conviction_payload
     return tradable, llm_meta, conviction_by_id
 
 
