@@ -11,6 +11,7 @@ from .db import connect_db, init_db, proposal_record, proposal_id_for, update_pr
 from .services.authorization_service import evaluate_authorization
 from .services.event_cluster_service import MARKET_CLASS_CONFIG, classify_market_class
 from .services.portfolio_risk_service import evaluate_portfolio_risk
+from .strategy.conviction import TIER_ORDER
 
 
 def _clob_host() -> str:
@@ -100,7 +101,7 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     reasons: List[str] = []
     market = record.get("market")
     proposal = record["proposal_json"]
-    has_conviction_tier = bool(record.get("conviction_tier"))
+    has_conviction_tier = record.get("conviction_tier") in TIER_ORDER
     if market is None:
         reasons.append("market_missing_from_db")
     else:
@@ -207,7 +208,7 @@ def evaluate_full_record(conn, record: Dict[str, Any]) -> Dict[str, Any]:
             "portfolio_risk": None,
             "authorization": None,
         }
-    portfolio_risk = evaluate_portfolio_risk(conn, record)
+    portfolio_risk = evaluate_portfolio_risk(conn, record, available_balance_usdc=single_risk["risk_summary"]["available_balance_usdc"])
     if not portfolio_risk["approved"]:
         _persist_risk_decision(conn, record["proposal_id"], portfolio_risk["reasons"])
         return {

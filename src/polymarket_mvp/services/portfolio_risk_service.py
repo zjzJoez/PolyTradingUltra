@@ -183,7 +183,7 @@ def check_drawdown_breaker(conn) -> Dict[str, Any]:
     }
 
 
-def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
+def evaluate_portfolio_risk(conn, record: Mapping[str, Any], *, available_balance_usdc: float | None = None) -> Dict[str, Any]:
     proposal = record["proposal_json"]
     exposures = _active_exposure(
         conn,
@@ -235,7 +235,7 @@ def evaluate_portfolio_risk(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
         reasons.append("max_open_positions_reached")
 
     # Conviction-strategy limits: total open exposure as fraction of balance + per-tier caps.
-    balance_cap = portfolio_exposure_cap()
+    balance_cap = portfolio_exposure_cap(available_balance_usdc)
     current_open_exposure = _total_open_exposure_usdc(conn)
     projected_open_exposure = current_open_exposure + float(proposal["recommended_size_usdc"])
     if record.get("proposal_kind") != "exit" and projected_open_exposure > balance_cap:

@@ -16,13 +16,6 @@ import traceback
 from typing import Any, Dict, List
 
 
-# Process-wide write coordination: serializes DB write transactions across all
-# autopilot loop threads to avoid SQLite "database is locked" under contention.
-# Held only for quick-write loops; slow loops (propose/context/review) do their
-# LLM work outside the lock and acquire it opportunistically via retry.
-_DB_WRITE_LOCK = threading.Lock()
-
-
 # Wall-clock timestamp of the most recent LLM-backed propose cycle. Used by
 # _loop_propose() to throttle LLM invocations independently of the loop
 # cadence (so the autopilot thread can keep waking up fast to service expiry
@@ -231,6 +224,32 @@ class Autopilot:
         results = fetch_and_persist_contexts(conn, markets)
         return len(results)
 
+    def _sweep_proposed_records(self, conn) -> None:
+        """Evaluate any proposals sitting at status='proposed' through the risk engine.
+
+        Runs unconditionally — does NOT require the LLM gate to be open.  This
+        ensures that exit proposals (written by _loop_exit) and imported alpha
+        signals are never blocked behind the LLM min-interval throttle.
+        """
+        from .risk_engine import evaluate_full_record
+
+        proposed = list_proposals_by_status(conn, ["proposed"])
+        for item in proposed:
+            pid = item["proposal_id"]
+            record = proposal_record(conn, pid)
+            if record is None:
+                continue
+            try:
+                result = evaluate_full_record(conn, record)
+                update_proposal_workflow_fields(
+                    conn,
+                    pid,
+                    authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                    status=result["next_status"],
+                )
+            except Exception:
+                _log(f"risk eval failed for {pid}: {traceback.format_exc()}")
+
     def _loop_propose(self, conn) -> int:
         from .proposer import run_proposal_pipeline
         from .risk_engine import evaluate_full_record
@@ -238,6 +257,12 @@ class Autopilot:
             LLMRateLimitError,
             llm_cooldown_remaining_sec,
         )
+
+        # Always sweep imported/exit proposals — these don't need the LLM so
+        # they must not be blocked behind the rate-limit gate below.
+        self._sweep_proposed_records(conn)
+        if os.getenv("MVP_SHADOW_MODE") == "1":
+            self._shadow_auto_approve_pending(conn)
 
         current_pending = list_proposals_by_status(conn, ["pending_approval"])
         if len(current_pending) >= self._max_pending_approvals():
@@ -327,31 +352,10 @@ class Autopilot:
             except Exception:
                 _log(f"risk eval failed for {p['proposal_id']}: {traceback.format_exc()}")
 
-        # Also evaluate any `proposed`-status records that bypassed run_proposal_pipeline
-        # (e.g. alpha_lab signals imported via `import-alpha-signals`). Without this
-        # sweep they stay at `proposed` forever and never reach the execute loop.
-        other_proposed = list_proposals_by_status(conn, ["proposed"])
-        for item in other_proposed:
-            pid = item["proposal_id"]
-            record = proposal_record(conn, pid)
-            if record is None:
-                continue
-            try:
-                result = evaluate_full_record(conn, record)
-                update_proposal_workflow_fields(
-                    conn,
-                    pid,
-                    authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
-                    status=result["next_status"],
-                )
-            except Exception:
-                _log(f"risk eval failed for imported {pid}: {traceback.format_exc()}")
-
-        # Shadow-mode auto-approval: proposals that passed risk but lack matching
-        # auto-execute authorization would normally sit in `pending_approval`
-        # waiting for a human. In shadow mode we auto-record an approval so they
-        # flow through to `_loop_execute`, which is in turn gated by
-        # MVP_SHADOW_MODE at the top of `poly_executor.execute_record`.
+        # Sweep again: LLM proposals were just risk-evaluated inline above;
+        # this second pass handles any residual 'proposed' rows that were
+        # created concurrently (e.g. exit proposals written during this tick).
+        self._sweep_proposed_records(conn)
         if os.getenv("MVP_SHADOW_MODE") == "1":
             self._shadow_auto_approve_pending(conn)
         return len(proposals)
@@ -457,12 +461,15 @@ class Autopilot:
         for position in positions[:max_exits]:
             try:
                 rec = run_exit_agent(conn, position, use_llm=True)
-                if rec.get("recommendation") == "close" and float(rec.get("confidence_score", 0)) >= 0.7:
+                recommendation = rec.get("recommendation")
+                if recommendation in ("close", "reduce") and float(rec.get("confidence_score", 0)) >= 0.7:
+                    target_pct = float(rec.get("target_reduce_pct") or 1.0)
+                    exit_size = round(float(position["size_usdc"]) * target_pct, 4)
                     exit_proposal = normalize_proposal({
                         "market_id": position["market_id"],
                         "outcome": position["outcome"],
                         "confidence_score": rec["confidence_score"],
-                        "recommended_size_usdc": position["size_usdc"],
+                        "recommended_size_usdc": exit_size,
                         "reasoning": rec.get("reasoning", "exit recommendation"),
                         "max_slippage_bps": get_env_int("POLY_RISK_MAX_SLIPPAGE_BPS", 500),
                     })

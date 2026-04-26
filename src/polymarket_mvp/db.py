@@ -417,7 +417,7 @@ def upsert_proposal(
           recommended_size_usdc=excluded.recommended_size_usdc,
           reasoning=excluded.reasoning,
           decision_engine=excluded.decision_engine,
-          status=excluded.status,
+          status=CASE WHEN proposals.status = 'proposed' THEN excluded.status ELSE proposals.status END,
           max_slippage_bps=excluded.max_slippage_bps,
           strategy_name=excluded.strategy_name,
           topic=excluded.topic,

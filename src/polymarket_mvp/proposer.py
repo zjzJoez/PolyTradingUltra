@@ -731,11 +731,12 @@ def main() -> int:
     markets = [dict(item) for item in markets_payload.get("markets", []) if not blocked_market_reason(item)]
     context_payload = load_json(args.context_file) if args.context_file else None
     cli_llm_meta: Dict[str, Any] | None = None
+    cli_conv: Dict[str, Any] = {}
     if args.engine == "openclaw_llm":
         if args.proposal_file:
             proposals = read_proposals(args.proposal_file)
         else:
-            proposals, cli_llm_meta, _cli_conv = build_openclaw_proposals(
+            proposals, cli_llm_meta, cli_conv = build_openclaw_proposals(
                 markets,
                 context_file=context_payload,
                 size_usdc=size_usdc,
@@ -773,6 +774,7 @@ def main() -> int:
                 or market_id
             )
             strategy_name = "near_expiry_conviction"
+            conv_data = cli_conv.get(proposal_id_for(normalize_proposal(proposal)), {})
             record = upsert_proposal(
                 conn,
                 proposal,
@@ -784,6 +786,11 @@ def main() -> int:
                 event_cluster_id=cluster_result["cluster"]["id"],
                 source_memo_id=(memo or {}).get("id"),
                 llm_meta=cli_llm_meta if args.engine == "openclaw_llm" else None,
+                conviction_tier=conv_data.get("conviction_tier"),
+                catalyst_clarity=conv_data.get("catalyst_clarity"),
+                downside_risk=conv_data.get("downside_risk"),
+                asymmetric_target_multiplier=conv_data.get("asymmetric_target_multiplier"),
+                thesis_catalyst_deadline=conv_data.get("thesis_catalyst_deadline"),
             )
             replace_proposal_contexts(conn, record["proposal_id"], market_contexts(conn, market_id))
             enriched = proposal_record(conn, record["proposal_id"])

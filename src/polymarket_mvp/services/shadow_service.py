@@ -18,7 +18,7 @@ def create_shadow_execution(conn, record: Mapping[str, Any], *, simulated_fill_p
             "simulated_notional": proposal["recommended_size_usdc"],
             "simulated_status": simulated_status,
             "context_json": {
-                "reference_price": proposal["confidence_score"],
+                "reference_price": simulated_fill_price,
                 "market_id": proposal["market_id"],
                 "outcome": proposal["outcome"],
             },
