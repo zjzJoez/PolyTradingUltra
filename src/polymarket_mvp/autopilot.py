@@ -460,11 +460,32 @@ class Autopilot:
         count = 0
         for position in positions[:max_exits]:
             try:
+                # Skip if a non-terminal exit proposal already exists for this position.
+                # Without this guard, each 30s tick creates a new proposal_id (if size
+                # or confidence changes) and multiple racing exit orders pile up.
+                existing = conn.execute(
+                    """SELECT 1 FROM proposals
+                       WHERE target_position_id = ?
+                         AND proposal_kind = 'exit'
+                         AND status NOT IN ('risk_blocked', 'expired', 'cancelled', 'executed')
+                       LIMIT 1""",
+                    (position["id"],),
+                ).fetchone()
+                if existing:
+                    continue
+
                 rec = run_exit_agent(conn, position, use_llm=True)
                 recommendation = rec.get("recommendation")
                 if recommendation in ("close", "reduce") and float(rec.get("confidence_score", 0)) >= 0.7:
                     target_pct = float(rec.get("target_reduce_pct") or 1.0)
                     exit_size = round(float(position["size_usdc"]) * target_pct, 4)
+                    # If the reduce size is too small to meet Polymarket's 5-share
+                    # minimum, promote to a full close rather than letting the risk
+                    # engine block it silently.
+                    if recommendation == "reduce":
+                        entry_price = float(position.get("entry_price") or 0)
+                        if entry_price > 0 and (exit_size / entry_price) < 5.0:
+                            exit_size = round(float(position["size_usdc"]), 4)
                     exit_proposal = normalize_proposal({
                         "market_id": position["market_id"],
                         "outcome": position["outcome"],

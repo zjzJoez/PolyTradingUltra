@@ -199,9 +199,17 @@ def _claude_payload(system_prompt: str, user_prompt: str) -> Any:
         "",
     ]
     # Skip work if a prior hit put us in cooldown — don't hammer the CLI and
-    # don't burn wall time on a call that will fail.
+    # don't burn wall time on a call that will fail. Raise with the *existing*
+    # state rather than calling _record_llm_rate_limit_hit(), which would
+    # increment consecutive_count and push cooldown_until further out on every
+    # call (the exit loop fires every 30s — without this guard it turns a
+    # 30-min cooldown into many hours).
     if llm_cooldown_remaining_sec() > 0:
-        raise _record_llm_rate_limit_hit("still in cooldown; skipping CLI invocation")
+        raise LLMRateLimitError(
+            stderr_snippet="still in cooldown; skipping CLI invocation",
+            cooldown_sec=max(0, int(_LLM_COOLDOWN_STATE["cooldown_until"] - time.time())),
+            consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+        )
     start = time.monotonic()
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     latency_ms = int((time.monotonic() - start) * 1000)

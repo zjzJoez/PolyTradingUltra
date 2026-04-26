@@ -102,6 +102,7 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     market = record.get("market")
     proposal = record["proposal_json"]
     has_conviction_tier = record.get("conviction_tier") in TIER_ORDER
+    is_exit = record.get("proposal_kind") == "exit"
     if market is None:
         reasons.append("market_missing_from_db")
     else:
@@ -120,29 +121,23 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
                 if not class_config["live_enabled"]:
                     reasons.append(f"market_class_disabled[{market_class}]")
                 elif (
-                    not has_conviction_tier
+                    not is_exit
+                    and not has_conviction_tier
                     and float(proposal["recommended_size_usdc"]) > float(class_config["max_order_usdc"])
                 ):
                     reasons.append(f"market_class_size_exceeded[{market_class}:max={class_config['max_order_usdc']}]")
         if not market.get("active") or market.get("closed") or not market.get("accepting_orders"):
             reasons.append("market_not_tradeable")
-    # Same logic for the global max_order_usdc gate: when conviction tier
-    # is set, trust the sizer (extreme tier is $15 at $50 balance, $30 at
-    # $100, etc.; the legacy POLY_RISK_MAX_ORDER_USDC=5 default would
-    # block every extreme entry).
-    if not has_conviction_tier and proposal["recommended_size_usdc"] > max_order_usdc:
+    # Exit proposals are sells — size/confidence/slippage/balance checks that
+    # gate new entries don't apply. Keep exchange-level checks (tradeable,
+    # shares minimum, live price) since those apply regardless of direction.
+    if not is_exit and not has_conviction_tier and proposal["recommended_size_usdc"] > max_order_usdc:
         reasons.append("size_above_risk_limit")
-    # When the conviction-tier sizer has already qualified this proposal,
-    # absolute confidence is irrelevant — long-tail bets intentionally use
-    # confidence values like 0.20 (a 0.07 edge over a 0.13 market price is
-    # still a real edge). The conviction sizer enforces edge thresholds via
-    # strategy/conviction.compute_tier(); double-gating on raw confidence
-    # would block every long-tail entry.
-    if not record.get("conviction_tier") and proposal["confidence_score"] < min_confidence:
+    if not is_exit and not record.get("conviction_tier") and proposal["confidence_score"] < min_confidence:
         reasons.append("confidence_below_threshold")
-    if proposal["max_slippage_bps"] > max_slippage_bps:
+    if not is_exit and proposal["max_slippage_bps"] > max_slippage_bps:
         reasons.append("slippage_above_risk_limit")
-    if proposal["recommended_size_usdc"] > available_balance:
+    if not is_exit and proposal["recommended_size_usdc"] > available_balance:
         reasons.append("insufficient_balance")
     if require_executable_market and market is not None and not _selected_outcome_has_live_price(record):
         reasons.append("selected_outcome_has_no_live_price")
