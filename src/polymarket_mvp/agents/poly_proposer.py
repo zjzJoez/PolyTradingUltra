@@ -60,10 +60,11 @@ SELF-CALIBRATION
 
 CONVICTION FIELDS (NEW — system uses these, not your self-rated "tier")
 - catalyst_clarity: one of "none" | "weak" | "moderate" | "strong".
-  - "strong" = specific scheduled event or concrete public signal that will resolve or move the price by a known date.
-  - "moderate" = plausible catalyst path but timing or trigger uncertain.
-  - "weak" = soft narrative only.
-  - "none" = no identifiable catalyst — pure mispricing claim.
+  - "strong" = a known, scheduled event will definitively resolve this market within days. Examples: a game/match happening today or tomorrow, a vote counting tonight, a scheduled announcement this week. If the market has days_to_expiry < 3 and resolves on a specific game or vote, this is STRONG.
+  - "moderate" = a plausible near-term catalyst (e.g. scheduled event in 7-14 days, ongoing series, expected ruling) but timing or final trigger less certain.
+  - "weak" = soft narrative — team form, sentiment shift, general trend — no single defining event.
+  - "none" = purely statistical mispricing claim with NO identifiable resolution event in sight. Use this only when you see a price anomaly but cannot point to any event that will move or resolve the market.
+  NOTE: Sports games and political votes with a known date ARE strong catalysts. Do not say "none" just because you lack insider information — the scheduled event itself is the catalyst.
 - downside_risk: one of "limited" | "moderate" | "substantial".
   - "limited" = loss capped at position cost AND no obvious mechanism that could collapse confidence further.
   - "moderate" = normal prediction-market loss shape.

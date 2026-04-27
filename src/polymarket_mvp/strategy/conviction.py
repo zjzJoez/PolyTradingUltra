@@ -42,10 +42,12 @@ _BASELINE_BALANCE_USDC: float = 50.0
 
 _CATALYST_STRONG = {"strong"}
 _CATALYST_MODERATE_OR_STRONG = {"moderate", "strong"}
+_CATALYST_ANY_IDENTIFIED = {"weak", "moderate", "strong"}  # anything other than "none"
 _DOWNSIDE_BLOCKING = {"substantial"}
 
 _EDGE_SKIP = 0.05
 _EDGE_SPECULATIVE = 0.10
+_EDGE_MEDIUM_WEAK = 0.12   # weak-clarity proposals need a slightly larger edge to reach medium
 _EDGE_MEDIUM = 0.20
 _EDGE_HIGH = 0.30
 
@@ -91,8 +93,14 @@ def compute_tier(
         return None
     if edge < _EDGE_SPECULATIVE:
         return TIER_SPECULATIVE
-    if edge < _EDGE_MEDIUM:
+    if edge < _EDGE_MEDIUM_WEAK:
+        # 0.10-0.12: only reach medium with at least moderate/strong clarity;
+        # weak or none stays speculative (small edge, soft narrative = small bet).
         return TIER_MEDIUM if clarity in _CATALYST_MODERATE_OR_STRONG else TIER_SPECULATIVE
+    if edge < _EDGE_MEDIUM:
+        # 0.12-0.20: medium if any identified catalyst (including weak);
+        # pure "none" (statistical-only claim) stays speculative.
+        return TIER_MEDIUM if clarity in _CATALYST_ANY_IDENTIFIED else TIER_SPECULATIVE
     if edge < _EDGE_HIGH:
         return TIER_HIGH if clarity in _CATALYST_STRONG else TIER_MEDIUM
     # edge >= 0.30
