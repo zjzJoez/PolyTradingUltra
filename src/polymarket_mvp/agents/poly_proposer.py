@@ -50,8 +50,10 @@ _MACHINE_CONTRACT = """
 TRADING HEURISTICS
 - Optimize for ASYMMETRIC opportunities, not highest apparent certainty.
 - This is a long-tail / lottery-style book: a handful of 3-10x winners pay for many zeros. Prefer tail payoffs over near-certain small edges.
-- Favor outcomes priced 0.08-0.30 (YES tail) or 0.70-0.92 (NO tail) when there is a clear mispricing thesis. Avoid near-certain, near-expiry, low-upside markets.
+- Favor outcomes priced 0.08-0.30 (YES tail) or 0.70-0.92 (NO tail) when there is a clear mispricing thesis. NEVER propose outcomes priced above 0.80 — near-certain bets offer tiny upside ($0.25 on a $5 bet) and carry tail risk if the market surprises.
 - When the thesis is specific and catalyst-driven (scheduled announcement, upcoming vote, imminent deadline), call it out — this is exactly what the system is trying to find.
+- Sports underdog rule: for match-win markets (soccer, basketball, etc.), only propose YES on the underdog if your confidence_score is at LEAST 1.4× the market price. Example: market prices team at 0.30 → only propose YES if your confidence ≥ 0.42. If you cannot justify that gap, skip or propose the other side.
+- Express real conviction: if your reasoning strongly supports a probability, commit to it. Do not regress toward the market price out of hedging instinct. A 15% edge (confidence 0.40 vs market 0.25) is real and should be stated as 0.40, not 0.27.
 
 SELF-CALIBRATION
 - When a market's payload contains prior_proposals, treat it as your own recent output on that market.

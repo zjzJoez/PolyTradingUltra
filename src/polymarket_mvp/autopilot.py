@@ -80,10 +80,23 @@ class Autopilot:
 
     def run_forever(self) -> None:
         init_db()
+        self._startup_checks()
         if self.max_iterations is not None:
             self._run_sequential()
         else:
             self._run_threaded()
+
+    def _startup_checks(self) -> None:
+        """Warn loudly about missing optional dependencies so operators notice immediately."""
+        try:
+            from .services.redeemer import redeem_resolved_positions  # noqa: F401
+        except ImportError:
+            _log(
+                "WARNING: web3 not installed — redeemer is DISABLED. "
+                "Winning positions will NOT be auto-redeemed; USDC stays locked in "
+                "conditional tokens until manually redeemed. "
+                "Fix: pip install 'polymarket-mvp[real-exec]'"
+            )
 
     def _run_sequential(self) -> None:
         """Single-threaded pass used by tests with max_iterations set."""

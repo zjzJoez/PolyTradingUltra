@@ -91,7 +91,14 @@ def evaluate_proposal(record: Dict[str, Any]) -> Dict[str, Any]:
     min_confidence = get_env_float("POLY_RISK_MIN_CONFIDENCE", 0.6)
     max_slippage_bps = get_env_int("POLY_RISK_MAX_SLIPPAGE_BPS", 500)
     configured_balance = get_env_float("POLYMARKET_AVAILABLE_BALANCE_U", 100.0)
-    real_available_balance = _real_available_balance_usdc()
+    # In shadow mode we simulate against the configured balance ($49), not the
+    # real wallet. The real wallet may be nearly empty while shadow-testing a
+    # strategy that assumes a funded account — using the real balance here
+    # causes the portfolio cap to collapse to ~$2 and blocks all new entries.
+    if get_env_bool("MVP_SHADOW_MODE", False):
+        real_available_balance = None
+    else:
+        real_available_balance = _real_available_balance_usdc()
     available_balance = (
         min(configured_balance, real_available_balance)
         if real_available_balance is not None
