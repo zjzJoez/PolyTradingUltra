@@ -22,7 +22,7 @@ def _active_exposure(conn, *, topic: str | None, event_cluster_id: int | None, s
         FROM executions e
         JOIN proposals p ON p.proposal_id = e.proposal_id
         LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
-        WHERE e.status IN ('submitted', 'live', 'filled')
+        WHERE e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
           AND mr.market_id IS NULL
         """
     ).fetchall()
@@ -74,7 +74,7 @@ def _active_market_outcome_exposure(conn, *, market_id: str | None, outcome: str
         WHERE p.proposal_kind = 'entry'
           AND p.market_id = ?
           AND p.outcome = ?
-          AND e.status IN ('submitted', 'live', 'filled')
+          AND e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
           AND mr.market_id IS NULL
         """,
         (market_id, outcome),
@@ -132,7 +132,7 @@ def _total_open_exposure_usdc(conn) -> float:
         FROM executions e
         JOIN proposals p ON p.proposal_id = e.proposal_id
         LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
-        WHERE e.status IN ('submitted', 'live', 'filled')
+        WHERE e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
           AND mr.market_id IS NULL
         """
     ).fetchone()
