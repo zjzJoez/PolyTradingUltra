@@ -169,7 +169,26 @@ def _market_llm_score(market: Mapping[str, Any]) -> float:
     days = market.get("days_to_expiry")
     if isinstance(days, (int, float)) and float(days) < 0.5:
         multiplier *= 0.5
+    # Category multiplier: tilt toward markets where the LLM has an
+    # institutional-knowledge advantage and away from highly-efficient
+    # sports lines (un-penalised when live form data is in context).
+    market_class = classify_market_class(market)
+    category_mult = _CATEGORY_MULTIPLIERS.get(market_class, 1.0)
+    if market_class in ("sports_winner", "sports_totals") and market.get("_has_sports_context"):
+        category_mult = min(category_mult * 2.0, 1.4)
+    multiplier *= category_mult
     return base * multiplier
+
+
+_CATEGORY_MULTIPLIERS: Dict[str, float] = {
+    "sports_winner":  0.8,
+    "sports_totals":  0.7,
+    "esports":        1.0,
+    "crypto_up_down": 0.0,
+    "politics":       1.8,
+    "tech":           1.5,
+    "other":          1.4,
+}
 
 
 def select_llm_candidates(
@@ -393,6 +412,17 @@ def build_openclaw_proposals(
     eligible_markets = [market for market in markets if not blocked_market_reason(market)]
     if not eligible_markets:
         return [], None, {}
+    # Tag markets that already have football-data.org context so the scorer
+    # can un-penalise sports lines with live form information.
+    if conn is not None:
+        for market in eligible_markets:
+            market_id_str = str(market["market_id"])
+            try:
+                ctx_rows = market_contexts(conn, market_id_str)
+            except Exception:
+                continue
+            if any((c.get("source_type") if isinstance(c, Mapping) else None) == "sports_data" for c in (ctx_rows or [])):
+                market["_has_sports_context"] = True
     llm_candidate_limit = max(1, get_env_int("POLY_PROPOSER_LLM_CANDIDATES", 8))
     candidate_markets = select_llm_candidates(eligible_markets, limit=llm_candidate_limit)
     if not candidate_markets:

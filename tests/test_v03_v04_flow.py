@@ -711,15 +711,24 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertIn("market_outcome_entry_already_pending", result["portfolio_risk"]["reasons"])
 
     def test_build_openclaw_proposals_generates_from_adapter(self) -> None:
-        markets = [sample_market()]
+        market = sample_market()
+        # Use a non-crypto question so category scoring doesn't deprioritise the
+        # market to zero — this test exercises the proposal pipeline, not the
+        # crypto-block path. Bump expiry past the directional cutoff for the
+        # same reason.
+        market["question"] = "Will the new bill be approved by the senate by next week?"
+        market["slug"] = "senate-bill-approval"
+        market["days_to_expiry"] = 5.0
+        market["seconds_to_expiry"] = 432000
+        markets = [market]
         context_file = {
             "markets": [
                 {
                     "market_id": "m1",
                     "context_payload": {
-                        "topic": "BTC",
-                        "assembled_text": "ETF chatter and near-term momentum.",
-                        "sources": [{"source_type": "news", "display_text": "ETF chatter"}],
+                        "topic": "Senate",
+                        "assembled_text": "Whip count tightening; vote scheduled this week.",
+                        "sources": [{"source_type": "news", "display_text": "Whip count tightening"}],
                     },
                 }
             ]
@@ -750,7 +759,16 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(proposals[0]["recommended_size_usdc"], 7.5)
 
     def test_build_openclaw_proposals_rejects_invalid_market_outcome(self) -> None:
-        markets = [sample_updown_market()]
+        # Use a non-crypto market so the new category multiplier doesn't zero
+        # the score and skip the LLM call entirely (we need the LLM mock to
+        # fire for the invalid-outcome assertion). Keep Up/Down outcome names
+        # so the mocked LLM's "No" still trips the validator.
+        market = sample_updown_market()
+        market["question"] = "Will the bill pass the senate vote next week?"
+        market["slug"] = "senate-vote-pass"
+        market["days_to_expiry"] = 5.0
+        market["seconds_to_expiry"] = 432000
+        markets = [market]
         with patch("polymarket_mvp.proposer.poly_proposer_generate") as mocked:
             mocked.return_value = [
                 {

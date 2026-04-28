@@ -224,6 +224,38 @@ class PerplexityAdapter:
         ]
 
 
+def _is_sports_market(market: Mapping[str, Any]) -> bool:
+    """Cheap pre-check before hitting football-data.org."""
+    from .services.event_cluster_service import classify_market_class
+    return classify_market_class(market) in ("sports_winner", "sports_totals")
+
+
+class SportsDataAdapter:
+    """football-data.org adapter — recent team form for sports markets."""
+
+    def fetch(self, market: Mapping[str, Any], *, limit: int = 1) -> List[Dict[str, Any]]:
+        if not _is_sports_market(market):
+            return []
+        from .services.sports_data import build_sports_context
+
+        text = build_sports_context(market)
+        if not text:
+            return []
+        return [
+            {
+                "source_type": "sports_data",
+                "source_id": f"fd_{market.get('market_id')}",
+                "title": "Team recent form",
+                "published_at": utc_now_iso(),
+                "url": None,
+                "raw_text": text,
+                "display_text": short_context_line("TEAM FORM: ", text, limit=600),
+                "importance_weight": 1.2,
+                "normalized_payload_json": {"text": text},
+            }
+        ]
+
+
 class WebSearchAdapter:
     """Free news context via DuckDuckGo Instant Answer API. No API key required."""
 
@@ -271,7 +303,7 @@ class WebSearchAdapter:
 
 
 def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, Any]], max_chars: int) -> Dict[str, Any]:
-    _source_order = {"perplexity": 0, "cryptopanic": 1, "web_search": 2, "apify_twitter": 3}
+    _source_order = {"sports_data": 0, "perplexity": 1, "cryptopanic": 2, "web_search": 3, "apify_twitter": 4}
     ordered = sorted(
         contexts,
         key=lambda item: (
@@ -285,7 +317,16 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
     lines: List[str] = []
     for item in ordered:
         source_type = item["source_type"]
-        prefix = "SUMMARY: " if source_type == "perplexity" else "NEWS: " if source_type == "cryptopanic" else "WEB: " if source_type == "web_search" else "X: "
+        if source_type == "sports_data":
+            prefix = "TEAM FORM: "
+        elif source_type == "perplexity":
+            prefix = "SUMMARY: "
+        elif source_type == "cryptopanic":
+            prefix = "NEWS: "
+        elif source_type == "web_search":
+            prefix = "WEB: "
+        else:
+            prefix = "X: "
         display_text = str(item.get("display_text") or "")
         if display_text.startswith(prefix):
             display_text = display_text[len(prefix) :].lstrip()
@@ -320,10 +361,15 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
 def provider_names(value: str | None) -> List[str]:
     # Default: cryptopanic for crypto/prediction markets, web_search (DuckDuckGo) as free fallback.
     # Perplexity included only when PERPLEXITY_API_KEY is set and non-empty.
+    # sports_data included only when FOOTBALL_DATA_API_KEY is set.
     import os as _os
-    default = "cryptopanic,web_search"
+    parts: List[str] = []
+    if (_os.getenv("FOOTBALL_DATA_API_KEY") or "").strip():
+        parts.append("sports_data")
     if (_os.getenv("PERPLEXITY_API_KEY") or "").strip():
-        default = "perplexity,cryptopanic,web_search"
+        parts.append("perplexity")
+    parts.extend(["cryptopanic", "web_search"])
+    default = ",".join(parts)
     raw = value or default
     return [item.strip() for item in raw.split(",") if item.strip()]
 
@@ -345,6 +391,11 @@ def fetch_contexts_for_market(
 ) -> Dict[str, Any]:
     contexts: List[Dict[str, Any]] = []
     enabled = list(providers)
+    if "sports_data" in enabled:
+        try:
+            contexts.extend(SportsDataAdapter().fetch(market, limit=limit))
+        except Exception:
+            pass
     if "perplexity" in enabled:
         try:
             contexts.extend(PerplexityAdapter().fetch(market))

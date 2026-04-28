@@ -56,7 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_market_event_links_cluster ON market_event_links(
 CREATE TABLE IF NOT EXISTS market_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity')),
+  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data')),
   source_id TEXT,
   title TEXT,
   published_at TEXT,
@@ -160,7 +160,7 @@ CREATE INDEX IF NOT EXISTS idx_proposals_alpha_signal ON proposals(alpha_signal_
 CREATE TABLE IF NOT EXISTS proposal_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   proposal_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity')),
+  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data')),
   source_id TEXT,
   title TEXT,
   published_at TEXT,

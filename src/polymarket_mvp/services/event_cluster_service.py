@@ -23,6 +23,16 @@ _SPORTS_KEYWORDS = (
 )
 _ESPORTS_KEYWORDS = ("esports", "e-sports", "league of legends", "dota", "csgo", "cs2", "valorant", "overwatch")
 _TOTALS_KEYWORDS = ("over", "under", "total", "combined", "o/u")
+_POLITICS_KEYWORDS = (
+    "election", "president", "presidential", "congress", "parliament", "senate",
+    "vote", "policy", "war", "ceasefire", "sanction", "tariff",
+    "nato", "ukraine", "china", "taiwan", "treaty", "law", "bill",
+    "trump", "biden", "harris", "putin", "zelensky",
+)
+_TECH_KEYWORDS = (
+    "ai", "openai", "nvidia", "apple", "google", "meta", "microsoft", "amazon",
+    "ipo", "acquisition", "merger", "regulation", "antitrust", "cryptocurrency",
+)
 
 
 def classify_market_class(market: Mapping[str, Any]) -> str:
@@ -54,7 +64,20 @@ def classify_market_class(market: Mapping[str, Any]) -> str:
             return "sports_totals"
         return "sports_winner"
 
+    if any(_kw_match(haystack, kw) for kw in _POLITICS_KEYWORDS):
+        return "politics"
+    if any(_kw_match(haystack, kw) for kw in _TECH_KEYWORDS):
+        return "tech"
+
     return "other"
+
+
+def _kw_match(haystack: str, keyword: str) -> bool:
+    """Word-boundary-aware keyword match — avoids 'ai' matching 'paint'."""
+    if " " in keyword:
+        return keyword in haystack
+    import re as _re
+    return _re.search(rf"\b{_re.escape(keyword)}\b", haystack) is not None
 
 
 # Per-class risk configuration
@@ -63,6 +86,8 @@ MARKET_CLASS_CONFIG: Dict[str, Dict[str, Any]] = {
     "sports_totals":  {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
     "esports":        {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
     "crypto_up_down": {"live_enabled": False, "max_order_usdc": 0,  "max_daily_gross": 0,  "max_open_positions": 0},
+    "politics":       {"live_enabled": True,  "max_order_usdc": 15, "max_daily_gross": 75, "max_open_positions": 8},
+    "tech":           {"live_enabled": True,  "max_order_usdc": 10, "max_daily_gross": 50, "max_open_positions": 6},
     "other":          {"live_enabled": True,  "max_order_usdc": 5,  "max_daily_gross": 25, "max_open_positions": 3},
 }
 

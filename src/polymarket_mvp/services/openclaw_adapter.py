@@ -174,6 +174,113 @@ def _claude_cli_path() -> str | None:
     return None
 
 
+def _codex_cli_path() -> str | None:
+    configured = (os.getenv("CODEX_CLI_PATH") or "").strip()
+    candidates: list[str] = []
+    if configured:
+        candidates.append(configured)
+    discovered = shutil.which("codex")
+    if discovered:
+        candidates.append(discovered)
+    candidates.extend(
+        [
+            str(Path.home() / ".local" / "bin" / "codex"),
+            "/usr/local/bin/codex",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
+    """Run GPT-5.5 via Codex CLI (OAuth-authenticated, no API key billing)."""
+    cli_path = _codex_cli_path()
+    if cli_path is None:
+        return None
+    model = (os.getenv("CODEX_MODEL") or "gpt-5.5").strip()
+    timeout_seconds = (os.getenv("CODEX_TIMEOUT_SECONDS") or "").strip()
+    timeout = int(timeout_seconds) if timeout_seconds else 180
+    # Codex CLI exposes a non-interactive `exec` mode for scripted use:
+    # `codex exec --json -m <model> --skip-git-repo-check <prompt>` reads the
+    # full prompt as a positional arg and emits one JSONL event per line.
+    prompt = (
+        "System instructions:\n"
+        f"{system_prompt}\n\n"
+        "User payload:\n"
+        f"{user_prompt}\n\n"
+        "Return valid JSON only. Do not wrap the JSON in markdown fences."
+    )
+    command = [
+        cli_path,
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-m",
+        model,
+        prompt,
+    ]
+    if llm_cooldown_remaining_sec() > 0:
+        raise LLMRateLimitError(
+            stderr_snippet="still in cooldown; skipping CLI invocation",
+            cooldown_sec=max(0, int(_LLM_COOLDOWN_STATE["cooldown_until"] - time.time())),
+            consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+        )
+    start = time.monotonic()
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    latency_ms = int((time.monotonic() - start) * 1000)
+    if result.returncode != 0:
+        stderr = sanitize_text(result.stderr or result.stdout)
+        if _looks_like_rate_limit(result.stderr or result.stdout or ""):
+            raise _record_llm_rate_limit_hit(stderr)
+        raise RuntimeError(f"Codex CLI failed: {stderr or result.returncode}")
+    final_text = _extract_codex_final_text(result.stdout or "")
+    parsed = _decode_json_candidate(final_text or result.stdout or "")
+    _LAST_META.clear()
+    _LAST_META.update({
+        "model": model,
+        "session_id": None,
+        "latency_ms": latency_ms,
+        "called_at": utc_now_iso(),
+        "transport": "codex_cli",
+    })
+    return parsed if parsed is not None else final_text
+
+
+def _extract_codex_final_text(stdout: str) -> str | None:
+    """Walk Codex `exec --json` JSONL events and return the final assistant text.
+
+    Codex emits one JSON object per line with shapes like
+    `{"type":"item.completed","item":{"item_type":"assistant_message","text":"..."}}`.
+    We pick the last assistant_message text we see, falling back to any "text"
+    field on terminal events.
+    """
+    if not stdout:
+        return None
+    last_text: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if isinstance(item, dict):
+            if item.get("item_type") in ("assistant_message", "agent_message"):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str) and text.strip():
+                    last_text = text
+        msg = event.get("msg") if isinstance(event, dict) else None
+        if isinstance(msg, dict):
+            text = msg.get("message") or msg.get("text")
+            if isinstance(text, str) and text.strip():
+                last_text = text
+    return last_text
+
+
 def _claude_payload(system_prompt: str, user_prompt: str) -> Any:
     cli_path = _claude_cli_path()
     if cli_path is None:
@@ -367,6 +474,8 @@ def _cli_payload(system_prompt: str, user_prompt: str) -> Any:
 
 def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any | None:
     mode = _transport_mode()
+    if mode in {"codex_cli", "codex"}:
+        return _codex_payload(system_prompt, user_prompt)
     if mode in {"claude", "claude_cli"}:
         return _claude_payload(system_prompt, user_prompt)
     if mode in {"cli", "local"}:
@@ -414,6 +523,7 @@ def is_enabled() -> bool:
         _http_chat_endpoint()[0] is not None
         or _cli_path() is not None
         or _claude_cli_path() is not None
+        or _codex_cli_path() is not None
     )
 
 
