@@ -128,16 +128,32 @@ def cancel_orphaned_positions(conn) -> int:
 
 
 def check_and_backfill_resolutions(conn) -> List[Dict[str, Any]]:
-    """Check open positions against Gamma API — detect resolved markets and write to market_resolutions.
+    """Check open positions AND shadow executions against Gamma API.
+
+    Detects resolved markets and writes to market_resolutions.
+    Shadow executions never create rows in the positions table, so without
+    the extra query below, conviction-era shadow PnL is invisible (Gate 4
+    always shows 0 resolved positions).
 
     Returns a list of newly resolved markets detected this pass.
     """
     gamma_base = (os.getenv("POLYMARKET_GAMMA_API") or "https://gamma-api.polymarket.com").rstrip("/")
     positions = list_positions(conn, statuses=["open", "partially_filled", "closing"])
-    if not positions:
+    # Also include markets from shadow executions that haven't been resolved yet.
+    shadow_rows = conn.execute(
+        """
+        SELECT DISTINCT p.market_id
+        FROM shadow_executions se
+        JOIN proposals p ON p.proposal_id = se.proposal_id
+        LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
+        WHERE mr.market_id IS NULL
+        """
+    ).fetchall()
+    shadow_market_ids = {str(row["market_id"]) for row in shadow_rows}
+    position_market_ids = {str(pos["market_id"]) for pos in positions}
+    market_ids = list(position_market_ids | shadow_market_ids)
+    if not market_ids:
         return []
-    # De-duplicate market IDs
-    market_ids = list({str(pos["market_id"]) for pos in positions})
     resolved: List[Dict[str, Any]] = []
     for market_id in market_ids:
         # Skip if already recorded
