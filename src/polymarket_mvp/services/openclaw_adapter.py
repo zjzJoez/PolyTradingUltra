@@ -217,6 +217,8 @@ def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
         "exec",
         "--json",
         "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
         "-m",
         model,
         prompt,
@@ -228,7 +230,17 @@ def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
             consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
         )
     start = time.monotonic()
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    # `codex exec` reads stdin even when a positional prompt is provided,
+    # so we close it explicitly — otherwise subprocess hangs waiting for EOF
+    # when the parent has no TTY (systemd-run, our case).
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
     latency_ms = int((time.monotonic() - start) * 1000)
     if result.returncode != 0:
         stderr = sanitize_text(result.stderr or result.stdout)
@@ -249,12 +261,10 @@ def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
 
 
 def _extract_codex_final_text(stdout: str) -> str | None:
-    """Walk Codex `exec --json` JSONL events and return the final assistant text.
+    """Walk Codex `exec --json` JSONL events and return the final agent message text.
 
-    Codex emits one JSON object per line with shapes like
-    `{"type":"item.completed","item":{"item_type":"assistant_message","text":"..."}}`.
-    We pick the last assistant_message text we see, falling back to any "text"
-    field on terminal events.
+    Codex emits one JSON object per line. The terminal text we want lives in
+    an `item.completed` event whose item is `{"type":"agent_message","text":"..."}`.
     """
     if not stdout:
         return None
@@ -267,13 +277,16 @@ def _extract_codex_final_text(stdout: str) -> str | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        item = event.get("item") if isinstance(event, dict) else None
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item")
         if isinstance(item, dict):
-            if item.get("item_type") in ("assistant_message", "agent_message"):
+            item_type = item.get("type") or item.get("item_type")
+            if item_type in ("agent_message", "assistant_message"):
                 text = item.get("text") or item.get("content")
                 if isinstance(text, str) and text.strip():
                     last_text = text
-        msg = event.get("msg") if isinstance(event, dict) else None
+        msg = event.get("msg")
         if isinstance(msg, dict):
             text = msg.get("message") or msg.get("text")
             if isinstance(text, str) and text.strip():
