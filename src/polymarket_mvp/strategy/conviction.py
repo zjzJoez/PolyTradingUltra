@@ -45,6 +45,12 @@ _CATALYST_MODERATE_OR_STRONG = {"moderate", "strong"}
 _CATALYST_ANY_IDENTIFIED = {"weak", "moderate", "strong"}  # anything other than "none"
 _DOWNSIDE_BLOCKING = {"substantial"}
 
+# Resolution clarity: how objectively the market can be settled.
+# Ambiguous markets skip entirely (resolution risk per Ma et al. 2026);
+# subjective markets downgrade one tier.
+_RESOLUTION_AMBIGUOUS = "ambiguous"
+_RESOLUTION_SUBJECTIVE = "subjective"
+
 _EDGE_SKIP = 0.05
 _EDGE_SPECULATIVE = 0.10
 _EDGE_MEDIUM_WEAK = 0.12   # weak-clarity proposals need a slightly larger edge to reach medium
@@ -74,11 +80,17 @@ def compute_tier(
     market_price: float,
     catalyst_clarity: str,
     downside_risk: str,
+    resolution_clarity: str = "objective",
 ) -> Optional[str]:
     """Deterministic tier mapping from LLM-provided objective fields.
 
-    Returns None when edge is too thin to justify any bet.
+    Returns None when edge is too thin to justify any bet, or when
+    resolution_clarity="ambiguous" (resolution risk too high to enter).
     """
+    res = (resolution_clarity or "objective").strip().lower()
+    if res == _RESOLUTION_AMBIGUOUS:
+        return None  # resolution risk: skip entirely
+
     try:
         c = float(confidence)
         p = float(market_price)
@@ -92,23 +104,31 @@ def compute_tier(
     if edge < _EDGE_SKIP:
         return None
     if edge < _EDGE_SPECULATIVE:
-        return TIER_SPECULATIVE
-    if edge < _EDGE_MEDIUM_WEAK:
+        tier = TIER_SPECULATIVE
+    elif edge < _EDGE_MEDIUM_WEAK:
         # 0.10-0.12: only reach medium with at least moderate/strong clarity;
         # weak or none stays speculative (small edge, soft narrative = small bet).
-        return TIER_MEDIUM if clarity in _CATALYST_MODERATE_OR_STRONG else TIER_SPECULATIVE
-    if edge < _EDGE_MEDIUM:
+        tier = TIER_MEDIUM if clarity in _CATALYST_MODERATE_OR_STRONG else TIER_SPECULATIVE
+    elif edge < _EDGE_MEDIUM:
         # 0.12-0.20: medium if any identified catalyst (including weak);
         # pure "none" (statistical-only claim) stays speculative.
-        return TIER_MEDIUM if clarity in _CATALYST_ANY_IDENTIFIED else TIER_SPECULATIVE
-    if edge < _EDGE_HIGH:
-        return TIER_HIGH if clarity in _CATALYST_STRONG else TIER_MEDIUM
-    # edge >= 0.30
-    if clarity in _CATALYST_STRONG and risk not in _DOWNSIDE_BLOCKING:
-        return TIER_EXTREME
-    if clarity in _CATALYST_MODERATE_OR_STRONG:
-        return TIER_HIGH
-    return TIER_MEDIUM
+        tier = TIER_MEDIUM if clarity in _CATALYST_ANY_IDENTIFIED else TIER_SPECULATIVE
+    elif edge < _EDGE_HIGH:
+        tier = TIER_HIGH if clarity in _CATALYST_STRONG else TIER_MEDIUM
+    else:
+        # edge >= 0.30
+        if clarity in _CATALYST_STRONG and risk not in _DOWNSIDE_BLOCKING:
+            tier = TIER_EXTREME
+        elif clarity in _CATALYST_MODERATE_OR_STRONG:
+            tier = TIER_HIGH
+        else:
+            tier = TIER_MEDIUM
+
+    # Subjective resolution: downgrade one tier (higher resolution risk, lower size).
+    if res == _RESOLUTION_SUBJECTIVE:
+        tier = downgrade_tier(tier)  # returns None if already at speculative
+
+    return tier
 
 
 def account_scale(balance_usdc: Optional[float] = None) -> float:

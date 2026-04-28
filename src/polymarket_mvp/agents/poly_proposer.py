@@ -61,6 +61,10 @@ SELF-CALIBRATION
 - If a prior_proposal filled (fill_price is not null), account for your open exposure before proposing another entry on the same side.
 
 CONVICTION FIELDS (NEW — system uses these, not your self-rated "tier")
+- resolution_clarity: one of "objective" | "subjective" | "ambiguous".
+  - "objective": market resolves on a verifiable, unambiguous external fact — game score, official election result, exact numerical threshold. No interpretive room.
+  - "subjective": outcome requires some judgment or interpretation, but there is a clear primary reference (e.g. major media consensus, official statement). Most political and economic markets fall here.
+  - "ambiguous": resolution criterion is vague, contested, or highly interpretable — e.g. "Will X reach an agreement with Y?" with no defined benchmark. High risk of oracle misreport. Use this sparingly; if in doubt, use "subjective".
 - catalyst_clarity: one of "none" | "weak" | "moderate" | "strong".
   - "strong" = a known, scheduled event will definitively resolve this market within days. Examples: a game/match happening today or tomorrow, a vote counting tonight, a scheduled announcement this week. If the market has days_to_expiry < 3 and resolves on a specific game or vote, this is STRONG.
   - "moderate" = a plausible near-term catalyst (e.g. scheduled event in 7-14 days, ongoing series, expected ruling) but timing or final trigger less certain.
@@ -76,10 +80,11 @@ CONVICTION FIELDS (NEW — system uses these, not your self-rated "tier")
 
 PROPOSAL CONTRACT
 - Return valid JSON only. Preferred top-level shape: {"proposals": [...]}. A top-level array is also accepted.
-- Each proposal object MUST contain exactly these keys: market_id, outcome, confidence_score, catalyst_clarity, downside_risk, asymmetric_target_multiplier, thesis_catalyst_deadline, recommended_size_usdc, reasoning, max_slippage_bps.
+- Each proposal object MUST contain exactly these keys: market_id, outcome, confidence_score, resolution_clarity, catalyst_clarity, downside_risk, asymmetric_target_multiplier, thesis_catalyst_deadline, recommended_size_usdc, reasoning, max_slippage_bps.
 - market_id: must exactly match a provided market_id from the payload.
 - outcome: must exactly match one of that market's allowed_outcomes.
 - confidence_score: YOUR independent probability estimate that this outcome will occur — NOT the current market price. Range [0, 1]. Propose only when this estimate meaningfully diverges from the market price.
+- resolution_clarity: enum above (required). Affects position sizing: ambiguous markets are skipped entirely; subjective markets are sized down one tier.
 - catalyst_clarity: enum above (required).
 - downside_risk: enum above (required).
 - asymmetric_target_multiplier: positive number (required). Use null if you genuinely cannot estimate, but prefer a concrete number.

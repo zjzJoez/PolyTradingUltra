@@ -239,6 +239,7 @@ def _size_from_conviction(
     confidence = llm_item.get("confidence_score")
     clarity = llm_item.get("catalyst_clarity") or ""
     downside = llm_item.get("downside_risk") or ""
+    resolution = llm_item.get("resolution_clarity") or "objective"
     if confidence is None:
         return 0.0, None
     tier = compute_tier(
@@ -246,6 +247,7 @@ def _size_from_conviction(
         market_price=market_price,
         catalyst_clarity=str(clarity),
         downside_risk=str(downside),
+        resolution_clarity=str(resolution),
     )
     if tier is None:
         return 0.0, None
@@ -328,6 +330,32 @@ def _enforce_clob_slippage_cap(
         if current_size < floor:
             return 0.0, None
     return current_size, current_tier
+
+
+def _apply_liquidity_tier_downgrade(
+    tier: str | None,
+    size_usdc: float,
+    liquidity_usdc: float,
+    market_price: float,
+    balance_usdc: float | None,
+) -> tuple[float, str | None]:
+    """Downgrade one tier for markets below the liquidity threshold.
+
+    Low-liquidity markets have fewer potential UMA disputers, making the
+    free-rider coordination failure more likely and resolution risk higher
+    (per Ma et al. 2026 resolution-mechanism analysis).
+    """
+    threshold = get_env_float("POLY_LIQUIDITY_DOWNGRADE_THRESHOLD", 20_000.0)
+    if tier is None or liquidity_usdc >= threshold:
+        return size_usdc, tier
+    downgraded = downgrade_tier(tier)
+    if downgraded is None:
+        # Already at speculative — keep rather than killing the trade entirely.
+        return size_usdc, tier
+    new_size = compute_tier_size(downgraded, balance_usdc)
+    if new_size < _five_share_floor(market_price):
+        return size_usdc, tier  # downgraded size wouldn't clear exchange minimum
+    return new_size, downgraded
 
 
 def _prior_proposals_snippet(conn, market_id: str, limit: int) -> List[Dict[str, Any]]:
@@ -527,6 +555,7 @@ def build_openclaw_proposals(
 
         raw = raw_items_by_id.get(pid, {})
         conviction_payload = {
+            "resolution_clarity": raw.get("resolution_clarity") or "objective",
             "catalyst_clarity": raw.get("catalyst_clarity"),
             "downside_risk": raw.get("downside_risk"),
             "asymmetric_target_multiplier": raw.get("asymmetric_target_multiplier"),
@@ -572,6 +601,14 @@ def build_openclaw_proposals(
             token_id=token_id,
             market_price=reference_price,
             balance_usdc=balance_override,
+        )
+        if size_usdc_new <= 0 or tier is None:
+            continue
+        # Liquidity-based tier downgrade: low-liquidity markets have fewer
+        # UMA disputers → higher resolution risk (Ma et al. 2026 free-rider).
+        market_liquidity = float((market or {}).get("liquidity_usdc") or 0)
+        size_usdc_new, tier = _apply_liquidity_tier_downgrade(
+            tier, size_usdc_new, market_liquidity, reference_price, balance_override
         )
         if size_usdc_new <= 0 or tier is None:
             continue
