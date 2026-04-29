@@ -118,16 +118,21 @@ def _extract_teams(question: str) -> tuple[str, str] | None:
 
 
 def _normalize(name: str) -> str:
-    """Fold to ASCII lowercase, strip common club-name affixes for matching."""
+    """Fold to ASCII lowercase, strip universally-meaningless club boilerplate.
+
+    Keeps distinguishing tokens (real, atletico, racing, …) so that
+    "Real Madrid" and "Atlético Madrid" don't collide. Only strips suffix
+    abbreviations (FC, CF, SC) and connector words (de, del, the, club,
+    football) so "Club Atlético de Madrid" → "atletico madrid" matches
+    Polymarket's "Atletico Madrid".
+    """
     s = unicodedata.normalize("NFKD", name or "")
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.lower()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Drop boilerplate that varies between sources (Real Madrid CF vs. Real Madrid).
     s = re.sub(
-        r"\b(?:fc|cf|sc|ac|sv|tsg|vfl|vfb|club|atletico|atletic|real|de|del|"
-        r"the|football|club\s+de|cd)\b",
+        r"\b(?:fc|cf|sc|ac|sv|tsg|vfl|vfb|ff|cd|club|football|the|de|del|da|do|dos|das)\b",
         " ",
         s,
     )
