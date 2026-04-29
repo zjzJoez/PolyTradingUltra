@@ -76,8 +76,11 @@ _LEADING_LABEL = re.compile(
 )
 _TRAILING_QUALIFIER = re.compile(
     r"\s*(?:[:\-]\s*(?:o/u|over/under|over|under|map\s*\d+|map\s+winner|"
-    r"first\s+half|second\s+half|moneyline|spread|total|tiebreak|set\s*\d+).*"
-    r"|\([^)]*\))\s*$",
+    r"first\s+half|second\s+half|moneyline|spread|total|tiebreak|set\s*\d+|"
+    r"both\s+teams\s+to\s+score).*"
+    r"|\([^)]*\)"
+    r"|\s+(?:end\s+in\s+a\s+draw|to\s+win|to\s+score|both\s+teams\s+to\s+score).*"
+    r")\s*$",
     flags=re.IGNORECASE,
 )
 
@@ -261,13 +264,24 @@ def _search_team(name: str) -> int | None:
         return None
     if needle in index:
         return index[needle]
-    # Fall back to a substring containment match: e.g. extracted "Arsenal"
-    # should resolve to "Arsenal FC" if both normalize-collapse via _normalize.
+    # Multi-token containment fallback: every token of the needle must appear
+    # as a token of the candidate (or vice versa for unique 2+-token names).
+    # Plain substring matches were too loose — every "Esports" team and every
+    # "Saudi" club collapsed to whichever key happened to be inserted first.
+    needle_tokens = needle.split()
+    if len(needle_tokens) < 2:
+        return None
+    needle_set = set(needle_tokens)
+    best: tuple[int, int] | None = None  # (score, team_id)
     for key, tid in index.items():
-        if needle in key or key in needle:
-            if min(len(needle), len(key)) >= 3:
-                return tid
-    return None
+        key_tokens = set(key.split())
+        if len(key_tokens) < 2:
+            continue
+        if needle_set.issubset(key_tokens) or key_tokens.issubset(needle_set):
+            score = len(needle_set & key_tokens)
+            if best is None or score > best[0]:
+                best = (score, tid)
+    return best[1] if best else None
 
 
 def _format_match(match: Mapping[str, Any], team_id: int) -> tuple[str, str] | None:
