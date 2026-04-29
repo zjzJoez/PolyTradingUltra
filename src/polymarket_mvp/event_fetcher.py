@@ -224,20 +224,23 @@ class PerplexityAdapter:
         ]
 
 
-def _is_sports_market(market: Mapping[str, Any]) -> bool:
-    """Cheap pre-check before hitting football-data.org."""
-    from .services.event_cluster_service import classify_market_class
-    return classify_market_class(market) in ("sports_winner", "sports_totals")
-
-
 class SportsDataAdapter:
-    """football-data.org adapter — recent team form for sports markets."""
+    """football-data.org adapter — recent team form for sports markets.
+
+    Polymarket sports questions often skip league keywords ("Will Arsenal FC
+    win on 2026-04-29?", "Club Atlético de Madrid vs. Arsenal FC"), so the
+    classifier keyword list misses them. Instead of gating on the classifier,
+    we gate on whether team-name extraction succeeds — that's itself a strong
+    sports signal, and `build_sports_context` already returns None on any
+    extraction or lookup failure, keeping the path silent for non-sports
+    questions.
+    """
 
     def fetch(self, market: Mapping[str, Any], *, limit: int = 1) -> List[Dict[str, Any]]:
-        if not _is_sports_market(market):
-            return []
-        from .services.sports_data import build_sports_context
+        from .services.sports_data import _extract_teams, build_sports_context
 
+        if _extract_teams(market.get("question") or "") is None:
+            return []
         text = build_sports_context(market)
         if not text:
             return []

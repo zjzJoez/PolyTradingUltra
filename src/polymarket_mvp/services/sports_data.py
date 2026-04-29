@@ -46,13 +46,30 @@ _NOISE_SUFFIX = re.compile(
     r"on\s+\w+|today|tonight|this\s+\w+|by\s+\w+|\?)\s*$",
     flags=re.IGNORECASE,
 )
+# Strip Polymarket-style market-class prefixes and trailing wager qualifiers.
+# Examples: "Game Handicap: KT vs HLE", "Counter-Strike: Vitality vs FUT - Map 1",
+# "Real Madrid vs. Arsenal: O/U 2.5", "Spread: Real Madrid (-2.5)".
+_LEADING_LABEL = re.compile(
+    r"^(?:game\s+handicap|games?\s+total|game\s+total|spread|exact\s+score|"
+    r"handicap|moneyline|first\s+half|second\s+half|over/under|o/u|map\s*\d+|"
+    r"counter[- ]?strike|league\s+of\s+legends|valorant|dota\s*2?|csgo|cs2)\s*[:\-]\s*",
+    flags=re.IGNORECASE,
+)
+_TRAILING_QUALIFIER = re.compile(
+    r"\s*(?:[:\-]\s*(?:o/u|over/under|over|under|map\s*\d+|map\s+winner|"
+    r"first\s+half|second\s+half|moneyline|spread|total|tiebreak|set\s*\d+).*"
+    r"|\([^)]*\))\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean_team_token(raw: str) -> str:
     s = sanitize_text(raw or "")
+    s = _LEADING_LABEL.sub("", s)
     s = _NOISE_PREFIX.sub("", s)
+    s = _TRAILING_QUALIFIER.sub("", s)
     s = _NOISE_SUFFIX.sub("", s)
-    s = re.sub(r"[?!.,]+$", "", s).strip()
+    s = re.sub(r"[?!.,;:]+$", "", s).strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
