@@ -340,7 +340,10 @@ def _extract_codex_final_text(stdout: str) -> str | None:
 
 
 _DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
-_DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+# As of 2026-05, /v1/models exposes deepseek-v4-flash and deepseek-v4-pro.
+# The legacy `deepseek-chat` alias still resolves but routes to the cheaper
+# v4-flash; pro is the better quality/cost trade-off for our use case.
+_DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
 
 
 def _deepseek_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any:
