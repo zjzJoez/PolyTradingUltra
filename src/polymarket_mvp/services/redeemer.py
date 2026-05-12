@@ -166,7 +166,16 @@ def _market_info(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | N
     raw_neg = mj.get("negRisk") if isinstance(mj, dict) else None
     # negRisk absent from the snapshot is NOT the same as negRisk=false — older
     # markets simply don't have the field. Return None to signal "ask the chain".
-    neg_risk: Optional[bool] = None if raw_neg is None else bool(raw_neg)
+    # Defensive parse: bool("false") is True, so a JSON string "false" would
+    # wrong-branch us into the standard-CTF path and silently 0-redeem a
+    # NegRisk position. Trust real JSON booleans; for anything else, do
+    # case-insensitive truthy parsing.
+    if raw_neg is None:
+        neg_risk: Optional[bool] = None
+    elif isinstance(raw_neg, bool):
+        neg_risk = raw_neg
+    else:
+        neg_risk = str(raw_neg).strip().lower() in ("true", "1", "yes")
     return {
         "condition_id": row["condition_id"],
         "neg_risk": neg_risk,

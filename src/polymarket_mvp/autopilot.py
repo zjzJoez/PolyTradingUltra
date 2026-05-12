@@ -43,6 +43,7 @@ from .db import (
     update_proposal_status,
     update_proposal_workflow_fields,
 )
+from .services.authorization_service import safe_authorization_status
 
 
 def _log(msg: str) -> None:
@@ -257,7 +258,9 @@ class Autopilot:
                 update_proposal_workflow_fields(
                     conn,
                     pid,
-                    authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                    authorization_status=safe_authorization_status(
+                        (result.get("authorization") or {}).get("authorization_status")
+                    ),
                     status=result["next_status"],
                 )
             except Exception:
@@ -359,7 +362,9 @@ class Autopilot:
                 update_proposal_workflow_fields(
                     conn,
                     p["proposal_id"],
-                    authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                    authorization_status=safe_authorization_status(
+                        (result.get("authorization") or {}).get("authorization_status")
+                    ),
                     status=result["next_status"],
                 )
             except Exception:

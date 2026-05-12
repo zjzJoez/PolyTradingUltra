@@ -8,7 +8,7 @@ import requests
 
 from .common import blocked_market_reason, dump_json, get_env_bool, get_env_float, get_env_int, market_reference_price, price_is_tradable, read_proposals, resolve_token_id, tradable_price_bounds, utc_now_iso
 from .db import connect_db, init_db, proposal_record, proposal_id_for, update_proposal_workflow_fields
-from .services.authorization_service import evaluate_authorization
+from .services.authorization_service import evaluate_authorization, safe_authorization_status
 from .services.event_cluster_service import MARKET_CLASS_CONFIG, classify_market_class
 from .services.portfolio_risk_service import evaluate_portfolio_risk
 from .strategy.conviction import TIER_ORDER
@@ -222,7 +222,24 @@ def evaluate_full_record(conn, record: Dict[str, Any]) -> Dict[str, Any]:
             "authorization": None,
         }
     authorization = evaluate_authorization(conn, record)
-    next_status = "authorized_for_execution" if authorization["authorization_status"] == "matched_auto_execute" else "pending_approval"
+    auth_status = authorization["authorization_status"]
+    # Limit-reached signals (daily_loss / position cap) mean a matching
+    # authorization rule was found but a hard risk cap blocked it. Treat
+    # these as risk_blocked rather than pending_approval — sending them
+    # for human approval would be misleading (the rule already denied it)
+    # and the literal status string is also not in the column CHECK enum,
+    # which used to crash the propose loop every retry.
+    if auth_status in {"daily_loss_limit_reached", "position_limit_reached"}:
+        _persist_risk_decision(conn, record["proposal_id"], [authorization.get("reason") or auth_status])
+        return {
+            "proposal_id": record["proposal_id"],
+            "approved_for_approval_gate": False,
+            "next_status": "risk_blocked",
+            "risk_summary": single_risk["risk_summary"],
+            "portfolio_risk": portfolio_risk,
+            "authorization": authorization,
+        }
+    next_status = "authorized_for_execution" if auth_status == "matched_auto_execute" else "pending_approval"
     return {
         "proposal_id": record["proposal_id"],
         "approved_for_approval_gate": True,
@@ -255,7 +272,9 @@ def main() -> int:
             update_proposal_workflow_fields(
                 conn,
                 proposal_id,
-                authorization_status=(result.get("authorization") or {}).get("authorization_status", "none"),
+                authorization_status=safe_authorization_status(
+                    (result.get("authorization") or {}).get("authorization_status")
+                ),
                 status=result["next_status"],
             )
             results.append(result)

@@ -247,6 +247,75 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(result["next_status"], "authorized_for_execution")
         self.assertEqual(result["authorization"]["authorization_status"], "matched_auto_execute")
 
+    def test_risk_engine_routes_limit_reached_to_risk_blocked(self) -> None:
+        """Regression for the production CHECK-constraint blow-up:
+
+        evaluate_authorization() can return authorization_status values like
+        'daily_loss_limit_reached' / 'position_limit_reached' to signal a
+        hard cap was hit. Before the fix, those leaked into
+        update_proposal_workflow_fields() and crashed on the CHECK constraint
+        every retry, freezing the propose loop on the offending proposal.
+
+        After the fix: limit-reached cases route to next_status='risk_blocked'
+        (with the reason persisted to risk_block_reasons_json), and the
+        authorization_status that lands in the DB is the safe 'none'.
+        """
+        from unittest.mock import patch as _patch
+        from polymarket_mvp.services.authorization_service import safe_authorization_status
+
+        # The pure normalizer
+        self.assertEqual(safe_authorization_status("daily_loss_limit_reached"), "none")
+        self.assertEqual(safe_authorization_status("position_limit_reached"), "none")
+        self.assertEqual(safe_authorization_status("matched_auto_execute"), "matched_auto_execute")
+        self.assertEqual(safe_authorization_status("matched_manual_only"), "matched_manual_only")
+        self.assertEqual(safe_authorization_status(None), "none")
+        self.assertEqual(safe_authorization_status("garbage_value"), "none")
+
+        # End-to-end: mock the authorization layer to return a limit-reached
+        # outcome, verify evaluate_full_record routes to risk_blocked and the
+        # DB write goes through cleanly (no CHECK violation).
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            proposal = sample_proposal()
+            stored = upsert_proposal(
+                conn, proposal, decision_engine="heuristic", status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction", topic="BTC",
+            )
+            conn.commit()
+            record = proposal_record(conn, stored["proposal_id"])
+
+            with _patch("polymarket_mvp.risk_engine.evaluate_authorization") as mock_auth:
+                mock_auth.return_value = {
+                    "authorization_status": "daily_loss_limit_reached",
+                    "matched_authorization": {"strategy_name": "near_expiry_conviction"},
+                    "reason": "daily_loss=60.00 >= max=50.00",
+                }
+                result = evaluate_full_record(conn, record)
+
+            self.assertEqual(result["next_status"], "risk_blocked")
+            # Persist through the same path the autopilot uses, with the new
+            # safe wrapper — this is the call that used to raise IntegrityError.
+            from polymarket_mvp.db import update_proposal_workflow_fields
+            update_proposal_workflow_fields(
+                conn,
+                stored["proposal_id"],
+                authorization_status=safe_authorization_status(
+                    (result.get("authorization") or {}).get("authorization_status")
+                ),
+                status=result["next_status"],
+            )
+            conn.commit()
+
+            saved = dict(conn.execute(
+                "SELECT status, authorization_status, risk_block_reasons_json FROM proposals WHERE proposal_id = ?",
+                (stored["proposal_id"],),
+            ).fetchone())
+            self.assertEqual(saved["status"], "risk_blocked")
+            self.assertEqual(saved["authorization_status"], "none")
+            self.assertIn("daily_loss", saved["risk_block_reasons_json"])
+
     def test_authorized_execution_creates_position_and_kill_switch_blocks(self) -> None:
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
