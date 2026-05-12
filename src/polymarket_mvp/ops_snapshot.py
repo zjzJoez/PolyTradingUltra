@@ -250,7 +250,7 @@ def _build_portfolio_summary(conn) -> dict[str, Any]:
             from .common import load_repo_env
             load_repo_env()
             from .poly_executor import _build_clob_client
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
             client = _build_clob_client()
             raw = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0))
             usdc_balance = int(raw["balance"]) / 1e6
