@@ -12,6 +12,7 @@ git push -u origin feat/clob-v2-migration
 # EC2 — get the code
 ssh polytrade
 cd /home/ubuntu/polymarket-mvp
+.venv/bin/python --version   # must be ≥3.10 — V2 SDK accepts 3.9.10+ but our _build_clob_client guard requires 3.10
 git fetch origin
 git checkout feat/clob-v2-migration
 .venv/bin/pip install -e '.[real-exec]'   # installs py-clob-client-v2==1.0.1
@@ -28,7 +29,9 @@ Expected at this point: `RESULT: ✗ NOT READY for V2 trading`. The SDK probe se
 ```bash
 ssh polytrade '/home/ubuntu/polymarket-mvp/.venv/bin/python /home/ubuntu/polymarket-mvp/scripts/migrate_to_clob_v2.py --dry-run'
 ```
-Expected output: 7 steps total, 1 already-done (`G` for CTF.setApprovalForAll(NegRiskAdapter) — was True from V1 unchanged) plus 6 `[do]` entries. **No txns are broadcast.**
+Expected output on a fresh-from-V1 wallet matching PRD §1: **7 `[do]` entries** (steps A–G). The script does not include a separate step for `CTF.setApprovalForAll(NegRiskAdapter)` because that bit was already True under V1 and is unchanged across the migration — the readiness checklist in `check_v2_state.py` still verifies it as a precondition. **No txns are broadcast in dry-run mode.**
+
+If the dry-run shows fewer than 7 `[do]` entries, the wallet is partially migrated — re-running with broadcast is still safe because every step is idempotent.
 
 ### Step 3 — Get explicit broadcast approval, then run
 **Only after the user says "approve, broadcast":**
@@ -66,7 +69,8 @@ ssh polytrade '
 ssh polytrade 'journalctl -u mvp-autopilot.service -f --since "5 min ago"'
 ```
 Look for:
-- A `[poly-executor] real preflight … collateral_balance_available=` line with a non-zero value
+- A `[poly-executor] real preflight … collateral_balance_available=<non-zero>` line — confirms pUSD balance is visible to the CLOB
+- The same line should show `api_keys_count=<≥1>` — confirms our existing V1-minted API key authenticates against the V2 endpoints (Open Q1 from the PRD)
 - No `insufficient_balance` decisions on conviction-tier proposals
 - Eventually: a `status=submitted` or `status=live` execution row
 
