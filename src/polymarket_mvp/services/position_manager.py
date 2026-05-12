@@ -28,6 +28,18 @@ def _is_cancelled_execution_status(status: str) -> bool:
     return normalized == "failed" or normalized.startswith("canceled") or normalized.startswith("cancelled")
 
 
+def _has_partial_fill(execution: Dict[str, Any]) -> bool:
+    """True when the execution recorded a non-zero fill, regardless of its
+    terminal status. This matters for orders that went LIVE → INVALID (or
+    similar) after a partial fill — we hold those tokens on-chain and the
+    position must reflect that, not be marked as cancelled (which would
+    pretend the trade never happened)."""
+    try:
+        return float(execution.get("filled_size_usdc") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _resolution_payout(resolution: Dict[str, Any], outcome: str) -> float | None:
     payload = resolution.get("source_payload_json") or {}
     raw_outcomes = payload.get("outcomes")
@@ -63,6 +75,15 @@ def sync_position_for_execution(conn, execution_id: int) -> Dict[str, Any] | Non
     execution = dict(row)
     execution_status = str(execution.get("status") or "")
     status = _position_status_from_execution_status(execution_status)
+    # Terminal-failure executions with a non-zero partial fill (e.g. INVALID
+    # after 10/12.63 shares matched) must become 'partially_filled' rather
+    # than fall through to the cancelled branch below — we hold those tokens
+    # on-chain and the resolution logic in update_position_marks will turn
+    # them into 'resolved' with the correct realized_pnl once the market
+    # settles. Without this, the position would be marked cancelled and the
+    # tokens would silently sit unresolved forever.
+    if status is None and _is_cancelled_execution_status(execution_status) and _has_partial_fill(execution):
+        status = "partially_filled"
     record = proposal_record(conn, str(execution["proposal_id"]))
     if record is None:
         return None

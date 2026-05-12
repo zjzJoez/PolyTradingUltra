@@ -628,6 +628,101 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "open")
         self.assertEqual(events[-1]["event_type"], "reconcile")
 
+    def test_partial_fill_then_invalid_advances_position_to_resolved(self) -> None:
+        """Regression for the production stuck-position-1593 bug:
+
+        Order is placed, goes LIVE, fills partially (10 of 12.5 shares at $0.4),
+        then the CLOB invalidates the rest. Market then resolves against us.
+
+        Before the fix, _normalize_order_status leaked "INVALID" as the literal
+        lowercase string into executions.status, the reconciler dropped the
+        partial fill (only recorded fills on status='filled'), and the
+        downstream sync never advanced the position past 'open_requested'.
+        After the fix: INVALID → 'failed', partial fill is preserved, position
+        becomes 'partially_filled' then 'resolved' with the correct loss.
+        """
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),  # outcome="Yes"
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            execution = {
+                "proposal_id": stored["proposal_id"],
+                "mode": "real",
+                "client_order_id": f"{stored['proposal_id']}-submitted",
+                "order_intent_json": {"request": {}},
+                "requested_price": 0.4,
+                "requested_size_usdc": 5.0,
+                "max_slippage_bps": 500,
+                "observed_worst_price": 0.4,
+                "slippage_check_status": "passed",
+                "status": "live",
+                "filled_size_usdc": None,
+                "avg_fill_price": None,
+                "txhash_or_order_id": "order-invalid-partial",
+                "slippage_bps": None,
+                "error_message": None,
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            }
+            record_execution(conn, execution)
+            conn.commit()
+            sync_all_positions(conn)  # creates the open_requested row
+
+            # CLOB returns INVALID after a partial fill — mirrors the exact
+            # production payload that froze position 1593.
+            fake_client = Mock()
+            fake_client.get_order.return_value = {
+                "id": "order-invalid-partial",
+                "status": "INVALID",
+                "size_matched": "10.0",
+                "price": "0.4",
+                "original_size": "12.5",
+            }
+            with patch(
+                "polymarket_mvp.services.reconciler._build_clob_client",
+                return_value=fake_client,
+            ):
+                reconcile_live_orders(conn)
+            conn.commit()
+
+            # Verify execution captured the partial fill (was dropped before the fix)
+            exec_row = dict(conn.execute(
+                "SELECT status, filled_size_usdc, avg_fill_price FROM executions WHERE txhash_or_order_id = ?",
+                ("order-invalid-partial",),
+            ).fetchone())
+            self.assertEqual(exec_row["status"], "failed")  # not the literal "invalid" anymore
+            self.assertAlmostEqual(exec_row["filled_size_usdc"], 4.0, places=4)
+            self.assertAlmostEqual(exec_row["avg_fill_price"], 0.4, places=4)
+
+            # Sync should now advance the position to partially_filled
+            sync_all_positions(conn)
+            position = list_positions(conn)[0]
+            self.assertEqual(position["status"], "partially_filled")
+            self.assertAlmostEqual(float(position["filled_qty"]), 10.0, places=4)
+            self.assertAlmostEqual(float(position["entry_price"]), 0.4, places=4)
+
+            # Market resolves "No" — we bet "Yes" → full loss on the 10 filled shares
+            upsert_market_resolution(
+                conn,
+                "m1",
+                "No",
+                {"outcomes": ["Yes", "No"], "outcomePrices": ["0", "1"]},
+            )
+            conn.commit()
+            update_position_marks(conn)
+
+            position = list_positions(conn)[0]
+            self.assertEqual(position["status"], "resolved")
+            self.assertAlmostEqual(float(position["realized_pnl"]), -4.0, places=4)
+
     def test_portfolio_risk_blocks_duplicate_market_outcome_entry_when_active_exposure_exists(self) -> None:
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
