@@ -104,3 +104,22 @@ def evaluate_authorization(conn, record: Mapping[str, Any]) -> Dict[str, Any]:
         result["reason"] = "matched_manual_only"
         return result
     return result
+
+
+# proposals.authorization_status CHECK enum. evaluate_authorization() can
+# return additional values like 'daily_loss_limit_reached' /
+# 'position_limit_reached' to communicate *why* authorization was denied —
+# those are not persistable to the column directly. Callers must route
+# limit-reached outcomes to status='risk_blocked' (with the reason saved to
+# proposals.risk_block_reasons_json) and persist authorization_status='none'.
+PERSISTABLE_AUTHORIZATION_STATUSES = frozenset({"none", "matched_manual_only", "matched_auto_execute"})
+
+
+def safe_authorization_status(raw: Any) -> str:
+    """Coerce an evaluate_authorization() outcome to a value that satisfies
+    the proposals.authorization_status CHECK constraint. Anything outside
+    the canonical 3-value enum (e.g. limit-reached signals) is mapped to
+    'none' — the underlying reason should already be captured in
+    risk_block_reasons_json by _persist_risk_decision()."""
+    value = str(raw) if raw is not None else "none"
+    return value if value in PERSISTABLE_AUTHORIZATION_STATUSES else "none"
