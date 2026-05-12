@@ -198,7 +198,7 @@ CREATE TABLE IF NOT EXISTS executions (
   max_slippage_bps INTEGER NOT NULL,
   observed_worst_price REAL,
   slippage_check_status TEXT NOT NULL CHECK(slippage_check_status IN ('passed', 'failed', 'skipped')),
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('submitted', 'live', 'filled', 'failed', 'shadow_simulated')),
   filled_size_usdc REAL,
   avg_fill_price REAL,
   txhash_or_order_id TEXT,
@@ -292,7 +292,7 @@ CREATE INDEX IF NOT EXISTS idx_positions_resolved_unredeemed ON positions(market
 CREATE TABLE IF NOT EXISTS position_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   position_id INTEGER NOT NULL,
-  event_type TEXT NOT NULL CHECK(event_type IN ('open', 'mark_update', 'reduce', 'close', 'stop', 'resolve', 'reconcile')),
+  event_type TEXT NOT NULL CHECK(event_type IN ('open', 'mark_update', 'reduce', 'close', 'stop', 'resolve', 'reconcile', 'redeem')),
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE CASCADE

@@ -681,9 +681,14 @@ class TradingOSUpgradeTests(unittest.TestCase):
             conn.commit()
 
             sync_all_positions(conn)
+            # Historical scenario was status='canceled_market_resolved'; that
+            # value was removed from the executions.status enum by migration
+            # v10 (it had zero code references and didn't fit the canonical
+            # state machine). The cancel-on-failure path now flows through
+            # the same 'failed' status with an explanatory error_message.
             conn.execute(
-                "UPDATE executions SET status = ?, updated_at = ? WHERE txhash_or_order_id = ?",
-                ("canceled_market_resolved", utc_now_iso(), "order-cancel-market-resolved"),
+                "UPDATE executions SET status = ?, error_message = ?, updated_at = ? WHERE txhash_or_order_id = ?",
+                ("failed", "canceled_market_resolved", utc_now_iso(), "order-cancel-market-resolved"),
             )
             conn.commit()
 
