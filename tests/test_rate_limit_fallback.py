@@ -49,7 +49,7 @@ class CooldownStateMachineTests(unittest.TestCase):
                 openclaw_adapter._claude_payload("sys", "user")
         self.assertEqual(ctx.exception.consecutive_count, 1)
         self.assertEqual(ctx.exception.cooldown_sec, 30 * 60)
-        self.assertGreater(llm_cooldown_remaining_sec(), 29 * 60)
+        self.assertGreater(llm_cooldown_remaining_sec("claude"), 29 * 60)
 
     def test_escalation_on_second_hit_within_window(self):
         # First hit → 30 min
@@ -58,7 +58,7 @@ class CooldownStateMachineTests(unittest.TestCase):
                 openclaw_adapter._claude_payload("sys", "user")
         # Artificially expire the first cooldown so the subprocess is called again,
         # but keep last_hit_at recent (within 6h reset window).
-        openclaw_adapter._LLM_COOLDOWN_STATE["cooldown_until"] = 0.0
+        openclaw_adapter._cooldown_state("claude")["cooldown_until"] = 0.0
 
         with self._mock_cli(), self._mock_run("rate limit exceeded"):
             with self.assertRaises(LLMRateLimitError) as ctx:
@@ -71,13 +71,13 @@ class CooldownStateMachineTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 openclaw_adapter._claude_payload("sys", "user")
         self.assertNotIsInstance(ctx.exception, LLMRateLimitError)
-        self.assertEqual(llm_cooldown_remaining_sec(), 0.0)
+        self.assertEqual(llm_cooldown_remaining_sec("claude"), 0.0)
 
     def test_cooldown_skips_subprocess_entirely(self):
         # Arm cooldown directly, then confirm _claude_payload raises without running subprocess.
-        openclaw_adapter._LLM_COOLDOWN_STATE["cooldown_until"] = time.time() + 1800
-        openclaw_adapter._LLM_COOLDOWN_STATE["consecutive_count"] = 1
-        openclaw_adapter._LLM_COOLDOWN_STATE["last_hit_at"] = time.time()
+        openclaw_adapter._cooldown_state("claude")["cooldown_until"] = time.time() + 1800
+        openclaw_adapter._cooldown_state("claude")["consecutive_count"] = 1
+        openclaw_adapter._cooldown_state("claude")["last_hit_at"] = time.time()
 
         run_mock = MagicMock()
         with patch("polymarket_mvp.services.openclaw_adapter._claude_cli_path",
@@ -88,10 +88,10 @@ class CooldownStateMachineTests(unittest.TestCase):
         run_mock.assert_not_called()
 
     def test_counter_resets_after_reset_window(self):
-        openclaw_adapter._LLM_COOLDOWN_STATE["cooldown_until"] = 0.0
-        openclaw_adapter._LLM_COOLDOWN_STATE["consecutive_count"] = 3
+        openclaw_adapter._cooldown_state("claude")["cooldown_until"] = 0.0
+        openclaw_adapter._cooldown_state("claude")["consecutive_count"] = 3
         # Last hit long ago → next hit should reset counter to 1.
-        openclaw_adapter._LLM_COOLDOWN_STATE["last_hit_at"] = time.time() - (7 * 60 * 60)
+        openclaw_adapter._cooldown_state("claude")["last_hit_at"] = time.time() - (7 * 60 * 60)
 
         with self._mock_cli(), self._mock_run("usage limit reached"):
             with self.assertRaises(LLMRateLimitError) as ctx:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,28 +26,35 @@ _LAST_META: dict[str, Any] = {}
 
 
 class LLMRateLimitError(RuntimeError):
-    """Raised when the claude CLI hits a Max/Pro usage limit.
+    """Raised when an LLM transport (claude CLI, codex CLI, …) hits a usage limit.
 
     Carries stderr_snippet + cooldown_applied_sec + consecutive_count so
-    callers can persist the event and honor the cooldown.
+    callers can persist the event and honor the cooldown. `transport` names
+    which provider triggered the limit so observability can group events.
     """
 
-    def __init__(self, stderr_snippet: str, cooldown_sec: int, consecutive_count: int):
+    def __init__(
+        self,
+        stderr_snippet: str,
+        cooldown_sec: int,
+        consecutive_count: int,
+        transport: str = "llm",
+    ):
         self.stderr_snippet = stderr_snippet
         self.cooldown_sec = cooldown_sec
         self.consecutive_count = consecutive_count
+        self.transport = transport
         super().__init__(
-            f"Claude CLI usage limit (consecutive={consecutive_count}, cooldown={cooldown_sec}s)"
+            f"{transport} CLI usage limit (consecutive={consecutive_count}, cooldown={cooldown_sec}s)"
         )
 
 
-# Exponential-backoff cooldown state for claude CLI rate-limit events.
-# Cadence: 1st hit = 30 min, 2nd within 2hr = 1hr, 3rd within 6hr = 6hr, reset after clean window.
-_LLM_COOLDOWN_STATE: dict[str, float] = {
-    "cooldown_until": 0.0,       # epoch seconds; proposer skips LLM while now < this
-    "last_hit_at": 0.0,           # epoch seconds of most recent hit
-    "consecutive_count": 0,        # cleared after a cooldown window elapses without a hit
-}
+# Exponential-backoff cooldown is per-transport — a Claude 5-hour-limit hit
+# must NOT silence the Codex CLI and vice versa. Each transport gets its own
+# {cooldown_until, last_hit_at, consecutive_count} bucket. The "default" key
+# preserves the pre-split semantics for callers that don't pass a transport.
+# Cadence: 1st hit = 30 min, 2nd within 2hr = 1hr, 3rd within 6hr = 6hr.
+_LLM_COOLDOWN_STATES: dict[str, dict[str, float]] = {}
 
 _COOLDOWN_SCHEDULE_SEC: tuple[int, ...] = (30 * 60, 60 * 60, 6 * 60 * 60)
 _RESET_WINDOW_SEC = 6 * 60 * 60
@@ -62,40 +70,74 @@ _RATE_LIMIT_MARKERS: tuple[str, ...] = (
     "429",
 )
 
+# Patterns that a CLI's stderr/stdout might leak into the rate-limit log
+# (and onward into Postgres llm_rate_limit_events.stderr_snippet). Redact
+# the value side of any of these before persisting.
+_SECRET_REDACT_PATTERN = re.compile(
+    r"\b(authorization|bearer|token|api[_-]?key|x[_-]auth[_-]token|x[_-]api[_-]key|"
+    r"openai[_-]?api[_-]?key|anthropic[_-]?api[_-]?key|x[_-]?goog[_-]?api[_-]?key)"
+    r"(\s*[:=]\s*|\s+)([^\s\"'`]{6,})",
+    flags=re.IGNORECASE,
+)
+# Matches likely bearer/sk-/eyJ tokens floating in plain text (Bearer prefix
+# already covered above; this catches naked tokens in error blobs).
+_BARE_SECRET_PATTERN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_\-]{16,}|eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-.]+)",
+)
+
+
+def _redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    text = _SECRET_REDACT_PATTERN.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
+    text = _BARE_SECRET_PATTERN.sub("<redacted>", text)
+    return text
+
 
 def _looks_like_rate_limit(text: str) -> bool:
     lowered = (text or "").lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
-def _record_llm_rate_limit_hit(stderr_snippet: str) -> LLMRateLimitError:
+def _cooldown_state(transport: str) -> dict[str, float]:
+    state = _LLM_COOLDOWN_STATES.get(transport)
+    if state is None:
+        state = {"cooldown_until": 0.0, "last_hit_at": 0.0, "consecutive_count": 0}
+        _LLM_COOLDOWN_STATES[transport] = state
+    return state
+
+
+def _record_llm_rate_limit_hit(stderr_snippet: str, transport: str = "default") -> LLMRateLimitError:
+    state = _cooldown_state(transport)
     now = time.time()
     # If the previous hit was long enough ago, reset the escalation counter.
-    if now - _LLM_COOLDOWN_STATE["last_hit_at"] > _RESET_WINDOW_SEC:
-        _LLM_COOLDOWN_STATE["consecutive_count"] = 0
-    _LLM_COOLDOWN_STATE["consecutive_count"] = int(_LLM_COOLDOWN_STATE["consecutive_count"]) + 1
-    idx = min(int(_LLM_COOLDOWN_STATE["consecutive_count"]) - 1, len(_COOLDOWN_SCHEDULE_SEC) - 1)
+    if now - state["last_hit_at"] > _RESET_WINDOW_SEC:
+        state["consecutive_count"] = 0
+    state["consecutive_count"] = int(state["consecutive_count"]) + 1
+    idx = min(int(state["consecutive_count"]) - 1, len(_COOLDOWN_SCHEDULE_SEC) - 1)
     cooldown = _COOLDOWN_SCHEDULE_SEC[idx]
-    _LLM_COOLDOWN_STATE["cooldown_until"] = now + cooldown
-    _LLM_COOLDOWN_STATE["last_hit_at"] = now
+    state["cooldown_until"] = now + cooldown
+    state["last_hit_at"] = now
     return LLMRateLimitError(
-        stderr_snippet=sanitize_text(stderr_snippet)[:400],
+        stderr_snippet=_redact_secrets(sanitize_text(stderr_snippet))[:400],
         cooldown_sec=cooldown,
-        consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+        consecutive_count=int(state["consecutive_count"]),
+        transport=transport,
     )
 
 
-def llm_cooldown_remaining_sec() -> float:
-    """Seconds remaining in the active claude CLI cooldown. 0 if none."""
-    remaining = _LLM_COOLDOWN_STATE["cooldown_until"] - time.time()
-    return max(0.0, remaining)
+def llm_cooldown_remaining_sec(transport: str = "default") -> float:
+    """Seconds remaining in the active cooldown for `transport`. 0 if none."""
+    state = _cooldown_state(transport)
+    return max(0.0, state["cooldown_until"] - time.time())
 
 
-def reset_llm_cooldown_state() -> None:
-    """Test-only: clear cooldown state between unit tests."""
-    _LLM_COOLDOWN_STATE["cooldown_until"] = 0.0
-    _LLM_COOLDOWN_STATE["last_hit_at"] = 0.0
-    _LLM_COOLDOWN_STATE["consecutive_count"] = 0
+def reset_llm_cooldown_state(transport: str | None = None) -> None:
+    """Test-only: clear cooldown state. Pass a transport name or None for all."""
+    if transport is None:
+        _LLM_COOLDOWN_STATES.clear()
+        return
+    _LLM_COOLDOWN_STATES.pop(transport, None)
 
 
 def get_last_meta() -> dict[str, Any] | None:
@@ -223,11 +265,13 @@ def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
         model,
         prompt,
     ]
-    if llm_cooldown_remaining_sec() > 0:
+    if llm_cooldown_remaining_sec("codex") > 0:
+        state = _cooldown_state("codex")
         raise LLMRateLimitError(
             stderr_snippet="still in cooldown; skipping CLI invocation",
-            cooldown_sec=max(0, int(_LLM_COOLDOWN_STATE["cooldown_until"] - time.time())),
-            consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+            cooldown_sec=max(0, int(state["cooldown_until"] - time.time())),
+            consecutive_count=int(state["consecutive_count"]),
+            transport="codex",
         )
     start = time.monotonic()
     # `codex exec` reads stdin even when a positional prompt is provided,
@@ -243,9 +287,10 @@ def _codex_payload(system_prompt: str, user_prompt: str) -> Any:
     )
     latency_ms = int((time.monotonic() - start) * 1000)
     if result.returncode != 0:
-        stderr = sanitize_text(result.stderr or result.stdout)
-        if _looks_like_rate_limit(result.stderr or result.stdout or ""):
-            raise _record_llm_rate_limit_hit(stderr)
+        raw = result.stderr or result.stdout or ""
+        stderr = _redact_secrets(sanitize_text(raw))
+        if _looks_like_rate_limit(raw):
+            raise _record_llm_rate_limit_hit(stderr, transport="codex")
         raise RuntimeError(f"Codex CLI failed: {stderr or result.returncode}")
     final_text = _extract_codex_final_text(result.stdout or "")
     parsed = _decode_json_candidate(final_text or result.stdout or "")
@@ -324,26 +369,29 @@ def _claude_payload(system_prompt: str, user_prompt: str) -> Any:
     # increment consecutive_count and push cooldown_until further out on every
     # call (the exit loop fires every 30s — without this guard it turns a
     # 30-min cooldown into many hours).
-    if llm_cooldown_remaining_sec() > 0:
+    if llm_cooldown_remaining_sec("claude") > 0:
+        state = _cooldown_state("claude")
         raise LLMRateLimitError(
             stderr_snippet="still in cooldown; skipping CLI invocation",
-            cooldown_sec=max(0, int(_LLM_COOLDOWN_STATE["cooldown_until"] - time.time())),
-            consecutive_count=int(_LLM_COOLDOWN_STATE["consecutive_count"]),
+            cooldown_sec=max(0, int(state["cooldown_until"] - time.time())),
+            consecutive_count=int(state["consecutive_count"]),
+            transport="claude",
         )
     start = time.monotonic()
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     latency_ms = int((time.monotonic() - start) * 1000)
     if result.returncode != 0:
-        stderr = sanitize_text(result.stderr or result.stdout)
-        if _looks_like_rate_limit(result.stderr or result.stdout or ""):
-            raise _record_llm_rate_limit_hit(stderr)
+        raw = result.stderr or result.stdout or ""
+        stderr = _redact_secrets(sanitize_text(raw))
+        if _looks_like_rate_limit(raw):
+            raise _record_llm_rate_limit_hit(stderr, transport="claude")
         raise RuntimeError(f"Claude CLI failed: {stderr or result.returncode}")
     envelope = _decode_json_candidate(result.stdout or "")
     if isinstance(envelope, dict):
         if envelope.get("is_error"):
             err_blob = f"{envelope.get('subtype')} {envelope.get('result')}"
             if _looks_like_rate_limit(err_blob):
-                raise _record_llm_rate_limit_hit(err_blob[:400])
+                raise _record_llm_rate_limit_hit(err_blob, transport="claude")
             raise RuntimeError(
                 f"Claude CLI returned error: {envelope.get('result') or envelope.get('subtype')}"
             )
