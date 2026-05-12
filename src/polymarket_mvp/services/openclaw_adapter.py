@@ -339,6 +339,84 @@ def _extract_codex_final_text(stdout: str) -> str | None:
     return last_text
 
 
+_DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+_DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _deepseek_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any:
+    """Call DeepSeek via its OpenAI-compatible HTTP API. Used as the fallback
+    transport when Codex CLI fails (rate-limit OR generic error like
+    'Codex CLI failed: ... thread not found' which we've seen in production
+    after quota exhaustion). Returns the raw JSON body — `chat_json` /
+    `chat_list` parse the OpenAI-style `choices[0].message.content` via the
+    existing `_extract_text` recursion."""
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY not configured — cannot fall back to DeepSeek")
+
+    if llm_cooldown_remaining_sec("deepseek") > 0:
+        state = _cooldown_state("deepseek")
+        raise LLMRateLimitError(
+            stderr_snippet="still in cooldown; skipping DeepSeek call",
+            cooldown_sec=max(0, int(state["cooldown_until"] - time.time())),
+            consecutive_count=int(state["consecutive_count"]),
+            transport="deepseek",
+        )
+
+    base_url = (os.getenv("DEEPSEEK_BASE_URL") or _DEEPSEEK_DEFAULT_BASE_URL).rstrip("/")
+    endpoint = f"{base_url}/chat/completions"
+    model = (os.getenv("DEEPSEEK_MODEL") or _DEEPSEEK_DEFAULT_MODEL).strip()
+    timeout_seconds_raw = (os.getenv("DEEPSEEK_TIMEOUT_SECONDS") or "").strip()
+    timeout = int(timeout_seconds_raw) if timeout_seconds_raw else 60
+
+    body = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        # DeepSeek honors OpenAI's response_format for JSON mode — this keeps
+        # the contract that `chat_json` expects (no markdown fences, valid
+        # JSON-only output).
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    start = time.monotonic()
+    try:
+        resp = requests.post(endpoint, headers=headers, json=body, timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"DeepSeek request failed: {type(exc).__name__}: {exc}")
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    if resp.status_code >= 400:
+        # Body may carry an api-error JSON like {"error":{"message":"..."}}; redact
+        # before persisting so a malformed key in our env doesn't leak into logs.
+        body_text = _redact_secrets(sanitize_text(resp.text or "")) or f"http_{resp.status_code}"
+        if resp.status_code == 429 or _looks_like_rate_limit(body_text):
+            raise _record_llm_rate_limit_hit(body_text, transport="deepseek")
+        raise RuntimeError(f"DeepSeek HTTP {resp.status_code}: {body_text[:300]}")
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"DeepSeek returned non-JSON body: {exc}")
+
+    _LAST_META.clear()
+    _LAST_META.update({
+        "model": model,
+        "session_id": None,
+        "latency_ms": latency_ms,
+        "called_at": utc_now_iso(),
+        "transport": "deepseek_http",
+    })
+    return payload
+
+
 def _claude_payload(system_prompt: str, user_prompt: str) -> Any:
     cli_path = _claude_cli_path()
     if cli_path is None:
@@ -533,12 +611,56 @@ def _cli_payload(system_prompt: str, user_prompt: str) -> Any:
     return raw or None
 
 
+def _fallback_provider() -> str | None:
+    """Provider to try when the primary transport raises a recoverable
+    error (rate-limit OR generic CLI failure). Returns None to disable."""
+    raw = (os.getenv("OPENCLAW_FALLBACK_PROVIDER") or "").strip().lower()
+    return raw or None
+
+
+def _try_fallback(provider: str, system_prompt: str, user_prompt: str, temperature: float, primary_exc: BaseException) -> Any:
+    """Run the fallback provider after the primary raised. If the fallback
+    itself fails, raise the *original* primary exception — the fallback's
+    failure is logged but doesn't shadow what the caller cares about."""
+    print(
+        f"[openclaw] primary transport failed ({type(primary_exc).__name__}): "
+        f"{str(primary_exc)[:160]} — falling back to {provider}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        if provider == "deepseek":
+            return _deepseek_payload(system_prompt, user_prompt, temperature=temperature)
+        # Unknown provider name in env — surface clearly so the user notices
+        # rather than silently swallowing.
+        raise RuntimeError(f"OPENCLAW_FALLBACK_PROVIDER={provider!r} not recognized")
+    except Exception as fallback_exc:
+        print(
+            f"[openclaw] fallback {provider} also failed ({type(fallback_exc).__name__}): "
+            f"{str(fallback_exc)[:160]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise primary_exc from fallback_exc
+
+
 def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any | None:
     mode = _transport_mode()
+    fallback = _fallback_provider()
     if mode in {"codex_cli", "codex"}:
-        return _codex_payload(system_prompt, user_prompt)
+        try:
+            return _codex_payload(system_prompt, user_prompt)
+        except (LLMRateLimitError, RuntimeError) as exc:
+            if fallback is None:
+                raise
+            return _try_fallback(fallback, system_prompt, user_prompt, temperature, exc)
     if mode in {"claude", "claude_cli"}:
-        return _claude_payload(system_prompt, user_prompt)
+        try:
+            return _claude_payload(system_prompt, user_prompt)
+        except (LLMRateLimitError, RuntimeError) as exc:
+            if fallback is None:
+                raise
+            return _try_fallback(fallback, system_prompt, user_prompt, temperature, exc)
     if mode in {"cli", "local"}:
         return _cli_payload(system_prompt, user_prompt)
     endpoint, headers = _http_chat_endpoint()
