@@ -274,6 +274,8 @@ CREATE TABLE IF NOT EXISTS positions (
   strategy_name TEXT,
   is_shadow INTEGER NOT NULL DEFAULT 0,
   mode TEXT NOT NULL DEFAULT 'real' CHECK(mode IN ('mock', 'real', 'shadow')),
+  redeemed_at TEXT,
+  redeemed_tx_hash TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (execution_id, is_shadow),
@@ -285,6 +287,7 @@ CREATE TABLE IF NOT EXISTS positions (
 
 CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_resolved_unredeemed ON positions(market_id, status, redeemed_at);
 
 CREATE TABLE IF NOT EXISTS position_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
