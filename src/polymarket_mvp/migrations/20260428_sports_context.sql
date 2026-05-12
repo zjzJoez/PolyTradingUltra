@@ -7,7 +7,13 @@
 -- in place. FKs are disabled for the rebuild so child rows survive the
 -- DROP/RENAME dance, then re-enabled.
 
+-- PRAGMA foreign_keys must be set outside an active transaction — SQLite
+-- silently ignores it inside BEGIN/COMMIT. Toggle it, then wrap the actual
+-- rebuild in an explicit transaction so a mid-script failure rolls back to
+-- the pre-migration state instead of leaving an orphaned *_old table.
 PRAGMA foreign_keys = OFF;
+
+BEGIN TRANSACTION;
 
 ALTER TABLE market_contexts RENAME TO market_contexts_old;
 
@@ -67,5 +73,7 @@ FROM proposal_contexts_old;
 DROP TABLE proposal_contexts_old;
 
 CREATE INDEX IF NOT EXISTS idx_proposal_contexts_proposal ON proposal_contexts(proposal_id);
+
+COMMIT;
 
 PRAGMA foreign_keys = ON;

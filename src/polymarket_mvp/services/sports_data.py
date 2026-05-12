@@ -143,8 +143,12 @@ def _normalize(name: str) -> str:
     return s
 
 
-# In-memory + disk-backed team index. {normalized_name: team_id}
-_TEAM_INDEX: dict[str, int] | None = None
+# In-memory + disk-backed team index. {normalized_name: team_id}.
+# Ambiguous keys (two distinct team_ids normalize to the same string) get
+# their team_id replaced with `None` — _search_team treats those as
+# unresolvable and returns None instead of fabricating a head-to-head from
+# whichever team happened to be inserted first.
+_TEAM_INDEX: dict[str, int | None] | None = None
 _INDEX_LOADED_AT: float = 0.0
 _RATE_LIMIT_BACKOFF_UNTIL: float = 0.0
 
@@ -157,25 +161,42 @@ def _cache_path() -> Path:
     return Path(base) / "football_data_team_index.json"
 
 
-def _load_disk_cache() -> dict[str, int] | None:
+def _load_disk_cache() -> dict[str, int | None] | None:
     path = _cache_path()
     if not path.exists():
         return None
     try:
         if path.stat().st_mtime < time.time() - _CACHE_TTL_SEC:
             return None
-        return {str(k): int(v) for k, v in json.loads(path.read_text(encoding="utf-8")).items()}
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    out: dict[str, int | None] = {}
+    for k, v in raw.items():
+        if v is None:
+            out[str(k)] = None
+        else:
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
-def _save_disk_cache(index: dict[str, int]) -> None:
+def _save_disk_cache(index: dict[str, int | None]) -> None:
+    """Atomic write so concurrent readers never see a half-flushed file."""
     path = _cache_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(index, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(index, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:
-        pass
+        # Best-effort cleanup of the temp file if rename failed.
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[name-defined]
+        except Exception:
+            pass
 
 
 def _record_rate_limit_hit() -> None:
@@ -188,16 +209,30 @@ def _in_rate_limit_backoff() -> bool:
     return time.time() < _RATE_LIMIT_BACKOFF_UNTIL
 
 
-def _add_team_to_index(index: dict[str, int], team: Mapping[str, Any]) -> None:
+def _add_team_to_index(index: dict[str, int | None], team: Mapping[str, Any]) -> None:
+    """Insert a team's normalized name keys into the index.
+
+    Collisions with an *existing different* team_id flip the slot to None
+    (= ambiguous) so _search_team can refuse to guess instead of returning
+    whichever team happened to be inserted first.
+    """
     team_id = team.get("id")
     if not isinstance(team_id, int):
         return
     for key in ("name", "shortName", "tla"):
         raw = team.get(key)
-        if isinstance(raw, str) and raw.strip():
-            normalized = _normalize(raw)
-            if normalized and normalized not in index:
-                index[normalized] = team_id
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        normalized = _normalize(raw)
+        if not normalized:
+            continue
+        existing = index.get(normalized, "_unset")
+        if existing == "_unset":
+            index[normalized] = team_id
+        elif existing is None:
+            continue  # already marked ambiguous
+        elif existing != team_id:
+            index[normalized] = None
 
 
 def _fetch_competition_teams(competition_code: str) -> list[Mapping[str, Any]]:
@@ -224,7 +259,7 @@ def _fetch_competition_teams(competition_code: str) -> list[Mapping[str, Any]]:
     return teams if isinstance(teams, list) else []
 
 
-def _build_team_index() -> dict[str, int]:
+def _build_team_index() -> dict[str, int | None]:
     """Hydrate the team-name → id index from cache or by fetching rosters."""
     global _TEAM_INDEX, _INDEX_LOADED_AT
     if _TEAM_INDEX is not None and time.time() - _INDEX_LOADED_AT < _CACHE_TTL_SEC:
@@ -234,7 +269,7 @@ def _build_team_index() -> dict[str, int]:
         _TEAM_INDEX = cached
         _INDEX_LOADED_AT = time.time()
         return _TEAM_INDEX
-    index: dict[str, int] = {}
+    index: dict[str, int | None] = {}
     for code in _FREE_TIER_COMPETITIONS:
         if _in_rate_limit_backoff():
             break
@@ -263,6 +298,8 @@ def _search_team(name: str) -> int | None:
     if not needle:
         return None
     if needle in index:
+        # `None` slot = two distinct teams collapsed to this normalized key.
+        # Refuse to guess — return None so the adapter skips the market.
         return index[needle]
     # Multi-token containment fallback: every token of the needle must appear
     # as a token of the candidate (or vice versa for unique 2+-token names).
@@ -272,16 +309,24 @@ def _search_team(name: str) -> int | None:
     if len(needle_tokens) < 2:
         return None
     needle_set = set(needle_tokens)
-    best: tuple[int, int] | None = None  # (score, team_id)
+    matches: list[tuple[int, int]] = []  # (score, team_id) for unambiguous slots
     for key, tid in index.items():
+        if tid is None:
+            continue
         key_tokens = set(key.split())
         if len(key_tokens) < 2:
             continue
         if needle_set.issubset(key_tokens) or key_tokens.issubset(needle_set):
-            score = len(needle_set & key_tokens)
-            if best is None or score > best[0]:
-                best = (score, tid)
-    return best[1] if best else None
+            matches.append((len(needle_set & key_tokens), tid))
+    if not matches:
+        return None
+    # If multiple distinct team_ids tie at the top score, refuse to pick.
+    matches.sort(key=lambda x: x[0], reverse=True)
+    top_score = matches[0][0]
+    top_ids = {tid for score, tid in matches if score == top_score}
+    if len(top_ids) > 1:
+        return None
+    return matches[0][1]
 
 
 def _format_match(match: Mapping[str, Any], team_id: int) -> tuple[str, str] | None:

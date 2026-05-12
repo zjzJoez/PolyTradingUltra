@@ -413,16 +413,31 @@ def build_openclaw_proposals(
     if not eligible_markets:
         return [], None, {}
     # Tag markets that already have football-data.org context so the scorer
-    # can un-penalise sports lines with live form information.
-    if conn is not None:
-        for market in eligible_markets:
-            market_id_str = str(market["market_id"])
-            try:
-                ctx_rows = market_contexts(conn, market_id_str)
-            except Exception:
-                continue
-            if any((c.get("source_type") if isinstance(c, Mapping) else None) == "sports_data" for c in (ctx_rows or [])):
+    # can un-penalise sports lines with live form information. Read the flag
+    # from both sources: the in-memory context_file payload (used by the
+    # standalone proposer CLI, which doesn't pass conn) and the persisted
+    # market_contexts rows (used by the autopilot loop).
+    for market in eligible_markets:
+        market_id_str = str(market["market_id"])
+        if context_file:
+            ctx_blob = resolve_context_payload(context_file, market_id_str)
+            sources = ctx_blob.get("sources") or []
+            if any(
+                (s.get("source_type") if isinstance(s, Mapping) else None) == "sports_data"
+                for s in sources
+            ):
                 market["_has_sports_context"] = True
+        if market.get("_has_sports_context") or conn is None:
+            continue
+        try:
+            ctx_rows = market_contexts(conn, market_id_str)
+        except Exception:
+            continue
+        if any(
+            (c.get("source_type") if isinstance(c, Mapping) else None) == "sports_data"
+            for c in (ctx_rows or [])
+        ):
+            market["_has_sports_context"] = True
     llm_candidate_limit = max(1, get_env_int("POLY_PROPOSER_LLM_CANDIDATES", 8))
     candidate_markets = select_llm_candidates(eligible_markets, limit=llm_candidate_limit)
     if not candidate_markets:
