@@ -271,7 +271,13 @@ def _extract_balance_value(payload: Any) -> float | None:
     return None
 
 
-def _real_preflight_check(client: Any, proposal: Dict[str, Any], *, token_id: str | None = None) -> Dict[str, Any]:
+def _real_preflight_check(
+    client: Any,
+    proposal: Dict[str, Any],
+    *,
+    token_id: str | None = None,
+    is_sell: bool = False,
+) -> Dict[str, Any]:
     from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
 
     signature_type = _require_signature_type()
@@ -317,11 +323,19 @@ def _real_preflight_check(client: Any, proposal: Dict[str, Any], *, token_id: st
             if isinstance(conditional, dict):
                 conditional_allowance = _coerce_float(conditional.get("allowance"))
             conditional_allowance_info = {"token_id": token_id, "raw": conditional, "allowance": conditional_allowance}
-            if conditional_allowance is not None and conditional_allowance == 0.0:
+            # Only block on missing conditional allowance for SELLs (exit-kind).
+            # For BUYs the wallet doesn't own the outcome token yet and the
+            # allowance is irrelevant — what we need for BUYs is USDC allowance
+            # to the exchange (checked above as COLLATERAL). Treating the BUY
+            # case as a hard error misroutes every first-touch order to
+            # order_submit_failed; see code-review #1 from the 2026-05-12
+            # shadow→real preflight audit.
+            if is_sell and conditional_allowance is not None and conditional_allowance == 0.0:
                 from .common import polygon_rpc_url
                 raise RuntimeError(
                     f"Conditional token allowance is zero for token_id={token_id}. "
-                    f"You may need to approve spender contracts for neg-risk markets. "
+                    f"SELL requires setApprovalForAll on the CTF token for the "
+                    f"appropriate exchange. "
                     f"Known spenders: {', '.join(KNOWN_NEG_RISK_SPENDERS)}. "
                     f"Use RPC: {polygon_rpc_url()}"
                 )
@@ -510,7 +524,10 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
             try:
                 client = _build_clob_client()
                 token_id_for_preflight = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
-                preflight = _real_preflight_check(client, proposal, token_id=token_id_for_preflight)
+                is_sell = record.get("proposal_kind") == "exit"
+                preflight = _real_preflight_check(
+                    client, proposal, token_id=token_id_for_preflight, is_sell=is_sell
+                )
                 print(
                     f"[poly-executor] real preflight proposal_id={record['proposal_id']} "
                     f"{json.dumps({'account_identity': preflight['account_identity'], 'api_keys_count': preflight['api_keys_count'], 'collateral_balance_available': preflight['collateral_balance_available']}, sort_keys=True)}",
@@ -644,13 +661,44 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
             return _failed_execution(record, mode, f"order_sdk_unavailable: {exc}", preflight=preflight)
         try:
             import concurrent.futures
+            import time as _time
             side = SELL if record.get("proposal_kind") == "exit" else BUY
             order = OrderArgs(token_id=token_id, price=requested_price, size=share_size, side=side)
-            signed = real_client.create_order(order)
+            # create_order internally fetches tick_size + negRisk metadata via
+            # HTTP. A single 5xx or transient timeout there should not fail the
+            # whole trade — it's a pre-network local-signing step, so retrying
+            # is safe (no risk of duplicate orders). post_order itself stays
+            # single-shot; the lost-response recovery path below handles its
+            # transient failures via the idempotency_key.
+            create_attempts = max(1, get_env_int("POLY_ORDER_CREATE_ATTEMPTS", 3))
+            create_backoff_seconds = max(0.5, get_env_float("POLY_ORDER_CREATE_BACKOFF_SECONDS", 1.0))
+            last_create_exc: Exception | None = None
+            for attempt in range(create_attempts):
+                try:
+                    signed = real_client.create_order(order)
+                    last_create_exc = None
+                    break
+                except Exception as exc:
+                    last_create_exc = exc
+                    if attempt + 1 < create_attempts and _looks_retryable_request_error(exc):
+                        _time.sleep(create_backoff_seconds * (2 ** attempt))
+                        continue
+                    break
+            if last_create_exc is not None:
+                raise last_create_exc
             order_timeout = get_env_int("POLY_ORDER_SUBMIT_TIMEOUT_SECONDS", 30)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(real_client.post_order, signed, OrderType.GTC)
                 response = future.result(timeout=order_timeout)
+            # Polymarket sometimes returns HTTP 200 with {success:false,errorMsg:...}
+            # for things like tick-size mismatch, allowance issues, or hidden
+            # negRisk validation. Without this guard the call below maps a
+            # missing/None status to "submitted" and we record a phantom live
+            # order that never actually existed on the book.
+            success_flag = response.get("success") if isinstance(response, dict) else None
+            if success_flag is False:
+                err_msg = (response.get("errorMsg") or response.get("error") or "unknown_clob_error")
+                raise RuntimeError(f"clob_rejected: {err_msg}")
             execution["txhash_or_order_id"] = str(response.get("orderID") or response.get("id") or "")
             execution["status"] = _normalize_order_status(response.get("status"))
             execution["order_intent_json"] = {"request": order_intent, "response": response, "preflight": preflight}

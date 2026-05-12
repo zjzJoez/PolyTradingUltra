@@ -1656,5 +1656,73 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertNotEqual(exec2.get("error_message"), "duplicate_market_outcome_exposure")
 
 
+class PreflightConditionalAllowanceTests(unittest.TestCase):
+    """Regression: preflight must not raise on conditional_allowance=0 for
+    BUY orders, but must raise for SELL (exit) orders. Production wallet has
+    setApprovalForAll=False on both CTFExchange and NegRiskCTFExchange so the
+    conditional allowance API returns 0 for every fresh outcome — before the
+    fix, every first-touch BUY died at preflight with order_submit_failed."""
+
+    def _mock_client_with_zero_conditional_allowance(self):
+        from py_clob_client.clob_types import AssetType  # pyright: ignore[reportMissingImports]
+        client = Mock()
+        client.get_api_keys.return_value = [{"key": "x"}]
+        def _balance_allowance(params):
+            if params.asset_type == AssetType.COLLATERAL:
+                return {"balance": "1000000000", "allowance": "1000000000"}
+            return {"balance": "0", "allowance": 0.0}
+        client.get_balance_allowance.side_effect = _balance_allowance
+        client.get_address.return_value = "0xe65B947Ec589CFDB27292ac1da6eB58AfFE4BdE7"
+        return client
+
+    def test_buy_preflight_does_not_raise_on_zero_conditional_allowance(self):
+        from polymarket_mvp.poly_executor import _real_preflight_check
+        with patch.dict(os.environ, {
+            "POLY_CLOB_FUNDER": "0xe65B947Ec589CFDB27292ac1da6eB58AfFE4BdE7",
+            "SIGNATURE_TYPE": "0",
+        }):
+            client = self._mock_client_with_zero_conditional_allowance()
+            preflight = _real_preflight_check(
+                client,
+                {"recommended_size_usdc": 5.0},
+                token_id="123456789",
+                is_sell=False,
+            )
+            self.assertEqual(preflight["conditional_allowance"]["allowance"], 0.0)
+            self.assertGreater(preflight["collateral_balance_available"], 0)
+
+    def test_sell_preflight_raises_on_zero_conditional_allowance(self):
+        from polymarket_mvp.poly_executor import _real_preflight_check
+        with patch.dict(os.environ, {
+            "POLY_CLOB_FUNDER": "0xe65B947Ec589CFDB27292ac1da6eB58AfFE4BdE7",
+            "SIGNATURE_TYPE": "0",
+        }):
+            client = self._mock_client_with_zero_conditional_allowance()
+            with self.assertRaises(RuntimeError) as ctx:
+                _real_preflight_check(
+                    client,
+                    {"recommended_size_usdc": 5.0},
+                    token_id="123456789",
+                    is_sell=True,
+                )
+            self.assertIn("Conditional token allowance is zero", str(ctx.exception))
+
+
+class ClobSuccessFalseTests(unittest.TestCase):
+    """Regression: HTTP 200 with {success: false} from post_order must NOT
+    be recorded as status='submitted'. Before the fix, _normalize_order_status
+    mapped the missing status field to "submitted", silently parking phantom
+    orders that never reached the book."""
+
+    def test_normalize_status_returns_submitted_for_none(self):
+        from polymarket_mvp.poly_executor import _normalize_order_status
+        self.assertEqual(_normalize_order_status(None), "submitted")
+
+    def test_normalize_status_maps_unknown_to_failed(self):
+        from polymarket_mvp.poly_executor import _normalize_order_status
+        self.assertEqual(_normalize_order_status("INVALID"), "failed")
+        self.assertEqual(_normalize_order_status("WHATEVER"), "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
