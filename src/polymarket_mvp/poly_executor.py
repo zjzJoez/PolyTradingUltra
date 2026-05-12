@@ -204,9 +204,16 @@ def _normalize_order_status(value: Any) -> str:
         return "filled"
     if raw in {"LIVE", "OPEN", "PLACED", "SUBMITTED"}:
         return "live"
-    if raw in {"CANCELED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED"}:
+    # INVALID is what the CLOB returns when an order is aged out / rejected
+    # by the matching engine after going LIVE — sometimes after a partial
+    # fill (the canonical case behind position 1593's 20-day freeze).
+    # Treat it as terminal-failure. Unknown statuses also map to "failed"
+    # rather than leaking through as a literal lowercase string, which
+    # used to silently corrupt the executions.status enum and freeze
+    # downstream reconciliation forever.
+    if raw in {"CANCELED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED", "INVALID"}:
         return "failed"
-    return str(value).strip().lower() or "submitted"
+    return "failed"
 
 
 def _reconcile_execution_with_order_snapshot(client: Any, execution: Dict[str, Any]) -> Dict[str, Any]:

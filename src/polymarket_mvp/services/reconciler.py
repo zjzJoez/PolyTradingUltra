@@ -198,13 +198,39 @@ def reconcile_live_orders(conn) -> List[Dict[str, Any]]:
             normalized_status = _normalize_order_status((snapshot or {}).get("status"))
             size_matched = (snapshot or {}).get("size_matched")
             price = (snapshot or {}).get("price")
+            # Compute the actual fill in USDC from size_matched × price. The
+            # CLOB reports size_matched whenever any fill has happened, even
+            # if the order subsequently went terminal (LIVE → INVALID, or
+            # CANCELED with partial fill). Before this fix we only recorded
+            # fills when normalized_status == "filled", which silently
+            # discarded every partial-fill-then-terminal case. That was the
+            # core of position 1593's 20-day freeze.
+            try:
+                observed_fill_usdc = float(size_matched) * float(price) if size_matched and price else None
+            except (TypeError, ValueError):
+                observed_fill_usdc = None
+            if normalized_status == "filled":
+                # CLOB doesn't always send size_matched on FILLED; fall back
+                # to the requested size, which by definition matches a full
+                # fill.
+                fill_usdc_to_record = observed_fill_usdc or execution.get("requested_size_usdc")
+                price_to_record = price or execution.get("avg_fill_price")
+            elif observed_fill_usdc and observed_fill_usdc > 0:
+                # Terminal-but-partially-filled (e.g. INVALID after 10 of
+                # 12.63 shares matched). Record the partial fill so the
+                # position state machine downstream sees we hold tokens.
+                fill_usdc_to_record = observed_fill_usdc
+                price_to_record = price
+            else:
+                fill_usdc_to_record = execution.get("filled_size_usdc")
+                price_to_record = execution.get("avg_fill_price")
             updated = update_execution(
                 conn,
                 int(execution["id"]),
                 {
                     "status": normalized_status,
-                    "avg_fill_price": price if normalized_status == "filled" else execution.get("avg_fill_price"),
-                    "filled_size_usdc": execution.get("requested_size_usdc") if normalized_status == "filled" else execution.get("filled_size_usdc"),
+                    "avg_fill_price": price_to_record,
+                    "filled_size_usdc": fill_usdc_to_record,
                     "order_intent_json": {
                         **(execution.get("order_intent_json") or {}),
                         "order_status_snapshot": snapshot,
