@@ -12,12 +12,36 @@ import json
 import os
 import sqlite3
 import sys
-from typing import Any, Dict, List
+import time
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from web3 import Web3
 
 from ..common import polygon_rpc_url, utc_now_iso
-from ..db import list_positions, record_position, record_position_event
+
+T = TypeVar("T")
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Heuristic 429 detection — web3.py surfaces RPC errors as raw HTTPError
+    or wraps them in generic exceptions, so we match on substring as well.
+    """
+    msg = str(exc).lower()
+    return "429" in msg or "too many requests" in msg or "rate limit" in msg
+
+
+def _retry_429(fn: Callable[[], T], *, attempts: int = 3, base_sleep: float = 1.0) -> T:
+    """Call fn(), retry on 429/timeout with exponential backoff (1s, 2s, 4s).
+    Any non-rate-limit exception is re-raised immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_rate_limited(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(base_sleep * (2 ** attempt))
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 # Contract addresses on Polygon
@@ -139,9 +163,13 @@ def _market_info(conn: sqlite3.Connection, market_id: str) -> Dict[str, Any] | N
     if row is None:
         return None
     mj = json.loads(row["market_json"]) if isinstance(row["market_json"], str) else row["market_json"]
+    raw_neg = mj.get("negRisk") if isinstance(mj, dict) else None
+    # negRisk absent from the snapshot is NOT the same as negRisk=false — older
+    # markets simply don't have the field. Return None to signal "ask the chain".
+    neg_risk: Optional[bool] = None if raw_neg is None else bool(raw_neg)
     return {
         "condition_id": row["condition_id"],
-        "neg_risk": bool(mj.get("negRisk")),
+        "neg_risk": neg_risk,
     }
 
 
@@ -179,7 +207,21 @@ def redeem_resolved_positions(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         abi=CTF_ABI,
     )
 
-    resolved_rows = conn.execute("SELECT market_id, resolved_outcome FROM market_resolutions").fetchall()
+    # Only iterate resolved markets where we actually held a real (non-shadow)
+    # position that hasn't been redeemed yet. Before this filter we were
+    # scanning every market_resolution row (~hundreds), making ~11 RPC calls
+    # each, and getting 429'd by the public Polygon RPC every cycle.
+    resolved_rows = conn.execute(
+        """
+        SELECT DISTINCT mr.market_id, mr.resolved_outcome
+        FROM market_resolutions mr
+        INNER JOIN positions p ON p.market_id = mr.market_id
+        WHERE p.status = 'resolved'
+          AND p.mode = 'real'
+          AND p.is_shadow = 0
+          AND p.redeemed_at IS NULL
+        """
+    ).fetchall()
     if not resolved_rows:
         return []
 
@@ -200,17 +242,35 @@ def redeem_resolved_positions(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
         cid_bytes = bytes.fromhex(condition_id[2:]) if condition_id.startswith("0x") else bytes.fromhex(condition_id)
 
-        # Detect token type on-chain: standard CTF vs NegRisk-wrapped
-        first_token = int(token_outcomes[0]["token_id"])
-        is_standard = _is_standard_ctf_token(ctf, wallet, cid_bytes, first_token, USDC_ADDRESS)
+        # Prefer the cached negRisk flag from the gamma snapshot. Only fall
+        # back to the 4-call on-chain detection if the snapshot doesn't carry
+        # the field (older markets predating the negRisk attribute).
+        try:
+            if info["neg_risk"] is None:
+                first_token = int(token_outcomes[0]["token_id"])
+                is_standard = _retry_429(
+                    lambda: _is_standard_ctf_token(ctf, wallet, cid_bytes, first_token, USDC_ADDRESS)
+                )
+            else:
+                is_standard = not info["neg_risk"]
 
-        if is_standard:
-            result = _redeem_standard(w3, account, wallet, ctf, cid_bytes,
-                                      market_id, resolved_outcome, condition_id, token_outcomes)
-        else:
-            # NegRisk path: redeem via NegRiskAdapter
-            result = _redeem_neg_risk(w3, account, wallet, ctf, cid_bytes,
-                                      market_id, resolved_outcome, condition_id, token_outcomes)
+            if is_standard:
+                result = _redeem_standard(w3, account, wallet, ctf, cid_bytes,
+                                          market_id, resolved_outcome, condition_id, token_outcomes)
+            else:
+                result = _redeem_neg_risk(w3, account, wallet, ctf, cid_bytes,
+                                          market_id, resolved_outcome, condition_id, token_outcomes)
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                # RPC is throttling us; abort the rest of this cycle so we
+                # don't pile up 429s. Next reconcile tick will retry the
+                # remaining markets.
+                print(f"[redeemer] rate-limited at {market_id}; aborting cycle", file=sys.stderr)
+                break
+            print(f"[redeemer] {market_id} failed: {exc}", file=sys.stderr)
+            results.append({"market_id": market_id, "condition_id": condition_id,
+                            "success": False, "error": str(exc)})
+            continue
 
         if result is None:
             continue
@@ -256,18 +316,15 @@ def _build_and_send_tx(w3: Web3, account, wallet: str, fn, gas: int = 300_000) -
 
 
 def _redeem_standard(w3, account, wallet, ctf, cid_bytes, market_id, resolved_outcome, condition_id, token_outcomes):
-    """Redeem standard (non-NegRisk) CTF positions."""
+    """Redeem standard (non-NegRisk) CTF positions. Caller has already
+    confirmed the token structure is standard via the cached negRisk flag
+    or _is_standard_ctf_token."""
     total, balances = _check_balances(ctf, wallet, token_outcomes, w3)
     if total == 0:
         return None
 
     payout_denom = ctf.functions.payoutDenominator(cid_bytes).call()
     if payout_denom == 0:
-        return None
-
-    first_token = int(token_outcomes[0]["token_id"])
-    if not _is_standard_ctf_token(ctf, wallet, cid_bytes, first_token, USDC_ADDRESS):
-        print(f"[redeemer] skipping {market_id}: tokens don't match standard CTF structure", file=sys.stderr)
         return None
 
     index_sets = [1 << i for i in range(len(token_outcomes))]
@@ -345,17 +402,21 @@ def _redeem_neg_risk(w3, account, wallet, ctf, cid_bytes, market_id, resolved_ou
 
 
 def _mark_positions_redeemed(conn: sqlite3.Connection, market_id: str, tx_hash: str) -> None:
-    positions = conn.execute(
-        "SELECT * FROM positions WHERE market_id = ? AND status = 'resolved'",
-        (market_id,),
-    ).fetchall()
-    for pos in positions:
-        pos_dict = dict(pos)
-        record_position_event(conn, {
-            "position_id": pos_dict["id"],
-            "event_type": "redeem",
-            "payload_json": {
-                "tx_hash": tx_hash,
-                "redeemed_at": utc_now_iso(),
-            },
-        })
+    """Stamp redeemed_at/redeemed_tx_hash on every resolved real position for
+    this market so the SQL filter in redeem_resolved_positions skips it on
+    subsequent ticks. (Earlier versions wrote position_events with
+    event_type='redeem', but that violates the live CHECK constraint and
+    silently rolled back.)"""
+    now = utc_now_iso()
+    conn.execute(
+        """
+        UPDATE positions
+        SET redeemed_at = ?, redeemed_tx_hash = ?, updated_at = ?
+        WHERE market_id = ?
+          AND status = 'resolved'
+          AND is_shadow = 0
+          AND mode = 'real'
+          AND redeemed_at IS NULL
+        """,
+        (now, tx_hash, now, market_id),
+    )
