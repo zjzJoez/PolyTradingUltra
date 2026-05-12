@@ -1664,7 +1664,7 @@ class PreflightConditionalAllowanceTests(unittest.TestCase):
     fix, every first-touch BUY died at preflight with order_submit_failed."""
 
     def _mock_client_with_zero_conditional_allowance(self):
-        from py_clob_client.clob_types import AssetType  # pyright: ignore[reportMissingImports]
+        from py_clob_client_v2 import AssetType  # pyright: ignore[reportMissingImports]
         client = Mock()
         client.get_api_keys.return_value = [{"key": "x"}]
         def _balance_allowance(params):
@@ -1706,6 +1706,64 @@ class PreflightConditionalAllowanceTests(unittest.TestCase):
                     is_sell=True,
                 )
             self.assertIn("Conditional token allowance is zero", str(ctx.exception))
+
+
+class ClobV2PreflightTests(unittest.TestCase):
+    """Regression for the V1→V2 SDK migration (2026-05-13). Before the swap,
+    get_balance_allowance returned `balance="0"` for V2-spender allowance
+    entries because the wallet still held USDC.e and V1-exchange approvals.
+    After the swap + on-chain pUSD wrap + V2 spender approvals, the same call
+    must report a non-zero pUSD balance and unblock conviction-tier proposals.
+    """
+
+    def test_preflight_succeeds_for_buy_with_v2_balance(self):
+        from polymarket_mvp.poly_executor import _real_preflight_check, KNOWN_V2_SPENDERS
+        from py_clob_client_v2 import AssetType  # pyright: ignore[reportMissingImports]
+
+        # Sanity: the V2 spender constant must list the three V2 contracts the
+        # risk engine, executor error strings, and migration script all depend on.
+        self.assertEqual(len(KNOWN_V2_SPENDERS), 3)
+        self.assertIn("0xE111180000d2663C0091e4f400237545B87B996B", KNOWN_V2_SPENDERS)  # CTFExchangeV2
+        self.assertIn("0xe2222d279d744050d28e00520010520000310F59", KNOWN_V2_SPENDERS)  # NegRiskCtfExchangeV2
+        self.assertIn("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", KNOWN_V2_SPENDERS)  # NegRiskAdapter
+
+        client = Mock()
+        client.get_api_keys.return_value = [{"key": "v2-key-1"}]
+        client.get_address.return_value = "0xe65B947Ec589CFDB27292ac1da6eB58AfFE4BdE7"
+
+        # V2 SDK wire shape: same JSON keys as V1; the only difference is that
+        # the allowances dict references the V2 spender addresses (not V1 ones),
+        # and the balance reflects the wallet's pUSD holdings rather than USDC.e.
+        def _balance_allowance(params):
+            if params.asset_type == AssetType.COLLATERAL:
+                return {
+                    "balance": "36230000",  # 36.23 pUSD (6 decimals raw)
+                    "allowances": {
+                        "0xE111180000d2663C0091e4f400237545B87B996B": "99999999999999999999",
+                        "0xe2222d279d744050d28e00520010520000310F59": "99999999999999999999",
+                        "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296": "99999999999999999999",
+                    },
+                }
+            return {"balance": "0", "allowance": "0"}
+        client.get_balance_allowance.side_effect = _balance_allowance
+
+        with patch.dict(os.environ, {
+            "POLY_CLOB_FUNDER": "0xe65B947Ec589CFDB27292ac1da6eB58AfFE4BdE7",
+            "SIGNATURE_TYPE": "0",
+        }):
+            preflight = _real_preflight_check(
+                client,
+                {"recommended_size_usdc": 2.0},  # conviction-tier speculative
+                token_id="999",
+                is_sell=False,
+            )
+
+        # The fix: balance is parsed from raw uint (divide by 1e6) and exceeds
+        # a speculative-tier $2 order, so preflight returns instead of raising
+        # the "Insufficient collateral balance" RuntimeError that blocked the
+        # 2026-05-12 shadow→real flip.
+        self.assertAlmostEqual(preflight["collateral_balance_available"], 36.23, places=2)
+        self.assertEqual(preflight["api_keys_count"], 1)
 
 
 class ClobSuccessFalseTests(unittest.TestCase):

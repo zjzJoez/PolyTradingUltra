@@ -22,10 +22,10 @@ ACCOUNT_MODE_NAMES = {
     1: "poly_proxy",
     2: "poly_gnosis_safe",
 }
-KNOWN_NEG_RISK_SPENDERS = [
-    "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-    "0xC5d563A36AE78145C45a50134d48A1215220f80a",
-    "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+KNOWN_V2_SPENDERS = [
+    "0xE111180000d2663C0091e4f400237545B87B996B",  # CTFExchangeV2
+    "0xe2222d279d744050d28e00520010520000310F59",  # NegRiskCtfExchangeV2
+    "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",  # NegRiskAdapter (unchanged across V1→V2)
 ]
 
 
@@ -83,11 +83,10 @@ def _build_clob_client():
             "use syntax unsupported by Python 3.9."
         )
     try:
-        from py_clob_client.client import ClobClient  # pyright: ignore[reportMissingImports]
-        from py_clob_client.clob_types import ApiCreds  # pyright: ignore[reportMissingImports]
+        from py_clob_client_v2 import ClobClient, ApiCreds  # pyright: ignore[reportMissingImports]
     except Exception as exc:
         raise RuntimeError(
-            "py-clob-client is unavailable. Install optional deps with "
+            "py-clob-client-v2 is unavailable. Install optional deps with "
             "`pip install -e .[real-exec]` in a Python 3.10+ environment."
         ) from exc
 
@@ -278,7 +277,7 @@ def _real_preflight_check(
     token_id: str | None = None,
     is_sell: bool = False,
 ) -> Dict[str, Any]:
-    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
+    from py_clob_client_v2 import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
 
     signature_type = _require_signature_type()
     funder = _env_any("POLY_CLOB_FUNDER", "FUNDER", required=True) or ""
@@ -336,7 +335,7 @@ def _real_preflight_check(
                     f"Conditional token allowance is zero for token_id={token_id}. "
                     f"SELL requires setApprovalForAll on the CTF token for the "
                     f"appropriate exchange. "
-                    f"Known spenders: {', '.join(KNOWN_NEG_RISK_SPENDERS)}. "
+                    f"Known V2 spenders: {', '.join(KNOWN_V2_SPENDERS)}. "
                     f"Use RPC: {polygon_rpc_url()}"
                 )
         except RuntimeError:
@@ -655,8 +654,8 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
             return _failed_execution(record, mode, "real_client_missing", preflight=preflight)
         real_client = client
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType  # pyright: ignore[reportMissingImports]
-            from py_clob_client.order_builder.constants import BUY, SELL  # pyright: ignore[reportMissingImports]
+            from py_clob_client_v2 import OrderArgs, OrderType  # pyright: ignore[reportMissingImports]
+            from py_clob_client_v2.order_builder.constants import BUY, SELL  # pyright: ignore[reportMissingImports]
         except Exception as exc:
             return _failed_execution(record, mode, f"order_sdk_unavailable: {exc}", preflight=preflight)
         try:
@@ -730,7 +729,7 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
                 from .common import polygon_rpc_url
                 error_msg = (
                     f"order_submit_failed (likely missing spender approval): {exc}. "
-                    f"Known neg-risk spenders: {', '.join(KNOWN_NEG_RISK_SPENDERS)}. "
+                    f"Known V2 spenders: {', '.join(KNOWN_V2_SPENDERS)}. "
                     f"RPC: {polygon_rpc_url()}"
                 )
             else:

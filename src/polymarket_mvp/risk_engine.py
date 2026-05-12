@@ -64,7 +64,7 @@ def _real_available_balance_usdc() -> float | None:
     """
     try:
         from .poly_executor import _build_clob_client, _coerce_float, _extract_balance_value
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams  # pyright: ignore[reportMissingImports]
     except Exception:
         return None
     try:
