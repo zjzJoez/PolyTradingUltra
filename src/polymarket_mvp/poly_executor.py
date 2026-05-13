@@ -153,8 +153,16 @@ def _client_identity_summary(client: Any, *, signature_type: int, funder: str) -
 
 def _require_live_orderbook(client: Any, token_id: str) -> Dict[str, Any]:
     orderbook = client.get_order_book(token_id)
-    bids = getattr(orderbook, "bids", None) or []
-    asks = getattr(orderbook, "asks", None) or []
+    # py-clob-client-v2 returns the raw HTTP response as a dict
+    # ({'bids': [...], 'asks': [...], 'market': ..., 'tick_size': ..., ...});
+    # the V1 SDK wrapped it in an OrderBookSummary dataclass with attributes.
+    # Support both so we don't regress if either form is ever surfaced.
+    if isinstance(orderbook, dict):
+        bids = orderbook.get("bids") or []
+        asks = orderbook.get("asks") or []
+    else:
+        bids = getattr(orderbook, "bids", None) or []
+        asks = getattr(orderbook, "asks", None) or []
     if not bids and not asks:
         raise RuntimeError(f"No live orderbook levels returned for token_id={token_id}")
     return {
