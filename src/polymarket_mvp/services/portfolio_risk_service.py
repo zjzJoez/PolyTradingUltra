@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Mapping
 
 from ..common import get_env_float, get_env_int, parse_iso8601, utc_now_iso
@@ -10,9 +11,27 @@ from ..strategy.conviction import (
 )
 
 
+def _active_exposure_statuses_sql() -> str:
+    """SQL fragment for the set of execution statuses counted as active exposure.
+
+    `shadow_simulated` is included only when MVP_SHADOW_MODE=1. Rationale: in
+    shadow mode the bot must treat its own simulated trades as exposure so it
+    doesn't double-propose the same market/outcome 50 times. In real mode the
+    simulated rows are fictional and historical (e.g., from a shadow→real
+    cutover) — letting them block real entries is the wrong behavior.
+
+    The set is interpolated as a literal SQL string rather than parameterized
+    because the membership is a fixed, internally-controlled enum.
+    """
+    statuses = ["submitted", "live", "filled"]
+    if os.getenv("MVP_SHADOW_MODE") == "1":
+        statuses.append("shadow_simulated")
+    return "'" + "','".join(statuses) + "'"
+
+
 def _active_exposure(conn, *, topic: str | None, event_cluster_id: int | None, strategy_name: str | None) -> Dict[str, float]:
     rows = conn.execute(
-        """
+        f"""
         SELECT
           p.topic,
           p.event_cluster_id,
@@ -22,7 +41,7 @@ def _active_exposure(conn, *, topic: str | None, event_cluster_id: int | None, s
         FROM executions e
         JOIN proposals p ON p.proposal_id = e.proposal_id
         LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
-        WHERE e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
+        WHERE e.status IN ({_active_exposure_statuses_sql()})
           AND mr.market_id IS NULL
         """
     ).fetchall()
@@ -66,7 +85,7 @@ def _active_market_outcome_exposure(conn, *, market_id: str | None, outcome: str
     if not market_id or not outcome:
         return 0.0
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(e.requested_size_usdc), 0)
         FROM executions e
         JOIN proposals p ON p.proposal_id = e.proposal_id
@@ -74,7 +93,7 @@ def _active_market_outcome_exposure(conn, *, market_id: str | None, outcome: str
         WHERE p.proposal_kind = 'entry'
           AND p.market_id = ?
           AND p.outcome = ?
-          AND e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
+          AND e.status IN ({_active_exposure_statuses_sql()})
           AND mr.market_id IS NULL
         """,
         (market_id, outcome),
@@ -123,16 +142,16 @@ def _total_open_positions(conn) -> int:
 
 
 def _total_open_exposure_usdc(conn) -> float:
-    """Sum in-flight gross exposure across submitted/live/filled executions for
+    """Sum in-flight gross exposure across active executions for
     positions that have not yet been resolved. Used for the balance-fraction cap.
     """
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(e.requested_size_usdc), 0)
         FROM executions e
         JOIN proposals p ON p.proposal_id = e.proposal_id
         LEFT JOIN market_resolutions mr ON mr.market_id = p.market_id
-        WHERE e.status IN ('submitted', 'live', 'filled', 'shadow_simulated')
+        WHERE e.status IN ({_active_exposure_statuses_sql()})
           AND mr.market_id IS NULL
         """
     ).fetchone()
