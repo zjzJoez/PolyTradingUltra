@@ -456,12 +456,13 @@ def build_openclaw_proposals(
             "max_tradable_price": max_tradable_price,
             "outcome_rule": "Each proposal outcome must exactly match one of the provided outcomes for that market.",
             "duplicate_rule": "Do not return duplicate proposals or multiple outcomes for the same market unless explicitly requested.",
-            "always_propose_rule": (
-                f"Always try to return at least {min(top, 3)} proposals. "
-                "When external context is absent, use pricing patterns, market structure, liquidity, and statistical reasoning "
-                "(e.g. spread markets near 0.5 can still offer value when one side is mispriced by even 2-3%). "
-                "Only return fewer proposals if the market list itself has fewer than that many tradable opportunities."
+            "calibration_rule": (
+                "An empty proposals list is the correct answer when no market meets the EVIDENCE STANDARD. "
+                "Do not manufacture picks to fill a quota. Past prompts pushed for >=3 proposals per call and that strategy "
+                "produced 1.8% hit rate on high-confidence picks vs 20.5% market-implied baseline — net negative. "
+                "Propose only when you can cite a specific fact from the payload that contradicts the market price."
             ),
+            "min_edge_required": 0.05,
             "tradeability_rule": (
                 "Only propose entries with meaningful upside and realistic fill potential. "
                 f"Reject outcomes priced below {min_tradable_price:.2f} or above {max_tradable_price:.2f}. "
