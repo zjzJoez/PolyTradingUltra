@@ -848,6 +848,83 @@ class TradingOSUpgradeTests(unittest.TestCase):
         self.assertEqual(result["next_status"], "risk_blocked")
         self.assertIn("market_outcome_exposure_exists", result["portfolio_risk"]["reasons"])
 
+    def test_shadow_simulated_exposure_blocks_in_shadow_mode_but_not_real_mode(self) -> None:
+        """Regression for the 2026-05-13 shadow→real cutover artifact.
+
+        Before the fix: `_active_market_outcome_exposure` always included
+        `shadow_simulated` in its active-status set, so historical shadow
+        rows blocked every fresh real-mode entry on the same market/outcome
+        right after a shadow→real flip. After the fix: `shadow_simulated` is
+        counted only when MVP_SHADOW_MODE=1 (the original intent — preventing
+        the simulator from double-buying), and is invisible in real mode.
+        """
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            shadow_proposal = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="executed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(
+                conn,
+                {
+                    "proposal_id": shadow_proposal["proposal_id"],
+                    "mode": "real",
+                    "client_order_id": f"{shadow_proposal['proposal_id']}-shadow",
+                    "order_intent_json": {"request": {}, "source": "shadow_gate"},
+                    "requested_price": 0.62,
+                    "requested_size_usdc": 5.0,
+                    "max_slippage_bps": 500,
+                    "observed_worst_price": 0.62,
+                    "slippage_check_status": "skipped",
+                    "status": "shadow_simulated",
+                    "filled_size_usdc": 0.0,
+                    "avg_fill_price": None,
+                    "txhash_or_order_id": None,
+                    "slippage_bps": 0,
+                    "error_message": None,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            # Re-propose the same market+outcome with a fresh proposal.
+            duplicate = sample_proposal()
+            duplicate["reasoning"] = "second proposal on same market+outcome after shadow tick"
+            stored = upsert_proposal(
+                conn,
+                duplicate,
+                decision_engine="heuristic",
+                status="proposed",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            conn.commit()
+
+            # Real-mode path: shadow_simulated row must not be counted.
+            with patch.dict(os.environ, {"MVP_SHADOW_MODE": "0"}):
+                real_result = evaluate_full_record(conn, proposal_record(conn, stored["proposal_id"]))
+            self.assertNotIn(
+                "market_outcome_exposure_exists",
+                real_result["portfolio_risk"]["reasons"],
+                "shadow_simulated row should not block a real-mode entry post-cutover",
+            )
+
+            # Shadow-mode path: same row must still count, so the simulator
+            # doesn't propose the same market+outcome again on the next tick.
+            with patch.dict(os.environ, {"MVP_SHADOW_MODE": "1"}):
+                shadow_result = evaluate_full_record(conn, proposal_record(conn, stored["proposal_id"]))
+            self.assertIn(
+                "market_outcome_exposure_exists",
+                shadow_result["portfolio_risk"]["reasons"],
+                "shadow_simulated row should still count inside shadow mode",
+            )
+
     def test_portfolio_risk_blocks_duplicate_market_outcome_entry_when_pending_entry_exists(self) -> None:
         init_db(self.db_path)
         with connect_db(self.db_path) as conn:
