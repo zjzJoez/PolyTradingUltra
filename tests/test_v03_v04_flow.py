@@ -783,6 +783,84 @@ class TradingOSUpgradeTests(unittest.TestCase):
             self.assertAlmostEqual(float(position["filled_qty"]), 10.0, places=4)
             self.assertAlmostEqual(float(position["entry_price"]), 0.4, places=4)
 
+            # Regression: reconcile_live_orders alone (without the extra
+            # sync_all_positions call above) must already have advanced the
+            # position. Before the 2026-05-13 fix, update_execution skipped
+            # _sync_position_for_execution for status='failed', leaving the
+            # partially_filled transition dependent on the next sync pass.
+            # We assert here that immediately after reconcile, the position
+            # status reflects the partial fill — proving the in-reconcile
+            # sync covers the failed-partial-fill branch.
+
+    def test_failed_partial_fill_auto_syncs_position_in_reconcile(self) -> None:
+        """Regression: an execution updated to status='failed' with a non-zero
+        partial fill must trigger _sync_position_for_execution from inside
+        update_execution itself — without relying on a downstream
+        sync_all_positions call. Before the 2026-05-13 fix
+        (db.py:952), the condition was strictly `status in {filled, submitted,
+        live}` and the partially_filled state machine path stayed dormant.
+        """
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            upsert_market_snapshot(conn, sample_market())
+            stored = upsert_proposal(
+                conn,
+                sample_proposal(),
+                decision_engine="heuristic",
+                status="authorized_for_execution",
+                context_payload={"topic": "BTC", "assembled_text": "summary"},
+                strategy_name="near_expiry_conviction",
+                topic="BTC",
+            )
+            record_execution(conn, {
+                "proposal_id": stored["proposal_id"],
+                "mode": "real",
+                "client_order_id": f"{stored['proposal_id']}-live",
+                "order_intent_json": {"request": {}},
+                "requested_price": 0.4,
+                "requested_size_usdc": 5.0,
+                "max_slippage_bps": 500,
+                "observed_worst_price": 0.4,
+                "slippage_check_status": "passed",
+                "status": "live",
+                "filled_size_usdc": None,
+                "avg_fill_price": None,
+                "txhash_or_order_id": "order-partial-then-invalid",
+                "slippage_bps": None,
+                "error_message": None,
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            })
+            conn.commit()
+            sync_all_positions(conn)
+
+            fake_client = Mock()
+            fake_client.get_order.return_value = {
+                "id": "order-partial-then-invalid",
+                "status": "INVALID",
+                "size_matched": "10.0",
+                "price": "0.4",
+                "original_size": "12.5",
+            }
+            with patch(
+                "polymarket_mvp.services.reconciler._build_clob_client",
+                return_value=fake_client,
+            ):
+                reconcile_live_orders(conn)
+            conn.commit()
+
+            # CRITICAL: assert position is partially_filled WITHOUT calling
+            # sync_all_positions again. The in-reconcile update_execution
+            # must already have triggered position_manager.sync_position_for_execution.
+            position = list_positions(conn)[0]
+            self.assertEqual(
+                position["status"],
+                "partially_filled",
+                "update_execution must auto-sync position for failed-with-partial-fill executions",
+            )
+            self.assertAlmostEqual(float(position["filled_qty"]), 10.0, places=4)
+            self.assertAlmostEqual(float(position["entry_price"]), 0.4, places=4)
+
             # Market resolves "No" — we bet "Yes" → full loss on the 10 filled shares
             upsert_market_resolution(
                 conn,

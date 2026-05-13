@@ -949,7 +949,18 @@ def update_execution(conn: sqlite3.Connection, execution_id: int, fields: Mappin
     item = row_to_dict(row) or {}
     if item.get("order_intent_json"):
         item["order_intent_json"] = _json_loads_if_present(item["order_intent_json"])
-    if item.get("status") in {"filled", "submitted", "live"}:
+    # Sync the position for any execution that holds tokens — either an actively-
+    # tracked status, OR a terminal-failure execution that captured a partial
+    # fill (e.g. INVALID after 10/12.63 shares matched, where size_matched > 0).
+    # Without the partial-fill branch, the post-2026-05-09 reconciler change
+    # records observed_fill_usdc on a failed status but position_manager never
+    # gets called, so the existing 'open_requested' row stays unresolved and
+    # update_position_marks skips it — same root cause as position 1593's
+    # 20-day freeze, one step removed from the original 4-bug fix (0345dcb).
+    fill_size = float(item.get("filled_size_usdc") or 0.0)
+    if item.get("status") in {"filled", "submitted", "live"} or (
+        item.get("status") == "failed" and fill_size > 0
+    ):
         _sync_position_for_execution(conn, execution_id)
     return item
 
