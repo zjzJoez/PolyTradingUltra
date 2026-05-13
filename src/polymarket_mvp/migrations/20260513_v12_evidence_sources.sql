@@ -84,30 +84,10 @@ INSERT INTO proposal_contexts
 SELECT * FROM proposal_contexts_old;
 DROP TABLE proposal_contexts_old;
 
--- ── provider_event_links ──────────────────────────────────────────────
-ALTER TABLE provider_event_links RENAME TO provider_event_links_old;
-
-CREATE TABLE provider_event_links (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_id INTEGER NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN (
-    'cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data',
-    'polymarket_historical', 'gdelt', 'tavily', 'odds_api', 'reddit'
-  )),
-  source_id TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(event_id, source_type, source_id),
-  FOREIGN KEY (event_id) REFERENCES event_clusters(id) ON DELETE CASCADE
-);
-
-INSERT INTO provider_event_links (
-  id, event_id, source_type, source_id, payload_json, created_at
-)
-SELECT
-  id, event_id, source_type, source_id, payload_json, created_at
-FROM provider_event_links_old;
-DROP TABLE provider_event_links_old;
+-- NOTE: schema.sql contains an old, aspirational definition of
+-- provider_event_links with a source_type column, but the actual production
+-- table is for sports-fixture mapping and has no source_type. We do NOT
+-- touch it here.
 
 -- ── adapter_budget_tracking (new) ─────────────────────────────────────
 -- Tracks daily call counts per paid adapter so we don't blow through
