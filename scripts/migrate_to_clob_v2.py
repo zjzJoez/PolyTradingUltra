@@ -80,10 +80,20 @@ CTF_ABI = [
      "outputs": []},
 ]
 
-# Polymarket's CollateralOnramp: wrap(uint256) burns USDC.e, mints pUSD 1:1.
+# Polymarket's CollateralOnramp signature (verified on-chain 2026-05-13 via
+# OpenChain selector lookup + eth_call simulation):
+#   wrap(address inToken, address recipient, uint256 amount)
+#   selector 0x62355638
+# Burns `amount` of `inToken` from msg.sender (USDC.e in our case), mints pUSD
+# to `recipient`. Earlier guess of wrap(uint256) was wrong — that selector
+# isn't in the dispatch table and the on-chain tx reverted with low gas.
 ONRAMP_ABI = [
     {"name": "wrap", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "amount", "type": "uint256"}],
+     "inputs": [
+        {"name": "inToken", "type": "address"},
+        {"name": "recipient", "type": "address"},
+        {"name": "amount", "type": "uint256"},
+     ],
      "outputs": []},
 ]
 
@@ -178,10 +188,14 @@ def _build_steps(
             if bal <= 1:
                 return "noop"
             amount = bal - 1  # leave 1 raw unit of dust as a buffer
-            fn = onramp.functions.wrap(amount)
+            fn = onramp.functions.wrap(
+                w3.to_checksum_address(USDC_E),
+                wallet_cs,
+                amount,
+            )
             return _send_tx(w3, account, fn, gas_limit=200_000)
 
-        return Step("B", "CollateralOnramp.wrap(USDC.e_balance - 1)", skip_check, send)
+        return Step("B", "CollateralOnramp.wrap(USDC.e, wallet, USDC.e_balance - 1)", skip_check, send)
 
     def _step_approve_pusd(letter: str, spender_label: str, spender_addr: str) -> Step:
         def skip_check() -> Tuple[bool, str]:
