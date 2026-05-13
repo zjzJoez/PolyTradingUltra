@@ -505,6 +505,11 @@ def build_openclaw_proposals(
     for market in candidate_markets:
         market_id_str = str(market["market_id"])
         context_blob = resolve_context_payload(context_file, market_id_str)
+        # Pull a few extended Gamma fields (when present) so the LLM can spot
+        # "new / featured / recently-listed" mispricings that aren't reflected
+        # in the price yet. All optional and best-effort.
+        mj_raw = market.get("market_json") or {}
+        mj = mj_raw if isinstance(mj_raw, dict) else {}
         market_block: Dict[str, Any] = {
             "market_id": market["market_id"],
             "question": market.get("question"),
@@ -527,6 +532,19 @@ def build_openclaw_proposals(
                 "sources": context_blob.get("sources", [])[:5],
             },
         }
+        for gamma_key, dest_key in (
+            ("featured", "featured"),
+            ("new", "new_listing"),
+            ("createdAt", "listed_at"),
+            ("acceptingOrdersTimestamp", "accepting_orders_since"),
+            ("competitive", "competitive_score"),
+            ("clobTokenIds", None),  # already in outcomes
+        ):
+            if dest_key is None:
+                continue
+            v = mj.get(gamma_key)
+            if v is not None and v != "":
+                market_block[dest_key] = v
         prior = _prior_proposals_snippet(conn, market_id_str, prior_proposal_depth)
         if prior:
             market_block["prior_proposals"] = prior

@@ -56,7 +56,10 @@ CREATE INDEX IF NOT EXISTS idx_market_event_links_cluster ON market_event_links(
 CREATE TABLE IF NOT EXISTS market_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data')),
+  source_type TEXT NOT NULL CHECK(source_type IN (
+    'cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data',
+    'polymarket_historical', 'gdelt', 'tavily', 'odds_api', 'reddit'
+  )),
   source_id TEXT,
   title TEXT,
   published_at TEXT,
@@ -71,6 +74,18 @@ CREATE TABLE IF NOT EXISTS market_contexts (
 
 CREATE INDEX IF NOT EXISTS idx_market_contexts_market ON market_contexts(market_id);
 CREATE INDEX IF NOT EXISTS idx_market_contexts_market_type ON market_contexts(market_id, source_type);
+
+-- Daily call counter for paid context adapters (Tavily, The Odds API) to
+-- protect small credit pools. Keyed by UTC date so a new day auto-resets.
+CREATE TABLE IF NOT EXISTS adapter_budget_tracking (
+  provider TEXT NOT NULL,
+  date_utc TEXT NOT NULL,
+  calls INTEGER NOT NULL DEFAULT 0,
+  last_call_at TEXT,
+  PRIMARY KEY (provider, date_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_adapter_budget_date ON adapter_budget_tracking(date_utc);
 
 CREATE TABLE IF NOT EXISTS research_memos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +175,10 @@ CREATE INDEX IF NOT EXISTS idx_proposals_alpha_signal ON proposals(alpha_signal_
 CREATE TABLE IF NOT EXISTS proposal_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   proposal_id TEXT NOT NULL,
-  source_type TEXT NOT NULL CHECK(source_type IN ('cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data')),
+  source_type TEXT NOT NULL CHECK(source_type IN (
+    'cryptopanic', 'apify_twitter', 'perplexity', 'web_search', 'sports_data',
+    'polymarket_historical', 'gdelt', 'tavily', 'odds_api', 'reddit'
+  )),
   source_id TEXT,
   title TEXT,
   published_at TEXT,

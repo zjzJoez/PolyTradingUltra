@@ -305,8 +305,578 @@ class WebSearchAdapter:
         ]
 
 
+class PolymarketHistoricalAdapter:
+    """Computes a base-rate prior from this DB's `market_resolutions` table.
+
+    The bot has been scanning Polymarket for weeks; every resolved market we
+    saw is now a sample of the base rate for "questions like this one". For a
+    fresh draw / O-U / underdog market, we look up similar resolved markets
+    (matched by market_topic keyword + outcome shape) and surface the
+    historical fraction that resolved on the bot's picked outcome.
+
+    No API calls — pure local SQL. Free, fast, and ground-truth.
+    """
+
+    MIN_SAMPLES = 5
+    LOOKBACK_DAYS = 90
+
+    def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        from .db import connect_db
+        from .services.event_cluster_service import classify_market_class
+
+        question = (market.get("question") or "").strip()
+        if not question:
+            return []
+        market_class = classify_market_class(market)
+        topic = market_topic(market) or question[:60]
+        keyword = self._topic_keyword(topic)
+        if not keyword:
+            return []
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT mr.market_id, mr.resolved_outcome, ms.question
+                FROM market_resolutions mr
+                JOIN market_snapshots ms ON ms.market_id = mr.market_id
+                WHERE mr.resolved_outcome IS NOT NULL
+                  AND mr.resolved_at > datetime('now', ?)
+                  AND ms.market_id != ?
+                  AND (ms.question LIKE ? OR ms.question LIKE ?)
+                ORDER BY mr.resolved_at DESC
+                LIMIT 200
+                """,
+                (
+                    f"-{self.LOOKBACK_DAYS} days",
+                    str(market.get("market_id") or ""),
+                    f"%{keyword}%",
+                    f"%{keyword.lower()}%",
+                ),
+            ).fetchall()
+        if len(rows) < self.MIN_SAMPLES:
+            return []
+        yes_count = sum(1 for r in rows if (r["resolved_outcome"] or "").strip().lower() == "yes")
+        n = len(rows)
+        yes_rate = yes_count / n
+        text = (
+            f"BASE RATE for similar '{keyword}' markets (last {self.LOOKBACK_DAYS}d, n={n}): "
+            f"resolved YES {yes_count}/{n} = {yes_rate * 100:.1f}%."
+        )
+        return [
+            {
+                "source_type": "polymarket_historical",
+                "source_id": f"hist_{keyword}_{n}",
+                "title": f"Historical base rate ({n} similar)",
+                "published_at": utc_now_iso(),
+                "url": None,
+                "raw_text": text,
+                "display_text": short_context_line("HISTORICAL: ", text, limit=400),
+                "importance_weight": 1.4,  # high — empirical base rate beats model guesses
+                "normalized_payload_json": {
+                    "keyword": keyword,
+                    "n": n,
+                    "yes_rate": yes_rate,
+                    "yes_count": yes_count,
+                    "lookback_days": self.LOOKBACK_DAYS,
+                    "market_class": market_class,
+                },
+            }
+        ]
+
+    @staticmethod
+    def _topic_keyword(topic: str) -> str:
+        """Pull the most signal-bearing keyword: 'draw', 'win', 'O/U', etc.
+
+        For "Will A vs B end in a draw?" → "end in a draw"
+        For "Will Hradec Králové win on …" → "win"
+        For "Real Betis vs Elche: O/U 2.5" → "O/U"
+        """
+        lowered = topic.lower()
+        if "draw" in lowered:
+            return "end in a draw"
+        if "o/u" in lowered or "over/under" in lowered:
+            return "O/U"
+        if "both teams to score" in lowered or "btts" in lowered:
+            return "Both Teams to Score"
+        if " win" in lowered:
+            return "win"
+        return ""
+
+
+class GdeltAdapter:
+    """Global Database of Events, Language, and Tone — 2.0 DOC API.
+
+    Free, no auth. Returns recent globally-tracked articles matching a query.
+    Best for political / macro / news-driven markets where a public event
+    has likely been reported by multiple outlets.
+
+    https://api.gdeltproject.org/api/v2/doc/doc?query=Q&format=json
+    """
+
+    endpoint = "https://api.gdeltproject.org/api/v2/doc/doc"
+    timeout = 15
+
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+
+    def fetch(self, market: Mapping[str, Any], *, max_records: int = 5) -> List[Dict[str, Any]]:
+        from .services.event_cluster_service import classify_market_class
+
+        # GDELT is overkill for sports (chronicles every match endlessly) and
+        # near-useless for esports / weather. Limit to politics + tech + other.
+        market_class = classify_market_class(market)
+        if market_class not in ("politics", "tech", "other"):
+            return []
+        query = market_topic(market) or (market.get("question") or "")[:80]
+        if not query:
+            return []
+        try:
+            response = self.session.get(
+                self.endpoint,
+                params={
+                    "query": query,
+                    "format": "json",
+                    "mode": "ArtList",
+                    "maxrecords": max_records,
+                    "sort": "DateDesc",
+                    "timespan": "48H",  # last 48h only
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            return []
+        articles = body.get("articles") or []
+        contexts: List[Dict[str, Any]] = []
+        for art in articles[:max_records]:
+            title = sanitize_text(str(art.get("title") or ""))
+            if not title:
+                continue
+            seendate = art.get("seendate") or ""
+            source = sanitize_text(str(art.get("domain") or ""))
+            line = f"{seendate[:10] if len(seendate) >= 10 else seendate} {source}: {title}"
+            contexts.append(
+                {
+                    "source_type": "gdelt",
+                    "source_id": art.get("url") or art.get("documentidentifier") or title[:60],
+                    "title": title,
+                    "published_at": seendate,
+                    "url": art.get("url"),
+                    "raw_text": json.dumps({"title": title, "domain": source, "seendate": seendate}, sort_keys=False),
+                    "display_text": short_context_line("GDELT: ", line, limit=260),
+                    "importance_weight": 0.85,
+                    "normalized_payload_json": {
+                        "title": title,
+                        "domain": source,
+                        "seendate": seendate,
+                        "url": art.get("url"),
+                    },
+                }
+            )
+        return contexts
+
+
+class TavilyAdapter:
+    """Tavily LLM-friendly search API.
+
+    PAID — 1000 lifetime credits on the dev key. Enforce a strict daily cap
+    via adapter_budget_tracking so a single bad day can't burn the pool.
+
+    Tavily returns an LLM-synthesized answer + ranked source snippets, which
+    is more useful per-call than raw web search. Fire only as a fallback when
+    other adapters returned thin context.
+    """
+
+    endpoint = "https://api.tavily.com/search"
+    timeout = 30
+    default_daily_cap = 30  # 30/day * 30 days = 900/month — safe under 1000 lifetime
+
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+
+    def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        from .db import connect_db, adapter_budget_calls_today, adapter_budget_increment
+
+        api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
+        if not api_key:
+            return []
+        daily_cap = get_env_int("TAVILY_DAILY_CAP", self.default_daily_cap)
+        with connect_db() as conn:
+            used = adapter_budget_calls_today(conn, "tavily")
+            if used >= daily_cap:
+                return []  # cap hit — silently skip until tomorrow
+        topic = market_topic(market)
+        question = (market.get("question") or "").strip()
+        end_date = (market.get("end_date") or "")[:10]
+        query = (
+            f"Latest factual updates on: {topic}. "
+            f"Original market question: {question}. Market resolves by {end_date}."
+        )[:380]
+        try:
+            response = self.session.post(
+                self.endpoint,
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": 5,
+                    "include_answer": True,
+                    "days": 7,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            return []
+        with connect_db() as conn:
+            adapter_budget_increment(conn, "tavily")
+            conn.commit()
+        contexts: List[Dict[str, Any]] = []
+        answer = sanitize_text(str(body.get("answer") or ""))
+        if answer:
+            contexts.append(
+                {
+                    "source_type": "tavily",
+                    "source_id": f"tavily_answer_{topic[:40]}",
+                    "title": f"Tavily synthesized answer: {topic}",
+                    "published_at": utc_now_iso(),
+                    "url": None,
+                    "raw_text": answer,
+                    "display_text": short_context_line("TAVILY: ", answer, limit=500),
+                    "importance_weight": 1.1,
+                    "normalized_payload_json": {"topic": topic, "answer": answer, "kind": "answer"},
+                }
+            )
+        for r in (body.get("results") or [])[:3]:
+            title = sanitize_text(str(r.get("title") or ""))
+            content = sanitize_text(str(r.get("content") or r.get("snippet") or ""))
+            if not title and not content:
+                continue
+            snippet = f"{title} — {content}" if title else content
+            contexts.append(
+                {
+                    "source_type": "tavily",
+                    "source_id": r.get("url") or title[:80],
+                    "title": title,
+                    "published_at": utc_now_iso(),
+                    "url": r.get("url"),
+                    "raw_text": snippet,
+                    "display_text": short_context_line("TAVILY: ", snippet, limit=280),
+                    "importance_weight": 0.95,
+                    "normalized_payload_json": {
+                        "title": title,
+                        "content": content,
+                        "url": r.get("url"),
+                        "score": r.get("score"),
+                        "kind": "result",
+                    },
+                }
+            )
+        return contexts
+
+
+class TheOddsApiAdapter:
+    """The Odds API — bookmaker consensus prices across 40+ sportsbooks.
+
+    PAID — 500 free reqs/month. Enforce a strict daily cap via
+    adapter_budget_tracking.
+
+    Returns the average implied probability across major books for a
+    Polymarket question. The "alpha" comes from comparing Polymarket's price
+    to the bookmaker consensus — when they diverge by more than the implied
+    Polymarket fee, that's a structural mispricing.
+    """
+
+    base_url = "https://api.the-odds-api.com/v4"
+    timeout = 25
+    default_daily_cap = 15  # 15/day * 30 = 450/month — safe under 500
+
+    # Polymarket question keyword → Odds API sport key (priority order).
+    SPORT_KEYWORDS = (
+        ("FC Barcelona", "soccer_spain_la_liga"),
+        ("Real Madrid", "soccer_spain_la_liga"),
+        ("Liga MX", "soccer_mexico_ligamx"),
+        ("Premier League", "soccer_epl"),
+        ("EFL Championship", "soccer_efl_champ"),
+        ("Bundesliga", "soccer_germany_bundesliga"),
+        ("Serie A", "soccer_italy_serie_a"),
+        ("Ligue 1", "soccer_france_ligue_one"),
+        ("MLS", "soccer_usa_mls"),
+        ("UEFA Champions League", "soccer_uefa_champs_league"),
+        ("La Liga", "soccer_spain_la_liga"),
+        ("NBA", "basketball_nba"),
+        ("NFL", "americanfootball_nfl"),
+        ("MLB", "baseball_mlb"),
+        ("NHL", "icehockey_nhl"),
+    )
+
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+
+    def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        from .db import connect_db, adapter_budget_calls_today, adapter_budget_increment
+        from .services.event_cluster_service import classify_market_class
+
+        api_key = (os.getenv("ODDS_API_KEY") or "").strip()
+        if not api_key:
+            return []
+        market_class = classify_market_class(market)
+        if market_class not in ("sports_winner", "sports_totals"):
+            return []
+        sport_key = self._resolve_sport(market)
+        if not sport_key:
+            return []
+        daily_cap = get_env_int("ODDS_API_DAILY_CAP", self.default_daily_cap)
+        with connect_db() as conn:
+            used = adapter_budget_calls_today(conn, "odds_api")
+            if used >= daily_cap:
+                return []
+        try:
+            response = self.session.get(
+                f"{self.base_url}/sports/{sport_key}/odds",
+                params={
+                    "apiKey": api_key,
+                    "regions": "eu,uk",
+                    "markets": "h2h,totals",
+                    "oddsFormat": "decimal",
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            events = response.json()
+        except Exception:
+            return []
+        with connect_db() as conn:
+            adapter_budget_increment(conn, "odds_api")
+            conn.commit()
+        event = self._match_event(events, market)
+        if not event:
+            return []
+        consensus = self._average_consensus(event)
+        if not consensus:
+            return []
+        question = (market.get("question") or "")[:80]
+        lines = []
+        if consensus.get("h2h"):
+            h2h = consensus["h2h"]
+            parts = [f"{name}={prob:.3f}" for name, prob in h2h.items()]
+            lines.append(f"H2H (avg {consensus['book_count']} books): " + " / ".join(parts))
+        if consensus.get("totals"):
+            for total_line, sides in consensus["totals"].items():
+                parts = [f"{name}={prob:.3f}" for name, prob in sides.items()]
+                lines.append(f"Totals {total_line}: " + " / ".join(parts))
+        text = " | ".join(lines)
+        return [
+            {
+                "source_type": "odds_api",
+                "source_id": f"odds_{event.get('id') or sport_key}",
+                "title": f"Bookmaker consensus: {question}",
+                "published_at": event.get("commence_time") or utc_now_iso(),
+                "url": None,
+                "raw_text": text,
+                "display_text": short_context_line("BOOKMAKERS: ", text, limit=500),
+                "importance_weight": 1.3,  # consensus odds are very strong evidence
+                "normalized_payload_json": {
+                    "sport_key": sport_key,
+                    "event_id": event.get("id"),
+                    "commence_time": event.get("commence_time"),
+                    "consensus": consensus,
+                    "n_books": consensus.get("book_count"),
+                },
+            }
+        ]
+
+    def _resolve_sport(self, market: Mapping[str, Any]) -> str | None:
+        haystack = " ".join([
+            str(market.get("question") or ""),
+            json.dumps(market.get("market_json") or {}, ensure_ascii=False)[:500],
+        ])
+        for keyword, sport_key in self.SPORT_KEYWORDS:
+            if keyword.lower() in haystack.lower():
+                return sport_key
+        return None
+
+    def _match_event(self, events: list, market: Mapping[str, Any]) -> Dict[str, Any] | None:
+        """Find the Odds-API event corresponding to our Polymarket question.
+
+        Polymarket questions like "Will FC Barcelona vs. Real Madrid end in a draw?"
+        and "Real Madrid vs. Barcelona: O/U 2.5" both reference the same fixture.
+        Match by checking if both home_team and away_team substrings appear in the
+        question text."""
+        question = (market.get("question") or "").lower()
+        if not question:
+            return None
+        for ev in events or []:
+            home = (ev.get("home_team") or "").lower()
+            away = (ev.get("away_team") or "").lower()
+            if home and away and home in question and away in question:
+                return ev
+            # Fallback: any single team match for win-based markets
+            if home and home in question and "win" in question:
+                return ev
+        return None
+
+    def _average_consensus(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Average bookmaker probabilities across markets."""
+        bookmakers = event.get("bookmakers") or []
+        if not bookmakers:
+            return {}
+        h2h_sum: Dict[str, list] = {}
+        totals_sum: Dict[str, Dict[str, list]] = {}
+        for bm in bookmakers:
+            for mkt in (bm.get("markets") or []):
+                if mkt.get("key") == "h2h":
+                    for o in (mkt.get("outcomes") or []):
+                        name = o.get("name") or ""
+                        price = float(o.get("price") or 0)
+                        if price > 0:
+                            h2h_sum.setdefault(name, []).append(1.0 / price)
+                elif mkt.get("key") == "totals":
+                    for o in (mkt.get("outcomes") or []):
+                        line = str(o.get("point") or "")
+                        name = (o.get("name") or "") + f" {line}"
+                        price = float(o.get("price") or 0)
+                        if price > 0:
+                            totals_sum.setdefault(line, {}).setdefault(name, []).append(1.0 / price)
+        result: Dict[str, Any] = {"book_count": len(bookmakers)}
+        if h2h_sum:
+            # Raw implied probabilities sum > 1.0 due to vig; normalize to sum=1.
+            avg = {k: sum(v) / len(v) for k, v in h2h_sum.items()}
+            total = sum(avg.values()) or 1.0
+            result["h2h"] = {k: v / total for k, v in avg.items()}
+        if totals_sum:
+            normalized_totals: Dict[str, Dict[str, float]] = {}
+            for line, sides in totals_sum.items():
+                avg = {k: sum(v) / len(v) for k, v in sides.items()}
+                total = sum(avg.values()) or 1.0
+                normalized_totals[line] = {k: v / total for k, v in avg.items()}
+            result["totals"] = normalized_totals
+        return result
+
+
+class RedditAdapter:
+    """Reddit sentiment via the Reddit OAuth API.
+
+    Needs three env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET,
+    REDDIT_USER_AGENT. Without them the adapter just returns []. The user
+    needs to register a "script" app at https://www.reddit.com/prefs/apps
+    and supply the resulting credentials.
+
+    For each market class we hit a different subreddit cluster — sportsbook
+    for sports, politicaldebate for politics, etc. Returns the top N hot
+    comments mentioning the topic keyword.
+    """
+
+    endpoint = "https://www.reddit.com"
+    oauth_endpoint = "https://www.reddit.com/api/v1/access_token"
+    timeout = 15
+
+    SUBREDDITS_BY_CLASS = {
+        "sports_winner": ["sportsbook", "soccer", "nba", "nfl"],
+        "sports_totals": ["sportsbook"],
+        "politics": ["PoliticalForecasting", "Polymarket", "neoliberal"],
+        "tech": ["stocks", "wallstreetbets"],
+        "other": ["Polymarket", "prediction"],
+    }
+
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+        self._token: str | None = None
+
+    def fetch(self, market: Mapping[str, Any], *, limit: int = 5) -> List[Dict[str, Any]]:
+        from .services.event_cluster_service import classify_market_class
+
+        client_id = (os.getenv("REDDIT_CLIENT_ID") or "").strip()
+        client_secret = (os.getenv("REDDIT_CLIENT_SECRET") or "").strip()
+        user_agent = (os.getenv("REDDIT_USER_AGENT") or "PolyTradingUltra/0.1").strip()
+        if not client_id or not client_secret:
+            return []
+        market_class = classify_market_class(market)
+        subreddits = self.SUBREDDITS_BY_CLASS.get(market_class)
+        if not subreddits:
+            return []
+        token = self._get_token(client_id, client_secret, user_agent)
+        if not token:
+            return []
+        topic = market_topic(market) or (market.get("question") or "")[:60]
+        if not topic:
+            return []
+        contexts: List[Dict[str, Any]] = []
+        for sub in subreddits[:2]:  # cap subreddit fan-out
+            try:
+                resp = self.session.get(
+                    f"https://oauth.reddit.com/r/{sub}/search",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": user_agent},
+                    params={"q": topic, "limit": limit, "restrict_sr": "true", "sort": "new", "t": "week"},
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                continue
+            for item in (data.get("data") or {}).get("children", [])[:limit]:
+                post = item.get("data") or {}
+                title = sanitize_text(str(post.get("title") or ""))
+                selftext = sanitize_text(str(post.get("selftext") or ""))[:240]
+                if not title:
+                    continue
+                snippet = f"r/{sub}: {title}" + (f" — {selftext}" if selftext else "")
+                contexts.append(
+                    {
+                        "source_type": "reddit",
+                        "source_id": post.get("id") or post.get("permalink") or title[:80],
+                        "title": title,
+                        "published_at": (post.get("created_utc") and str(int(post["created_utc"]))) or None,
+                        "url": post.get("url"),
+                        "raw_text": json.dumps(
+                            {"title": title, "selftext": selftext, "subreddit": sub, "score": post.get("score")},
+                            sort_keys=False,
+                        ),
+                        "display_text": short_context_line("REDDIT: ", snippet, limit=280),
+                        "importance_weight": 0.5 + min((post.get("score") or 0) / 1000.0, 0.4),
+                        "normalized_payload_json": {
+                            "subreddit": sub,
+                            "title": title,
+                            "score": post.get("score"),
+                            "selftext": selftext,
+                            "url": post.get("url"),
+                        },
+                    }
+                )
+        return contexts
+
+    def _get_token(self, client_id: str, client_secret: str, user_agent: str) -> str | None:
+        if self._token:
+            return self._token
+        try:
+            resp = self.session.post(
+                self.oauth_endpoint,
+                auth=(client_id, client_secret),
+                data={"grant_type": "client_credentials"},
+                headers={"User-Agent": user_agent},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            self._token = resp.json().get("access_token")
+            return self._token
+        except Exception:
+            return None
+
+
 def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, Any]], max_chars: int) -> Dict[str, Any]:
-    _source_order = {"sports_data": 0, "perplexity": 1, "cryptopanic": 2, "web_search": 3, "apify_twitter": 4}
+    _source_order = {
+        "odds_api": 0,              # bookmaker consensus — strongest sports signal
+        "sports_data": 1,           # team form
+        "polymarket_historical": 2, # empirical base rate
+        "gdelt": 3,                 # global news events
+        "perplexity": 4,            # LLM summary
+        "tavily": 5,                # LLM-friendly search
+        "cryptopanic": 6,           # crypto news (mostly disabled)
+        "reddit": 7,                # sentiment
+        "web_search": 8,            # DuckDuckGo (mostly empty)
+        "apify_twitter": 9,         # twitter (noisy)
+    }
     ordered = sorted(
         contexts,
         key=lambda item: (
@@ -318,18 +888,21 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
     remaining = max_chars
     included: List[Dict[str, Any]] = []
     lines: List[str] = []
+    _PREFIX_BY_SOURCE = {
+        "sports_data": "TEAM FORM: ",
+        "perplexity": "SUMMARY: ",
+        "cryptopanic": "NEWS: ",
+        "web_search": "WEB: ",
+        "apify_twitter": "X: ",
+        "polymarket_historical": "HISTORICAL: ",
+        "gdelt": "GDELT: ",
+        "tavily": "TAVILY: ",
+        "odds_api": "BOOKMAKERS: ",
+        "reddit": "REDDIT: ",
+    }
     for item in ordered:
         source_type = item["source_type"]
-        if source_type == "sports_data":
-            prefix = "TEAM FORM: "
-        elif source_type == "perplexity":
-            prefix = "SUMMARY: "
-        elif source_type == "cryptopanic":
-            prefix = "NEWS: "
-        elif source_type == "web_search":
-            prefix = "WEB: "
-        else:
-            prefix = "X: "
+        prefix = _PREFIX_BY_SOURCE.get(source_type, "X: ")
         display_text = str(item.get("display_text") or "")
         if display_text.startswith(prefix):
             display_text = display_text[len(prefix) :].lstrip()
@@ -362,15 +935,29 @@ def compose_context_payload(market: Mapping[str, Any], contexts: List[Dict[str, 
 
 
 def provider_names(value: str | None) -> List[str]:
-    # Default: cryptopanic for crypto/prediction markets, web_search (DuckDuckGo) as free fallback.
-    # Perplexity included only when PERPLEXITY_API_KEY is set and non-empty.
-    # sports_data included only when FOOTBALL_DATA_API_KEY is set.
+    """Default provider list — only enables paid adapters when their API keys are set.
+
+    Always-on (free, no auth): polymarket_historical, gdelt, web_search, cryptopanic
+      (cryptopanic auto-soft-fails to a stub when its key is missing).
+    Conditional (env-key gated): sports_data, perplexity, tavily, odds_api, reddit.
+    """
     import os as _os
     parts: List[str] = []
+    # Always-on free adapters first.
+    parts.append("polymarket_historical")
+    parts.append("gdelt")
+    # Conditional on API keys.
     if (_os.getenv("FOOTBALL_DATA_API_KEY") or "").strip():
         parts.append("sports_data")
     if (_os.getenv("PERPLEXITY_API_KEY") or "").strip():
         parts.append("perplexity")
+    if (_os.getenv("TAVILY_API_KEY") or "").strip():
+        parts.append("tavily")
+    if (_os.getenv("ODDS_API_KEY") or "").strip():
+        parts.append("odds_api")
+    if (_os.getenv("REDDIT_CLIENT_ID") or "").strip() and (_os.getenv("REDDIT_CLIENT_SECRET") or "").strip():
+        parts.append("reddit")
+    # Existing free/soft-fail adapters.
     parts.extend(["cryptopanic", "web_search"])
     default = ",".join(parts)
     raw = value or default
@@ -394,9 +981,25 @@ def fetch_contexts_for_market(
 ) -> Dict[str, Any]:
     contexts: List[Dict[str, Any]] = []
     enabled = list(providers)
+    # Local/free adapters first — no network cost.
+    if "polymarket_historical" in enabled:
+        try:
+            contexts.extend(PolymarketHistoricalAdapter().fetch(market))
+        except Exception:
+            pass
+    if "odds_api" in enabled:
+        try:
+            contexts.extend(TheOddsApiAdapter().fetch(market))
+        except Exception:
+            pass
     if "sports_data" in enabled:
         try:
             contexts.extend(SportsDataAdapter().fetch(market, limit=limit))
+        except Exception:
+            pass
+    if "gdelt" in enabled:
+        try:
+            contexts.extend(GdeltAdapter().fetch(market))
         except Exception:
             pass
     if "perplexity" in enabled:
@@ -404,11 +1007,21 @@ def fetch_contexts_for_market(
             contexts.extend(PerplexityAdapter().fetch(market))
         except Exception:
             pass
+    if "tavily" in enabled:
+        try:
+            contexts.extend(TavilyAdapter().fetch(market))
+        except Exception:
+            pass
     if "cryptopanic" in enabled:
         try:
             contexts.extend(CryptoPanicAdapter().fetch(market, limit=limit))
         except Exception as exc:
             contexts.append(cryptopanic_soft_fail_context(str(exc)))
+    if "reddit" in enabled:
+        try:
+            contexts.extend(RedditAdapter().fetch(market, limit=limit))
+        except Exception:
+            pass
     if "web_search" in enabled:
         try:
             contexts.extend(WebSearchAdapter().fetch(market))

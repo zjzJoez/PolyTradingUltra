@@ -168,6 +168,36 @@ def replace_market_contexts(conn: sqlite3.Connection, market_id: str, contexts: 
         )
 
 
+def adapter_budget_calls_today(conn: sqlite3.Connection, provider: str) -> int:
+    """Return how many calls a paid adapter has made today (UTC). Used to enforce
+    per-day caps on Tavily / The Odds API so we don't burn the small credit pools."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute(
+        "SELECT calls FROM adapter_budget_tracking WHERE provider = ? AND date_utc = ?",
+        (provider, today),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def adapter_budget_increment(conn: sqlite3.Connection, provider: str) -> None:
+    """Record a paid-adapter call. Upserts on (provider, date_utc) so the counter
+    auto-resets at UTC midnight."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    conn.execute(
+        """
+        INSERT INTO adapter_budget_tracking (provider, date_utc, calls, last_call_at)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(provider, date_utc) DO UPDATE SET
+          calls = calls + 1,
+          last_call_at = excluded.last_call_at
+        """,
+        (provider, today, now.isoformat().replace("+00:00", "Z")),
+    )
+
+
 def market_contexts(conn: sqlite3.Connection, market_id: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
