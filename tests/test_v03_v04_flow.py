@@ -1921,6 +1921,70 @@ class ClobV2PreflightTests(unittest.TestCase):
         self.assertEqual(preflight["api_keys_count"], 1)
 
 
+class ClobV2OrderbookShapeTests(unittest.TestCase):
+    """Regression for the 2026-05-13 V2-SDK return-shape mismatch.
+
+    py-clob-client v1 returned `OrderBookSummary` (a dataclass with .bids/.asks
+    attributes); py-clob-client-v2 1.0.1 returns the raw HTTP response as a
+    plain dict. _require_live_orderbook used `getattr(book, 'bids', None)` —
+    which silently returns None for dicts — so every BUY's price-fetch step
+    raised "No live orderbook levels" even on markets with 50 asks + 24 bids.
+    Six conviction-tier proposals (08:12–09:05 UTC) failed this way before
+    the fix.
+    """
+
+    def test_v2_dict_orderbook_passes_when_levels_present(self):
+        from polymarket_mvp.poly_executor import _require_live_orderbook
+        client = Mock()
+        # Actual V2 wire shape (captured live from CLOB on 2026-05-13).
+        client.get_order_book.return_value = {
+            "market": "0xabc",
+            "asset_id": "9685802300939575294413700412851149300941364303265925763014674648159146573840",
+            "timestamp": "1747119480000",
+            "bids": [
+                {"price": "0.01", "size": "1120.41"},
+                {"price": "0.02", "size": "5925.61"},
+            ],
+            "asks": [
+                {"price": "0.99", "size": "1627.58"},
+                {"price": "0.98", "size": "2250"},
+            ],
+            "tick_size": "0.01",
+            "neg_risk": False,
+        }
+        result = _require_live_orderbook(client, "9685802300939575294413700412851149300941364303265925763014674648159146573840")
+        self.assertEqual(result["asks"], 2)
+        self.assertEqual(result["bids"], 2)
+
+    def test_v2_dict_orderbook_raises_when_both_sides_empty(self):
+        from polymarket_mvp.poly_executor import _require_live_orderbook
+        client = Mock()
+        client.get_order_book.return_value = {
+            "market": "0xabc",
+            "asset_id": "tok",
+            "bids": [],
+            "asks": [],
+        }
+        with self.assertRaises(RuntimeError) as ctx:
+            _require_live_orderbook(client, "tok")
+        self.assertIn("No live orderbook levels", str(ctx.exception))
+
+    def test_v1_attr_orderbook_still_works(self):
+        """Defensive: even if a future wrapper or shim returns an object with
+        .bids/.asks attributes again (e.g. OrderBookSummary), parsing must
+        keep working — V2 only ships dicts today, but the gate isn't locked to
+        either shape."""
+        from polymarket_mvp.poly_executor import _require_live_orderbook
+        class _BookLike:
+            bids = [{"price": "0.5", "size": "100"}]
+            asks = [{"price": "0.6", "size": "50"}]
+        client = Mock()
+        client.get_order_book.return_value = _BookLike()
+        result = _require_live_orderbook(client, "tok")
+        self.assertEqual(result["asks"], 1)
+        self.assertEqual(result["bids"], 1)
+
+
 class ClobSuccessFalseTests(unittest.TestCase):
     """Regression: HTTP 200 with {success: false} from post_order must NOT
     be recorded as status='submitted'. Before the fix, _normalize_order_status
