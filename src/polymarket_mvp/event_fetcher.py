@@ -422,9 +422,17 @@ class GdeltAdapter:
         from .services.event_cluster_service import classify_market_class
 
         # GDELT is overkill for sports (chronicles every match endlessly) and
-        # near-useless for esports / weather. Limit to politics + tech + other.
+        # near-useless for esports / weather. Use a defensive double-gate:
+        # skip if classifier says non-political-tech-other, AND skip if the
+        # question contains common sports keywords (since the classifier
+        # often misroutes sports as 'other').
         market_class = classify_market_class(market)
         if market_class not in ("politics", "tech", "other"):
+            return []
+        question_lower = (market.get("question") or "").lower()
+        sports_hints = ("draw", " win on ", "vs.", "vs ", "o/u", "over/under",
+                        "both teams to score", "btts", "winner")
+        if any(hint in question_lower for hint in sports_hints):
             return []
         query = market_topic(market) or (market.get("question") or "")[:80]
         if not query:
@@ -616,14 +624,15 @@ class TheOddsApiAdapter:
 
     def fetch(self, market: Mapping[str, Any]) -> List[Dict[str, Any]]:
         from .db import connect_db, adapter_budget_calls_today, adapter_budget_increment
-        from .services.event_cluster_service import classify_market_class
 
         api_key = (os.getenv("ODDS_API_KEY") or "").strip()
         if not api_key:
             return []
-        market_class = classify_market_class(market)
-        if market_class not in ("sports_winner", "sports_totals"):
-            return []
+        # Gate on whether we can map this market to a known league keyword.
+        # classify_market_class returns 'other' for many Polymarket sports
+        # questions ("Will A vs B end in a draw?"); using _resolve_sport as
+        # the primary gate is more accurate because it directly looks for
+        # league/team keywords we have Odds-API mappings for.
         sport_key = self._resolve_sport(market)
         if not sport_key:
             return []
