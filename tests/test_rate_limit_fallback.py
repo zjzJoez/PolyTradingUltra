@@ -152,18 +152,21 @@ class DeepSeekFallbackTests(unittest.TestCase):
             openclaw_adapter.chat_payload("sys", "user")
         mock_deepseek.assert_not_called()
 
-    def test_fallback_failure_raises_primary_error(self):
-        """If both primary and fallback fail, the primary error is raised
-        (the fallback failure goes to stderr but doesn't shadow the
-        original cause)."""
+    def test_fallback_failure_returns_none(self):
+        """When BOTH primary (Codex) and fallback (DeepSeek) fail, chat_payload
+        must return None instead of raising. The previous behavior of raising
+        the primary error propagated all the way to autopilot._tick and showed
+        as 'propose error: Traceback' in the systemd log on every cycle,
+        dragging the entire pipeline into CRITICAL-lag state. Returning None
+        lets the proposer log 'no proposals this cycle' and continue cleanly."""
         primary = RuntimeError("Codex CLI failed: original error")
         with patch("polymarket_mvp.services.openclaw_adapter._codex_payload") as mock_codex, \
-             patch("polymarket_mvp.services.openclaw_adapter._deepseek_payload") as mock_deepseek:
+             patch("polymarket_mvp.services.openclaw_adapter._deepseek_payload") as mock_deepseek, \
+             patch("polymarket_mvp.services.openclaw_adapter._record_dual_failure"):
             mock_codex.side_effect = primary
-            mock_deepseek.side_effect = RuntimeError("DeepSeek HTTP 401: bad key")
-            with self.assertRaises(RuntimeError) as ctx:
-                openclaw_adapter.chat_payload("sys", "user")
-        self.assertIs(ctx.exception, primary)
+            mock_deepseek.side_effect = RuntimeError("DeepSeek HTTP 402: Insufficient Balance")
+            result = openclaw_adapter.chat_payload("sys", "user")
+        self.assertIsNone(result)
 
     def test_fallback_disabled_by_default(self):
         """No OPENCLAW_FALLBACK_PROVIDER → no fallback call, primary error propagates."""

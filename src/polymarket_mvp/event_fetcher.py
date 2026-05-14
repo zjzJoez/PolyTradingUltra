@@ -966,8 +966,14 @@ def provider_names(value: str | None) -> List[str]:
         parts.append("odds_api")
     if (_os.getenv("REDDIT_CLIENT_ID") or "").strip() and (_os.getenv("REDDIT_CLIENT_SECRET") or "").strip():
         parts.append("reddit")
-    # Existing free/soft-fail adapters.
-    parts.extend(["cryptopanic", "web_search"])
+    # cryptopanic requires an auth token; without it the adapter returned
+    # soft-fail stubs on every tick (654 stub rows in 12h, all "temporarily
+    # unavailable" — pure noise in the LLM payload). Gate explicitly so a
+    # missing key means "this adapter is silently absent" not "this adapter
+    # emits 8 useless rows per tick".
+    if (_os.getenv("CRYPTOPANIC_AUTH_TOKEN") or "").strip():
+        parts.append("cryptopanic")
+    parts.append("web_search")
     default = ",".join(parts)
     raw = value or default
     return [item.strip() for item in raw.split(",") if item.strip()]

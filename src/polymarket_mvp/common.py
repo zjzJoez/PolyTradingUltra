@@ -320,6 +320,59 @@ def clamp_order_live_ttl(agent_ttl: int | None) -> int:
     return max(floor, effective)
 
 
+def compute_order_ttl(
+    market_json: Any,
+    *,
+    agent_ttl: int | None = None,
+    now_iso: str | None = None,
+) -> int:
+    """Compute an order's live TTL with awareness of the underlying event's
+    start/end time. Designed for pre-match sports markets where the static
+    POLY_ORDER_MAX_LIVE_TTL_SECONDS=3600 cap was producing every limit order
+    auto-cancelling after 1h while the actual match was still 4-10 hours away.
+
+    Logic:
+      1. Start from clamp_order_live_ttl(agent_ttl) — the existing system bound.
+      2. If the market has an end_date in the future, allow extending TTL up to
+         `end_date - now - SAFETY_BUFFER` (default 10 minutes), capped at
+         POLY_ORDER_DYNAMIC_TTL_MAX_SECONDS (default 21600 = 6h).
+      3. If end_date is already past, return the system floor (15s) — the
+         executor will skip placing the order anyway.
+      4. If end_date is missing or unparseable, return the system clamp.
+
+    Env knobs:
+      POLY_ORDER_MAX_LIVE_TTL_SECONDS   — existing static ceiling (used as fallback)
+      POLY_ORDER_DYNAMIC_TTL_MAX_SECONDS — new dynamic ceiling (default 21600 = 6h)
+      POLY_ORDER_DYNAMIC_TTL_SAFETY_SEC — buffer before market close (default 600 = 10min)
+    """
+    static_clamp = clamp_order_live_ttl(agent_ttl)
+    end_date = None
+    try:
+        if isinstance(market_json, dict):
+            end_date = market_json.get("end_date") or market_json.get("endDate")
+    except Exception:
+        end_date = None
+    if not end_date:
+        return static_clamp
+    try:
+        end_dt = parse_iso8601(str(end_date))
+    except Exception:
+        return static_clamp
+    now_dt = parse_iso8601(now_iso or utc_now_iso())
+    seconds_remaining = int((end_dt - now_dt).total_seconds())
+    if seconds_remaining <= 0:
+        return 15  # market expired/expiring — system floor
+    safety_buffer = get_env_int("POLY_ORDER_DYNAMIC_TTL_SAFETY_SEC", 600)
+    dynamic_ceiling = get_env_int("POLY_ORDER_DYNAMIC_TTL_MAX_SECONDS", 21600)
+    dynamic_max = max(15, min(seconds_remaining - safety_buffer, dynamic_ceiling))
+    # If agent set a TTL, honor it as a lower bound; otherwise use the larger
+    # of static and dynamic. This lets dynamic raise the ceiling for far-future
+    # matches without breaking near-expiry markets.
+    if agent_ttl:
+        return max(15, min(agent_ttl, dynamic_max))
+    return max(static_clamp, dynamic_max)
+
+
 KNOWN_SYMBOLS = {
     "BTC": ("BTC", "BITCOIN"),
     "ETH": ("ETH", "ETHEREUM"),

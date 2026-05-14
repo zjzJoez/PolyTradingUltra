@@ -622,9 +622,22 @@ def _fallback_provider() -> str | None:
 
 
 def _try_fallback(provider: str, system_prompt: str, user_prompt: str, temperature: float, primary_exc: BaseException) -> Any:
-    """Run the fallback provider after the primary raised. If the fallback
-    itself fails, raise the *original* primary exception — the fallback's
-    failure is logged but doesn't shadow what the caller cares about."""
+    """Run the fallback provider after the primary raised.
+
+    Returns the fallback's payload on success.
+
+    On fallback failure: logs both failures and **returns None** instead of
+    re-raising. The proposer treats None as "no LLM response this cycle" and
+    skips the tick cleanly — much better than letting the exception bubble
+    up to autopilot._tick where it shows as "propose error: Traceback" and
+    drags the whole pipeline into a CRITICAL-lag state.
+
+    Common failure modes this protects against:
+      - DeepSeek HTTP 402 "Insufficient Balance" (account out of credit)
+      - DeepSeek HTTP 429 (rate-limited)
+      - DeepSeek HTTPS timeout / connection reset
+      - OPENCLAW_FALLBACK_PROVIDER set to an unknown value
+    """
     print(
         f"[openclaw] primary transport failed ({type(primary_exc).__name__}): "
         f"{str(primary_exc)[:160]} — falling back to {provider}",
@@ -634,17 +647,39 @@ def _try_fallback(provider: str, system_prompt: str, user_prompt: str, temperatu
     try:
         if provider == "deepseek":
             return _deepseek_payload(system_prompt, user_prompt, temperature=temperature)
-        # Unknown provider name in env — surface clearly so the user notices
-        # rather than silently swallowing.
         raise RuntimeError(f"OPENCLAW_FALLBACK_PROVIDER={provider!r} not recognized")
     except Exception as fallback_exc:
         print(
             f"[openclaw] fallback {provider} also failed ({type(fallback_exc).__name__}): "
-            f"{str(fallback_exc)[:160]}",
+            f"{str(fallback_exc)[:160]} — propose will skip this cycle",
             file=sys.stderr,
             flush=True,
         )
-        raise primary_exc from fallback_exc
+        _record_dual_failure(primary_exc, fallback_exc)
+        return None
+
+
+def _record_dual_failure(primary_exc: BaseException, fallback_exc: BaseException) -> None:
+    """Record a 'both LLM transports failed' event in llm_rate_limit_events so
+    operators can spot prolonged outages without grepping journal. We treat
+    this as a recoverable rate-limit-class event (60s cooldown) so the next
+    tick will at least try again."""
+    try:
+        from ..common import utc_now_iso
+        from ..db import connect_db
+        message = f"primary={type(primary_exc).__name__}: {str(primary_exc)[:120]} | fallback={type(fallback_exc).__name__}: {str(fallback_exc)[:120]}"
+        with connect_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO llm_rate_limit_events (hit_at, stderr_snippet, cooldown_applied_sec, consecutive_count)
+                VALUES (?, ?, ?, ?)
+                """,
+                (utc_now_iso(), message[:500], 60, 1),
+            )
+            conn.commit()
+    except Exception:
+        # Logging mustn't itself blow up the propose path. Swallow silently.
+        pass
 
 
 def chat_payload(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> Any | None:

@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .common import blocked_market_reason, clamp_order_live_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, parse_iso8601, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
+from .common import blocked_market_reason, clamp_order_live_ttl, compute_order_ttl, dump_json, get_env_float, get_env_int, load_repo_env, market_reference_price, parse_iso8601, proposal_id_for, read_proposals, resolve_token_id, utc_now_iso
 from .db import connect_db, has_active_execution, has_active_market_outcome_exposure, init_db, latest_execution, list_proposals_by_status, proposal_record, record_execution, update_proposal_status
 from .services.kill_switch_service import check_kill_switch
 from .services.shadow_service import create_shadow_execution
@@ -612,7 +612,14 @@ def execute_record(conn, record: Dict[str, Any], mode: str, *, session_state: Di
     requested_size_usdc = proposal["recommended_size_usdc"]
     share_size = requested_size_usdc / requested_price if requested_price else 0.0
     token_id = resolve_token_id(record["market"]["market_json"], proposal["outcome"])
-    order_live_ttl = clamp_order_live_ttl(record.get("order_live_ttl_seconds"))
+    # Dynamic TTL aware of the market's actual end_date. Static 1h cap was
+    # auto-cancelling every pre-match sports limit order before the match
+    # even started; compute_order_ttl extends TTL up to (end_date - now - buffer)
+    # for far-future matches, capped at POLY_ORDER_DYNAMIC_TTL_MAX_SECONDS.
+    order_live_ttl = compute_order_ttl(
+        record.get("market", {}).get("market_json") or {},
+        agent_ttl=record.get("order_live_ttl_seconds"),
+    )
     idempotency_key = f"{record['proposal_id']}-{mode}-{uuid.uuid4().hex[:8]}"
     order_intent = {
         "proposal_id": record["proposal_id"],

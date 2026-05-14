@@ -365,12 +365,14 @@ class ProviderNamesTests(unittest.TestCase):
             "ODDS_API_KEY": "",
             "REDDIT_CLIENT_ID": "",
             "REDDIT_CLIENT_SECRET": "",
+            "CRYPTOPANIC_AUTH_TOKEN": "",
         }, clear=False):
             names = provider_names(None)
         self.assertIn("polymarket_historical", names)
         self.assertIn("gdelt", names)
-        self.assertIn("cryptopanic", names)
         self.assertIn("web_search", names)
+        # cryptopanic now gated on token — used to spam soft_fail stubs without one
+        self.assertNotIn("cryptopanic", names)
         self.assertNotIn("tavily", names)
         self.assertNotIn("odds_api", names)
         self.assertNotIn("perplexity", names)
