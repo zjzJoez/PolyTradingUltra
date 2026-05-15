@@ -212,10 +212,16 @@ def lookup_elo(team_name: str, *, force_refresh: bool = False, session: requests
 # rates are ~25-30% globally; we use 26% as the unconditional prior and let
 # Elo gap shift it (closer matches → more draws).
 DEFAULT_HOME_ADVANTAGE = 65.0  # ELO points; calibrated to ~5pp lift for home team
-DRAW_BASE_RATE = 0.26
-DRAW_GAP_SLOPE = 0.0005       # draw rate falls as |Elo gap| grows
-DRAW_MIN = 0.10
-DRAW_MAX = 0.32
+# Draw-rate parameters re-calibrated 2026-05-15 after first backtest
+# (n=13 Polymarket draw markets resolved over 30d). Actual draw rate 23.1%;
+# original parameters (slope 0.0005, base 0.26) gave model predictions
+# averaging 16.2% — systematically under-estimating draws. Empirically
+# European football draws sit at 25-28% even at large Elo gaps. New
+# parameters keep draw between 17% (huge favorites) and 28% (equal teams).
+DRAW_BASE_RATE = 0.28
+DRAW_GAP_SLOPE = 0.00015       # draw rate falls as |Elo gap| grows (much shallower)
+DRAW_MIN = 0.16
+DRAW_MAX = 0.30
 
 
 def _logistic_p_home_vs_away_only(elo_home_eff: float, elo_away: float) -> float:
@@ -258,13 +264,12 @@ class MarketSide:
     UNKNOWN = "unknown"
 
 
-def _parse_question(question: str) -> Tuple[str, str, str] | None:
+def _parse_question(question: str) -> Tuple[str, str | None, str] | None:
     """Return (team_a, team_b, side) where side ∈ {HOME_WIN, AWAY_WIN, DRAW}.
 
-    team_a is presumed home; if a "vs" question doesn't carry home info we
-    default to question-order (first team = home), since Polymarket questions
-    usually follow the home-first convention. We're aware this is a best-
-    effort heuristic.
+    For single-team win questions like "Will Real Madrid win on 2026-05-15?"
+    team_b is returned as None — the caller is expected to look up the opponent
+    via market_event_links / event_clusters / other markets in the same fixture.
     """
     if not question:
         return None
@@ -274,16 +279,56 @@ def _parse_question(question: str) -> Tuple[str, str, str] | None:
     m = re.match(r"^will\s+(.+?)\s+vs\.?\s+(.+?)\s+end\s+in\s+a\s+draw", lq)
     if m:
         return (m.group(1), m.group(2), MarketSide.DRAW)
-    # "Will A win on YYYY-MM-DD?" — single-team win market. We have no
-    # opponent in the question, so this needs an outside lookup. Return
-    # None for now; future iteration can join with event_clusters to find
-    # the opponent.
-    if re.match(r"^will\s+.+?\s+win\s+on\b", lq):
-        return None
+    # "Will A win on YYYY-MM-DD?" — single-team. Opponent looked up via fixture.
+    m = re.match(r"^will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}", lq)
+    if m:
+        return (m.group(1), None, MarketSide.HOME_WIN)
     # "Will A beat B?" / "Will A defeat B?"
     m = re.match(r"^will\s+(.+?)\s+(?:beat|defeat|outscore)\s+(.+?)\b", lq)
     if m:
         return (m.group(1), m.group(2), MarketSide.HOME_WIN)
+    return None
+
+
+def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized: str) -> str | None:
+    """For 'Will A win on date?' markets, find the opponent by looking up
+    other markets in the same event_cluster that have both teams in the
+    question (typically the "Will A vs B end in a draw?" market for the
+    same fixture). Returns the opponent's name (raw, not normalized)."""
+    cluster_id = market.get("event_cluster_id")
+    if not cluster_id:
+        return None
+    try:
+        from ..db import connect_db
+    except Exception:
+        return None
+    try:
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ms.question
+                FROM market_snapshots ms
+                JOIN market_event_links mel ON mel.market_id = ms.market_id
+                WHERE mel.event_cluster_id = ?
+                  AND ms.market_id != ?
+                  AND ms.question LIKE '%vs%'
+                LIMIT 10
+                """,
+                (int(cluster_id), str(market.get("market_id") or "")),
+            ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        q = (row["question"] or "").strip()
+        parsed = _parse_question(q)
+        if parsed is None:
+            continue
+        a, b, _ = parsed
+        if not a or not b:
+            continue
+        na, nb = normalize_team(a), normalize_team(b)
+        if known_team_normalized in (na, nb):
+            return b if known_team_normalized == na else a
     return None
 
 
@@ -344,6 +389,27 @@ def signal_for_market(
     if parsed is None:
         return None
     team_a, team_b, side = parsed
+    # If single-team-win market (team_b is None), look up opponent via
+    # event_cluster sibling markets. Falls back gracefully if cluster
+    # membership isn't recorded.
+    if team_b is None:
+        team_b = _find_opponent_via_cluster(market, normalize_team(team_a))
+        if team_b is None:
+            return EloSignal(
+                market_id=str(market.get("market_id") or ""),
+                outcome="?",
+                recommendation="no_match",
+                model_p=0.0,
+                market_p=0.0,
+                edge=0.0,
+                elo_home=0.0,
+                elo_away=0.0,
+                side_from_question=side,
+                raw_probs={},
+                team_a=team_a,
+                team_b="",
+                reasoning=f"single-team-win market but no opponent found in event_cluster (mkt={market.get('market_id')})",
+            )
     elo_home = lookup_elo(team_a, session=session)
     elo_away = lookup_elo(team_b, session=session)
     if elo_home is None or elo_away is None:

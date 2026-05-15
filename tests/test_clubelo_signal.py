@@ -132,9 +132,16 @@ class ParseQuestionTests(unittest.TestCase):
         self.assertIn("madrid", a.lower())
         self.assertEqual(side, "home_win")
 
+    def test_single_team_win_question_returns_partial(self):
+        # "Will X win on YYYY-MM-DD?" — opponent is None, looked up by caller
+        result = _parse_question("Will Lens win on 2026-05-13?")
+        self.assertIsNotNone(result)
+        a, b, side = result
+        self.assertEqual(a, "lens")
+        self.assertIsNone(b)
+        self.assertEqual(side, "home_win")
+
     def test_unsupported_questions_return_none(self):
-        # Single-team "Will X win on..." has no opponent in the question
-        self.assertIsNone(_parse_question("Will Lens win on 2026-05-13?"))
         # O/U markets — different shape
         self.assertIsNone(_parse_question("Real Madrid vs. Barcelona: O/U 2.5"))
         # Empty
