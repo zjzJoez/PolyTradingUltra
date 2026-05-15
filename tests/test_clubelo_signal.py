@@ -85,27 +85,45 @@ class BuildNormalizedIndexTests(unittest.TestCase):
 
 class ComputeThreeWayProbsTests(unittest.TestCase):
     def test_strong_home_favorite(self):
-        # Barcelona (1969) home vs Alaves (1636) — Barca should be heavy fav
-        probs = compute_three_way_probs(elo_home=1969, elo_away=1636)
+        # Barcelona (1969) home vs Alaves (1636) — Barca should be heavy fav.
+        # Pass explicit params so test isn't fragile to default tuning.
+        probs = compute_three_way_probs(
+            elo_home=1969, elo_away=1636,
+            home_advantage=65.0, logistic_divisor=400.0,
+        )
         self.assertGreater(probs["home"], 0.65)
         self.assertLess(probs["away"], 0.15)
         self.assertAlmostEqual(sum(probs.values()), 1.0, places=5)
 
     def test_strong_underdog_at_home(self):
-        # Alaves (1636) HOME vs Barca (1969) — Alaves still underdog but
-        # home advantage matters
-        probs_alaves_home = compute_three_way_probs(elo_home=1636, elo_away=1969)
-        probs_alaves_away = compute_three_way_probs(elo_home=1969, elo_away=1636)
-        # Home advantage means Alaves's win prob is higher when at home vs away
+        # Alaves (1636) HOME vs Barca (1969) — with explicit home_advantage,
+        # Alaves's win prob is higher when at home than when away.
+        probs_alaves_home = compute_three_way_probs(
+            elo_home=1636, elo_away=1969,
+            home_advantage=65.0, logistic_divisor=400.0,
+        )
+        probs_alaves_away = compute_three_way_probs(
+            elo_home=1969, elo_away=1636,
+            home_advantage=65.0, logistic_divisor=400.0,
+        )
         self.assertGreater(probs_alaves_home["home"], probs_alaves_away["away"])
 
     def test_equal_teams(self):
-        # Same ELO → home favored only by home_advantage
-        probs = compute_three_way_probs(elo_home=1700, elo_away=1700)
+        # Same ELO → home favored only by explicit home_advantage
+        probs = compute_three_way_probs(
+            elo_home=1700, elo_away=1700,
+            home_advantage=65.0, logistic_divisor=400.0,
+        )
         # With home_advantage=65, home should win more often than away
         self.assertGreater(probs["home"], probs["away"])
         # Equal teams → high draw rate
         self.assertGreater(probs["draw"], 0.2)
+        self.assertAlmostEqual(sum(probs.values()), 1.0, places=5)
+
+    def test_default_home_advantage_is_zero(self):
+        # Verify the default behavior: equal teams → roughly symmetric
+        probs = compute_three_way_probs(elo_home=1700, elo_away=1700)
+        self.assertAlmostEqual(probs["home"], probs["away"], places=3)
         self.assertAlmostEqual(sum(probs.values()), 1.0, places=5)
 
     def test_large_gap_reduces_draw(self):

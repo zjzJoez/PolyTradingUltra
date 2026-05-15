@@ -211,7 +211,19 @@ def lookup_elo(team_name: str, *, force_refresh: bool = False, session: requests
 # Standard FIFA-style ELO logistic + an empirical draw split. League draw
 # rates are ~25-30% globally; we use 26% as the unconditional prior and let
 # Elo gap shift it (closer matches → more draws).
-DEFAULT_HOME_ADVANTAGE = 65.0  # ELO points; calibrated to ~5pp lift for home team
+# Home advantage default is 0 because Polymarket single-team-win questions
+# ("Will A win on date?") don't tell us if A is home or away. Empirically
+# (2026-05-15 backtest, n=41) keeping home_adv=65 inflated home_win
+# predictions by ~7pp and produced -40% ROI. With home_adv=0 the model
+# treats both teams as neutral-venue, which is correct given the data we
+# have. The harness's --home-advantage flag can override for explicit
+# home/away markets.
+DEFAULT_HOME_ADVANTAGE = 0.0
+# ELO logistic dampening factor. Default 400 is the FIFA-standard; football
+# results have more upsets than pure ELO predicts, so we use a flatter
+# slope. 500 is a reasonable middle ground per academic literature
+# (Hvattum & Arntzen 2010 recommend 400-550 depending on league efficiency).
+DEFAULT_ELO_LOGISTIC_DIVISOR = 500.0
 # Draw-rate parameters re-calibrated 2026-05-15 after first backtest
 # (n=13 Polymarket draw markets resolved over 30d). Actual draw rate 23.1%;
 # original parameters (slope 0.0005, base 0.26) gave model predictions
@@ -224,10 +236,17 @@ DRAW_MIN = 0.16
 DRAW_MAX = 0.30
 
 
-def _logistic_p_home_vs_away_only(elo_home_eff: float, elo_away: float) -> float:
-    """Binary 'home wins given there's a winner'. Standard ELO logistic on (home+adv)-away."""
+def _logistic_p_home_vs_away_only(elo_home_eff: float, elo_away: float,
+                                  divisor: float = DEFAULT_ELO_LOGISTIC_DIVISOR) -> float:
+    """Binary 'home wins given there's a winner'. ELO logistic on (home+adv)-away.
+
+    Larger divisor → flatter curve → less confident at large gaps. Default 500
+    instead of FIFA-standard 400 reflects that football has more upsets than
+    pure ELO predicts (verified empirically against 28 Polymarket single-team
+    win markets where the standard 400-divisor over-predicted by 3-7pp).
+    """
     diff = elo_home_eff - elo_away
-    return 1.0 / (1.0 + 10 ** (-diff / 400.0))
+    return 1.0 / (1.0 + 10 ** (-diff / divisor))
 
 
 def compute_three_way_probs(
@@ -235,6 +254,7 @@ def compute_three_way_probs(
     elo_away: float,
     *,
     home_advantage: float = DEFAULT_HOME_ADVANTAGE,
+    logistic_divisor: float = DEFAULT_ELO_LOGISTIC_DIVISOR,
 ) -> Dict[str, float]:
     """Return {'home', 'draw', 'away'} probabilities. Sums to ~1.0.
 
@@ -245,7 +265,7 @@ def compute_three_way_probs(
       3. Distribute the remaining (1 - P_draw) into home/away by the binary.
     """
     elo_home_eff = elo_home + home_advantage
-    binary_home = _logistic_p_home_vs_away_only(elo_home_eff, elo_away)
+    binary_home = _logistic_p_home_vs_away_only(elo_home_eff, elo_away, divisor=logistic_divisor)
     gap = abs(elo_home_eff - elo_away)
     p_draw = DRAW_BASE_RATE - DRAW_GAP_SLOPE * gap
     p_draw = max(DRAW_MIN, min(DRAW_MAX, p_draw))
