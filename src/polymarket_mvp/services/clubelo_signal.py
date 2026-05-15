@@ -290,13 +290,19 @@ def _parse_question(question: str) -> Tuple[str, str | None, str] | None:
     return None
 
 
-def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized: str) -> str | None:
+def _find_opponent_via_fixture(market: Mapping[str, Any], known_team_normalized: str) -> str | None:
     """For 'Will A win on date?' markets, find the opponent by looking up
-    other markets in the same event_cluster that have both teams in the
-    question (typically the "Will A vs B end in a draw?" market for the
-    same fixture). Returns the opponent's name (raw, not normalized)."""
+    other markets with the SAME end_date that have both teams in the question.
+
+    Empirically (verified 2026-05-15): Polymarket creates separate markets for
+    each fixture's win-A / win-B / draw / O-U-2.5 / O-U-3.5 / BTTS options.
+    All share the same end_date down to the minute. Joining on end_date is
+    far more reliable than event_cluster_id (which the bot stores per-market
+    rather than per-fixture).
+    """
     market_id = str(market.get("market_id") or "")
-    if not market_id:
+    end_date = market.get("end_date")
+    if not market_id or not end_date:
         return None
     try:
         from ..db import connect_db
@@ -304,32 +310,22 @@ def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized:
         return None
     try:
         with connect_db() as conn:
-            # Resolve event_cluster_id from market_event_links (it's not a
-            # column on market_snapshots; the relationship lives in the
-            # market_event_links join table).
-            cluster_row = conn.execute(
-                "SELECT event_cluster_id FROM market_event_links WHERE market_id = ? LIMIT 1",
-                (market_id,),
-            ).fetchone()
-            if cluster_row is None:
-                return None
-            cluster_id = cluster_row["event_cluster_id"] if hasattr(cluster_row, "keys") else cluster_row[0]
-            if not cluster_id:
-                return None
             rows = conn.execute(
                 """
-                SELECT DISTINCT ms.question
-                FROM market_snapshots ms
-                JOIN market_event_links mel ON mel.market_id = ms.market_id
-                WHERE mel.event_cluster_id = ?
-                  AND ms.market_id != ?
-                  AND (ms.question LIKE '%vs%' OR ms.question LIKE '%vs.%')
-                LIMIT 10
+                SELECT DISTINCT question
+                FROM market_snapshots
+                WHERE end_date = ?
+                  AND market_id != ?
+                  AND (question LIKE '%vs.%' OR question LIKE '% vs %')
+                LIMIT 20
                 """,
-                (int(cluster_id), market_id),
+                (end_date, market_id),
             ).fetchall()
     except Exception:
         return None
+    # First pass: prefer the explicit "Will A vs B end in a draw?" form
+    # because _parse_question handles it cleanly. Fall back to O/U-style
+    # "A vs. B: O/U X" by stripping the trailing qualifier.
     for row in rows:
         q = (row["question"] or "").strip()
         parsed = _parse_question(q)
@@ -339,8 +335,25 @@ def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized:
         if not a or not b:
             continue
         na, nb = normalize_team(a), normalize_team(b)
-        if known_team_normalized in (na, nb):
-            return b if known_team_normalized == na else a
+        if known_team_normalized == na:
+            return b
+        if known_team_normalized == nb:
+            return a
+    # Second pass: O/U or BTTS-style "Team A vs. Team B: <qualifier>"
+    for row in rows:
+        q = (row["question"] or "").strip()
+        # Strip trailing "[: ...]" qualifier
+        m = re.match(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s*:.*)?$", q, flags=re.IGNORECASE)
+        if not m:
+            continue
+        a, b = m.group(1).strip(), m.group(2).strip()
+        if not a or not b:
+            continue
+        na, nb = normalize_team(a), normalize_team(b)
+        if known_team_normalized == na:
+            return b
+        if known_team_normalized == nb:
+            return a
     return None
 
 
@@ -405,7 +418,7 @@ def signal_for_market(
     # event_cluster sibling markets. Falls back gracefully if cluster
     # membership isn't recorded.
     if team_b is None:
-        team_b = _find_opponent_via_cluster(market, normalize_team(team_a))
+        team_b = _find_opponent_via_fixture(market, normalize_team(team_a))
         if team_b is None:
             return EloSignal(
                 market_id=str(market.get("market_id") or ""),
