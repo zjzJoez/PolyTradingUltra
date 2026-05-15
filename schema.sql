@@ -87,6 +87,30 @@ CREATE TABLE IF NOT EXISTS adapter_budget_tracking (
 
 CREATE INDEX IF NOT EXISTS idx_adapter_budget_date ON adapter_budget_tracking(date_utc);
 
+-- Deterministic-signal shadow tracking (clubelo, pinnacle, dixon-coles, ...).
+-- See migration 20260515_v13_signal_events.sql for rationale.
+CREATE TABLE IF NOT EXISTS signal_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_name TEXT NOT NULL,
+  market_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  recommendation TEXT NOT NULL CHECK(recommendation IN ('bet', 'skip', 'no_match')),
+  model_p REAL,
+  market_p REAL,
+  edge REAL,
+  size_recommendation_usdc REAL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  generated_at TEXT NOT NULL,
+  FOREIGN KEY (market_id) REFERENCES market_snapshots(market_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_events_signal_market
+  ON signal_events(signal_name, market_id);
+CREATE INDEX IF NOT EXISTS idx_signal_events_generated
+  ON signal_events(generated_at);
+CREATE INDEX IF NOT EXISTS idx_signal_events_recommendation
+  ON signal_events(signal_name, recommendation, generated_at);
+
 CREATE TABLE IF NOT EXISTS research_memos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id TEXT NOT NULL,
