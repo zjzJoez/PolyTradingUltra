@@ -295,8 +295,8 @@ def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized:
     other markets in the same event_cluster that have both teams in the
     question (typically the "Will A vs B end in a draw?" market for the
     same fixture). Returns the opponent's name (raw, not normalized)."""
-    cluster_id = market.get("event_cluster_id")
-    if not cluster_id:
+    market_id = str(market.get("market_id") or "")
+    if not market_id:
         return None
     try:
         from ..db import connect_db
@@ -304,6 +304,18 @@ def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized:
         return None
     try:
         with connect_db() as conn:
+            # Resolve event_cluster_id from market_event_links (it's not a
+            # column on market_snapshots; the relationship lives in the
+            # market_event_links join table).
+            cluster_row = conn.execute(
+                "SELECT event_cluster_id FROM market_event_links WHERE market_id = ? LIMIT 1",
+                (market_id,),
+            ).fetchone()
+            if cluster_row is None:
+                return None
+            cluster_id = cluster_row["event_cluster_id"] if hasattr(cluster_row, "keys") else cluster_row[0]
+            if not cluster_id:
+                return None
             rows = conn.execute(
                 """
                 SELECT DISTINCT ms.question
@@ -311,10 +323,10 @@ def _find_opponent_via_cluster(market: Mapping[str, Any], known_team_normalized:
                 JOIN market_event_links mel ON mel.market_id = ms.market_id
                 WHERE mel.event_cluster_id = ?
                   AND ms.market_id != ?
-                  AND ms.question LIKE '%vs%'
+                  AND (ms.question LIKE '%vs%' OR ms.question LIKE '%vs.%')
                 LIMIT 10
                 """,
-                (int(cluster_id), str(market.get("market_id") or "")),
+                (int(cluster_id), market_id),
             ).fetchall()
     except Exception:
         return None
