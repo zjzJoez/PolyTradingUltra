@@ -45,32 +45,12 @@ from .clubelo_signal import (
     _parse_question,
     normalize_team,
 )
+from .sport_keyword_map import SPORT_KEYWORDS
 
 
 DEFAULT_EDGE_THRESHOLD = 0.03  # 3pp absolute edge over vig-removed consensus
 DEFAULT_DAILY_CAP = 15          # mirrors TheOddsApiAdapter
 SIGNAL_NAME = "odds_divergence"
-
-
-# Sport-keyword map — copied from TheOddsApiAdapter to keep the signal module
-# independent of the context-adapter wiring. Update both if leagues change.
-SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
-    ("FC Barcelona", "soccer_spain_la_liga"),
-    ("Real Madrid", "soccer_spain_la_liga"),
-    ("Liga MX", "soccer_mexico_ligamx"),
-    ("Premier League", "soccer_epl"),
-    ("EFL Championship", "soccer_efl_champ"),
-    ("Bundesliga", "soccer_germany_bundesliga"),
-    ("Serie A", "soccer_italy_serie_a"),
-    ("Ligue 1", "soccer_france_ligue_one"),
-    ("MLS", "soccer_usa_mls"),
-    ("UEFA Champions League", "soccer_uefa_champs_league"),
-    ("La Liga", "soccer_spain_la_liga"),
-    ("NBA", "basketball_nba"),
-    ("NFL", "americanfootball_nfl"),
-    ("MLB", "baseball_mlb"),
-    ("NHL", "icehockey_nhl"),
-)
 
 
 def _resolve_sport_key(market: Mapping[str, Any]) -> str | None:

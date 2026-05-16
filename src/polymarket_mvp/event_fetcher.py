@@ -601,23 +601,12 @@ class TheOddsApiAdapter:
     default_daily_cap = 15  # 15/day * 30 = 450/month — safe under 500
 
     # Polymarket question keyword → Odds API sport key (priority order).
-    SPORT_KEYWORDS = (
-        ("FC Barcelona", "soccer_spain_la_liga"),
-        ("Real Madrid", "soccer_spain_la_liga"),
-        ("Liga MX", "soccer_mexico_ligamx"),
-        ("Premier League", "soccer_epl"),
-        ("EFL Championship", "soccer_efl_champ"),
-        ("Bundesliga", "soccer_germany_bundesliga"),
-        ("Serie A", "soccer_italy_serie_a"),
-        ("Ligue 1", "soccer_france_ligue_one"),
-        ("MLS", "soccer_usa_mls"),
-        ("UEFA Champions League", "soccer_uefa_champs_league"),
-        ("La Liga", "soccer_spain_la_liga"),
-        ("NBA", "basketball_nba"),
-        ("NFL", "americanfootball_nfl"),
-        ("MLB", "baseball_mlb"),
-        ("NHL", "icehockey_nhl"),
-    )
+    # Shared with services.odds_divergence_signal via services.sport_keyword_map
+    # so the two adapters stay in sync — see that module for the full list
+    # (~200 entries covering 25+ leagues including 2. Bundesliga, J-League,
+    # Chinese Super League, Brazilian Serie A, Argentine Primera, etc.).
+    from .services.sport_keyword_map import SPORT_KEYWORDS as _SHARED_SPORT_KEYWORDS
+    SPORT_KEYWORDS = _SHARED_SPORT_KEYWORDS
 
     def __init__(self, session: requests.Session | None = None) -> None:
         self.session = session or requests.Session()

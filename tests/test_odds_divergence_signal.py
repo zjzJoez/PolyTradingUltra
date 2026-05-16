@@ -38,8 +38,54 @@ class ResolveSportKeyTests(unittest.TestCase):
         market = {"question": "Will Deportivo Alavés vs. FC Barcelona end in a draw?"}
         self.assertEqual(_resolve_sport_key(market), "soccer_spain_la_liga")
 
-    def test_unknown_league_returns_none(self):
-        market = {"question": "Will Henan FC vs. Shenzhen FC end in a draw?"}
+    def test_chinese_super_league_match(self):
+        market = {"question": "Will Henan FC vs. Shanghai Haigang end in a draw?"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_china_superleague")
+
+    def test_bundesliga2_match(self):
+        market = {"question": "1. FC Kaiserslautern vs. FC Schalke 04: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_germany_bundesliga2")
+
+    def test_argentine_primera_match(self):
+        market = {"question": "AA Argentinos Juniors vs. CA Huracán: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_argentina_primera_division")
+
+    def test_saudi_pro_league_match(self):
+        market = {"question": "Al Nassr Saudi Club vs. Al Hilal Saudi Club: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_saudi_arabia_pro_league")
+
+    def test_brazilian_match(self):
+        market = {"question": "Chapecoense vs. Red Bull Bragantino: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_brazil_campeonato")
+
+    def test_j_league_match(self):
+        market = {"question": "Albirex Niigata vs. Nara Club: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_japan_j_league")
+
+    def test_portuguese_primeira_match(self):
+        market = {"question": "Will Sport Lisboa e Benfica vs. SC Braga end in a draw?"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_portugal_primeira_liga")
+
+    def test_mlb_athletics_vs_athletic_bilbao_disambiguation(self):
+        # Critical collision: 'Athletics' (Oakland MLB) must route to MLB even
+        # though it contains the substring 'Athletic' (which would otherwise
+        # match La Liga's Athletic Bilbao).
+        market = {"question": "Athletics vs. Baltimore Orioles: O/U 8.5"}
+        self.assertEqual(_resolve_sport_key(market), "baseball_mlb")
+        # And the actual La Liga side still routes correctly:
+        market = {"question": "Athletic Club vs. CA Osasuna: O/U 2.5"}
+        self.assertEqual(_resolve_sport_key(market), "soccer_spain_la_liga")
+
+    def test_nba_team_match_without_league_keyword(self):
+        # Most NBA questions don't contain "NBA" — just team names.
+        market = {"question": "76ers vs. Celtics"}
+        self.assertEqual(_resolve_sport_key(market), "basketball_nba")
+        market = {"question": "Lakers vs. Warriors: O/U 215.5"}
+        self.assertEqual(_resolve_sport_key(market), "basketball_nba")
+
+    def test_truly_unknown_league_returns_none(self):
+        # Made-up team names with no keyword overlap
+        market = {"question": "Will Atletis FC vs. Boring SC end in a draw?"}
         self.assertIsNone(_resolve_sport_key(market))
 
 
