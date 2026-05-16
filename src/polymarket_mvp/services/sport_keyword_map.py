@@ -166,6 +166,7 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("NFL", "americanfootball_nfl"),
 
     # ─── NHL — major teams ───
+    ("Golden Knights", "icehockey_nhl"),  # Vegas
     ("Oilers", "icehockey_nhl"),
     ("Maple Leafs", "icehockey_nhl"),
     ("Canadiens", "icehockey_nhl"),
@@ -176,6 +177,20 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Avalanche", "icehockey_nhl"),
     ("Lightning", "icehockey_nhl"),
     ("Senators", "icehockey_nhl"),
+    ("Hurricanes", "icehockey_nhl"),
+    ("Stars", "icehockey_nhl"),  # Dallas Stars
+    ("Flames", "icehockey_nhl"),
+    ("Sharks", "icehockey_nhl"),
+    ("Kraken", "icehockey_nhl"),
+    ("Wild", "icehockey_nhl"),
+    ("Blue Jackets", "icehockey_nhl"),
+    ("Coyotes", "icehockey_nhl"),
+    ("Predators", "icehockey_nhl"),
+    ("Devils", "icehockey_nhl"),
+    ("Islanders", "icehockey_nhl"),
+    ("Sabres", "icehockey_nhl"),
+    ("Panthers", "icehockey_nhl"),  # Florida (NFL Carolina Panthers above takes priority)
+    ("Red Wings", "icehockey_nhl"),
     ("NHL", "icehockey_nhl"),
 
     # ─── La Liga (Spanish 1st div) — distinctive team names ───
@@ -226,12 +241,31 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Wolverhampton", "soccer_epl"),
     ("Nottingham Forest", "soccer_epl"),
 
+    # Premier League extras
+    ("Everton FC", "soccer_epl"),
+    ("Leicester City", "soccer_epl"),  # may be Championship in some seasons
+
     # ─── EFL Championship (English 2nd tier) ───
     ("Middlesbrough", "soccer_efl_champ"),
     ("Southampton FC", "soccer_efl_champ"),
     ("Hull City", "soccer_efl_champ"),
     ("Millwall", "soccer_efl_champ"),
     ("Sheffield United", "soccer_efl_champ"),
+    ("Sheffield Wednesday", "soccer_efl_champ"),
+    ("West Bromwich Albion", "soccer_efl_champ"),
+    ("Watford FC", "soccer_efl_champ"),
+    ("Coventry City", "soccer_efl_champ"),
+    ("Wrexham AFC", "soccer_efl_champ"),
+    ("Stoke City", "soccer_efl_champ"),
+    ("Blackburn Rovers", "soccer_efl_champ"),
+    ("Ipswich Town", "soccer_efl_champ"),
+    ("Bristol City", "soccer_efl_champ"),
+    ("Charlton Athletic", "soccer_efl_champ"),
+    ("Oxford United", "soccer_efl_champ"),
+    ("Preston North End", "soccer_efl_champ"),
+    ("Derby County", "soccer_efl_champ"),
+    ("Swansea City", "soccer_efl_champ"),
+    ("Portsmouth FC", "soccer_efl_champ"),
     ("Leeds United", "soccer_efl_champ"),
     ("Birmingham City", "soccer_efl_champ"),
     ("Sunderland", "soccer_efl_champ"),
@@ -271,6 +305,9 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Eintracht Braunschweig", "soccer_germany_bundesliga2"),
     ("St. Pauli", "soccer_germany_bundesliga2"),
     ("Hamburger SV", "soccer_germany_bundesliga2"),
+    ("Holstein Kiel", "soccer_germany_bundesliga2"),
+    ("SG Dynamo Dresden", "soccer_germany_bundesliga2"),
+    ("Dynamo Dresden", "soccer_germany_bundesliga2"),
 
     # ─── Serie A (Italian 1st div) ───
     ("Internazionale", "soccer_italy_serie_a"),
@@ -289,6 +326,13 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Empoli", "soccer_italy_serie_a"),
     ("Udinese", "soccer_italy_serie_a"),
     ("Sassuolo", "soccer_italy_serie_a"),
+    ("Cagliari Calcio", "soccer_italy_serie_a"),
+    ("Cagliari", "soccer_italy_serie_a"),
+    ("Hellas Verona", "soccer_italy_serie_a"),
+    ("Como 1907", "soccer_italy_serie_a"),
+    ("Lecce", "soccer_italy_serie_a"),
+    ("Parma", "soccer_italy_serie_a"),
+    ("Venezia", "soccer_italy_serie_a"),
 
     # ─── Ligue 1 (French 1st div) ───
     ("Paris Saint-Germain", "soccer_france_ligue_one"),
@@ -303,6 +347,14 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Racing Club de Lens", "soccer_france_ligue_one"),
     ("Angers SCO", "soccer_france_ligue_one"),
     ("Montpellier", "soccer_france_ligue_one"),
+    ("AS Saint-Étienne", "soccer_france_ligue_one"),
+    ("Saint-Étienne", "soccer_france_ligue_one"),
+    ("Stade Brestois", "soccer_france_ligue_one"),
+    ("Toulouse FC", "soccer_france_ligue_one"),
+    ("FC Nantes", "soccer_france_ligue_one"),
+    ("Auxerre", "soccer_france_ligue_one"),
+    ("Reims", "soccer_france_ligue_one"),
+    ("Le Havre", "soccer_france_ligue_one"),
 
     # ─── Ligue 2 ───
     ("Amiens SC", "soccer_france_ligue_two"),
@@ -318,6 +370,16 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Portland Timbers", "soccer_usa_mls"),
     ("New York City FC", "soccer_usa_mls"),
     ("New York Red Bulls", "soccer_usa_mls"),
+    ("Vancouver Whitecaps", "soccer_usa_mls"),
+    ("Toronto FC", "soccer_usa_mls"),
+    ("Columbus Crew", "soccer_usa_mls"),
+    ("Philadelphia Union", "soccer_usa_mls"),
+    ("Houston Dynamo", "soccer_usa_mls"),
+    ("Real Salt Lake", "soccer_usa_mls"),
+    ("Sporting Kansas City", "soccer_usa_mls"),
+    ("Colorado Rapids", "soccer_usa_mls"),
+    ("Minnesota United", "soccer_usa_mls"),
+    ("FC Cincinnati", "soccer_usa_mls"),
     ("MLS", "soccer_usa_mls"),
 
     # ─── Eredivisie (Dutch 1st div) ───
@@ -403,16 +465,60 @@ SPORT_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("Al Hazem", "soccer_saudi_arabia_pro_league"),
     ("Al Fateh", "soccer_saudi_arabia_pro_league"),
 
-    # ─── J-League ───
+    # ─── J-League (Japan 1st div) ───
     ("Albirex Niigata", "soccer_japan_j_league"),
     ("Nara Club", "soccer_japan_j_league"),
     ("Tokushima Vortis", "soccer_japan_j_league"),
     ("Kyōto Sanga", "soccer_japan_j_league"),
     ("Kyoto Sanga", "soccer_japan_j_league"),
     ("Urawa Reds", "soccer_japan_j_league"),
+    ("Urawa Red Diamonds", "soccer_japan_j_league"),
     ("Kashima Antlers", "soccer_japan_j_league"),
     ("FC Tokyo", "soccer_japan_j_league"),
+    ("FC Tōkyō", "soccer_japan_j_league"),
+    ("Yokohama F. Marinos", "soccer_japan_j_league"),
     ("Yokohama", "soccer_japan_j_league"),
+    ("Sanfrecce Hiroshima", "soccer_japan_j_league"),
+    ("Fagiano Okayama", "soccer_japan_j_league"),
+    ("Vissel Kōbe", "soccer_japan_j_league"),
+    ("Vissel Kobe", "soccer_japan_j_league"),
+    ("Gamba Ōsaka", "soccer_japan_j_league"),
+    ("Gamba Osaka", "soccer_japan_j_league"),
+    ("Shimizu S-Pulse", "soccer_japan_j_league"),
+    ("Kawasaki Frontale", "soccer_japan_j_league"),
+    ("JEF United", "soccer_japan_j_league"),
+    ("FC Mito", "soccer_japan_j_league"),
+    ("Cerezo Ōsaka", "soccer_japan_j_league"),
+    ("Cerezo Osaka", "soccer_japan_j_league"),
+
+    # ─── K-League 1 (Korea Republic 1st div) ───
+    ("FC Seoul", "soccer_korea_kleague1"),
+    ("Gimcheon Sangmu", "soccer_korea_kleague1"),
+    ("Ulsan HD", "soccer_korea_kleague1"),
+    ("Jeonbuk Hyundai Motors", "soccer_korea_kleague1"),
+    ("Jeju SK", "soccer_korea_kleague1"),
+    ("Gangwon FC", "soccer_korea_kleague1"),
+    ("Incheon United", "soccer_korea_kleague1"),
+    ("Bucheon FC 1995", "soccer_korea_kleague1"),
+    ("Bucheon FC", "soccer_korea_kleague1"),
+    ("Gwangju FC", "soccer_korea_kleague1"),
+    ("FC Anyang", "soccer_korea_kleague1"),
+    ("Daejeon Hana Citizen", "soccer_korea_kleague1"),
+    ("Pohang Steelers", "soccer_korea_kleague1"),
+    ("Suwon Samsung Bluewings", "soccer_korea_kleague1"),
+    ("Daegu FC", "soccer_korea_kleague1"),
+
+    # ─── A-League Men (Australia 1st div) ───
+    ("Auckland FC", "soccer_australia_aleague"),
+    ("Melbourne City", "soccer_australia_aleague"),
+    ("Melbourne Victory", "soccer_australia_aleague"),
+    ("Sydney FC", "soccer_australia_aleague"),
+    ("Western Sydney Wanderers", "soccer_australia_aleague"),
+    ("Brisbane Roar", "soccer_australia_aleague"),
+    ("Adelaide United", "soccer_australia_aleague"),
+    ("Perth Glory", "soccer_australia_aleague"),
+    ("Newcastle Jets", "soccer_australia_aleague"),
+    ("Western United", "soccer_australia_aleague"),
 
     # ─── Chinese Super League ───
     ("Beijing Guoan", "soccer_china_superleague"),
